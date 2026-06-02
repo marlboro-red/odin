@@ -148,6 +148,18 @@ event source is **one trait, usually one file**. All five are object-safe (used 
 `Arc<dyn Trait>`), `Send + Sync`, implemented via `#[async_trait]`, and exchange owned,
 mostly-serializable context/outcome structs so impls can live in *your* crate.
 
+> **Two things to know before you start.** (1) Annotate every `impl` with
+> `#[odin_core::async_trait]` — it's re-exported, so you neither add nor version-match the
+> `async-trait` crate (a mismatched version otherwise surfaces as a cryptic `E0195`). (2) Import
+> the traits **and** their context/outcome structs from the crate root — `use odin_core::{Provider,
+> InvocationCtx, InvocationOutcome, Action, ActionCtx, ActionOutcome, Workspace, WorkspaceHandle,
+> …};` — they're all re-exported there. Several of these structs are `#[non_exhaustive]`, so build
+> them with their constructors (`InvocationOutcome::success`, `ActionOutcome::success().with_*`,
+> `SideEffect::pull_request`/`comment`/…, `WorkspaceHandle::new`, `TriggerEvent::new`), not struct
+> literals. A complete, compiled custom-Provider + custom-Action example lives at
+> [`crates/odin-core/examples/custom_plugin.rs`](../crates/odin-core/examples/custom_plugin.rs)
+> (`cargo run -p odin-core --example custom_plugin`).
+
 ### `Provider` — invoke a coding-agent CLI
 
 ```rust
@@ -162,9 +174,11 @@ pub trait Provider: Send + Sync {
 
 `invoke` receives an `InvocationCtx { step_id, workdir, prompt, inputs, timeout, cancel }`
 (the prompt is already rendered; `inputs` maps required artifacts to on-disk paths) and
-returns an `InvocationOutcome { exit_code, stdout, stderr, outputs, usage, produced }`. The
-`outputs` map is exposed to later steps as `steps.<id>.outputs.*`. A provider must **not**
-touch the store or git — the engine owns durability and DIFF capture.
+returns an `InvocationOutcome`. Build it with `InvocationOutcome::success(stdout)` or
+`::failure(exit_code)`, chaining `.with_stderr(..)` / `.with_output(k, v)` / `.with_usage(..)`
+/ `.with_produced(name, path)` (it's `#[non_exhaustive]`). The `outputs` map is exposed to
+later steps as `steps.<id>.outputs.*`. A provider must **not** touch the store or git — the
+engine owns durability and DIFF capture.
 
 ```rust
 struct EchoProvider;
@@ -192,10 +206,17 @@ pub trait Workspace: Send + Sync {
 }
 ```
 
-`acquire(AcquireCtx { run_id, config })` returns a `WorkspaceHandle { run_id, path, branch,
-token }`. The handle is `Serialize` because the engine persists it in `RunState` to reattach
-on resume; `token` is your opaque reclaim handle. The built-ins are `WorktreeWorkspace`
-(a throwaway `git worktree` per run) and `SlotPoolWorkspace` (a pool of reusable clones).
+`acquire(AcquireCtx { run_id, config })` returns a handle built with `WorkspaceHandle::new(run_id,
+path, branch, token)` — `path` should be absolute, `token` is your opaque reclaim handle. The
+handle is `Serialize` because the engine persists it in `RunState` to reattach on resume. The
+built-ins are `WorktreeWorkspace` (a throwaway `git worktree` per run) and `SlotPoolWorkspace`
+(a pool of reusable clones).
+
+> **Selection caveat.** A workflow's `workspace.type` is a *closed* set today — `worktree` or
+> `slot_pool`. Registering a custom `Workspace` under one of those `kind()`s (via
+> `register_workspace`) **overrides** that built-in (last-writer-wins), but introducing a
+> brand-new `type:` string from YAML is not yet wired. So you can swap the implementation of a
+> built-in workspace kind, but not add a third selectable kind without an engine change.
 
 ### `Store` — durable, crash-resumable persistence
 
@@ -212,7 +233,9 @@ pub trait Store: Send + Sync {
 ```
 
 `RunState` is `Serialize`, so a backend can persist it as one opaque blob — implement
-`checkpoint`/`load_incomplete`/`load_run` and you have crash-resume. The ships-with backend is
+`checkpoint`/`load_incomplete`/`load_run` and you have crash-resume. (`RunState`/`RunEvent`/
+`StepState` are `#[non_exhaustive]` and have no public constructor: a store *round-trips* them
+via serde, it doesn't fabricate them — which is all a durable backend needs.) The ships-with backend is
 [`SqliteStore`] (`open(path)` or `open_in_memory()`); `MemStore` (the `mock` feature) is an
 in-memory one for tests. `RunEvent` is the audit log: `RunStarted`, `StepStarted`,
 `GateResult`, `JudgeResult`, `StepFinished`, `RunFinished`.
@@ -228,9 +251,10 @@ pub trait Action: Send + Sync {
 ```
 
 `run(ActionCtx { step_id, workdir, args })` — `args` are the step's templated `with:` values —
-returns `ActionOutcome { exit_code, outputs, side_effects }`. Emit a `SideEffect` to record an
-outward effect (a PR opened, a branch pushed) in the run summary. Built-ins: `shell.exec`,
-`git.commit`, `git.push`, `github.open_pr`.
+returns an `ActionOutcome`. Build it with `ActionOutcome::success().with_output(k, v)` /
+`.with_side_effect(e)`; a `SideEffect` (constructed via `SideEffect::pull_request`/`comment`/
+`commit`/`push`/`artifact`) records an outward effect in the run summary. Built-ins:
+`shell.exec`, `git.commit`, `git.push`, `github.open_pr`.
 
 ### `Trigger` — a source of run-starting events
 
@@ -261,7 +285,8 @@ let mut builder = EngineBuilder::new()           // seeds the built-ins
     .store(Arc::new(SqliteStore::open("runs.db")?));
 builder.registry_mut()
     .register_provider(Arc::new(MyProvider))      // resolves `provider: my-agent`
-    .register_action(Arc::new(MyAction));         // resolves `action: my.thing`
+    .register_action(Arc::new(MyAction))          // resolves `action: my.thing`
+    .register_workspace(Arc::new(MyWorkspace));   // overrides the built-in `kind()` it returns
 let engine = builder.build()?;
 ```
 

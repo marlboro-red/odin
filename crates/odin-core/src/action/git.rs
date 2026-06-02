@@ -48,10 +48,7 @@ impl Action for GitCommit {
         Ok(ActionOutcome {
             exit_code: 0,
             outputs,
-            side_effects: vec![SideEffect::Commit {
-                sha,
-                branch: Some(branch),
-            }],
+            side_effects: vec![SideEffect::commit(sha, Some(branch))],
         })
     }
 }
@@ -99,7 +96,7 @@ impl Action for GitPush {
         Ok(ActionOutcome {
             exit_code: 0,
             outputs,
-            side_effects: vec![SideEffect::Push { branch, remote }],
+            side_effects: vec![SideEffect::push(branch, remote)],
         })
     }
 }

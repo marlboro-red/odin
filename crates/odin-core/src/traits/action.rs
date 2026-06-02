@@ -48,3 +48,27 @@ pub struct ActionOutcome {
     /// Externally-visible effects, surfaced in [`crate::api::RunSummary`].
     pub side_effects: Vec<SideEffect>,
 }
+
+impl ActionOutcome {
+    /// A successful (exit 0) outcome with no outputs or side effects — the starting point for
+    /// a custom [`Action`]. Because the struct is `#[non_exhaustive]`, out-of-crate
+    /// implementors build it with this plus the `with_*` builders rather than a struct literal.
+    #[must_use]
+    pub fn success() -> Self {
+        Self::default()
+    }
+
+    /// Records an outward [`SideEffect`] (builder style), surfaced in the run summary.
+    #[must_use]
+    pub fn with_side_effect(mut self, effect: SideEffect) -> Self {
+        self.side_effects.push(effect);
+        self
+    }
+
+    /// Adds a named output exposed to later steps as `steps.<id>.outputs.<key>` (builder style).
+    #[must_use]
+    pub fn with_output(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.outputs.insert(key.into(), value.into());
+        self
+    }
+}
