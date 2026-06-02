@@ -1,5 +1,7 @@
 //! The root workflow type and its metadata.
 
+use std::num::NonZeroUsize;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +66,13 @@ pub struct Workflow {
     /// Default retry/timeout applied to steps that omit their own.
     #[serde(default, skip_serializing_if = "WorkflowDefaults::is_empty")]
     pub defaults: WorkflowDefaults,
+
+    /// Maximum steps executing at once within a run. Omitted / `1` = sequential (the
+    /// default). When `> 1`, independent steps run concurrently up to this many; steps in
+    /// the shared workdir run exclusively, while `scratch: true` steps (isolated worktrees)
+    /// run in parallel. The user asserts that concurrent shared-workdir steps don't conflict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<NonZeroUsize>,
 }
 
 fn default_true() -> bool {

@@ -33,6 +33,7 @@ anyhow = { version = "1.0.102", optional = true }
 tokio = { version = "1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "process", "time", "sync", "macros", "io-util", "fs"], optional = true }
 tokio-util = { version = "0.7.18", features = ["rt"], optional = true }
 futures-core = { version = "0.3.32", optional = true }
+futures-util = { version = "0.3.32", default-features = false, optional = true }
 # Pinned below 0.40: rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script uses
 # the still-unstable `cfg_select!` and won't compile on stable.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
@@ -54,6 +55,7 @@ runtime = [
     "dep:tokio-util",
     "dep:anyhow",
     "dep:futures-core",
+    "dep:futures-util",
     "dep:rusqlite",
 ]
 # Ships the Noop/Mock trait impls for downstream tests.

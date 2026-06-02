@@ -756,6 +756,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures-core",
+ "futures-util",
  "indexmap",
  "minijinja",
  "rusqlite",

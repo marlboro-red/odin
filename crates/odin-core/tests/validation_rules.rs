@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN026`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN028`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -224,6 +224,23 @@ fn odin027_webhook_param_undeclared() {
         "name: x\ntriggers:\n  - type: github_webhook\n    events: [\"issues.labeled\"]\n    params:\n      ghost: issue.html_url\nsteps:\n  - {id: a, run: ./x}\n",
         DiagCode::WebhookParamUndeclared,
     );
+}
+
+#[test]
+fn odin028_scratch_on_action_step() {
+    // An action's effects are discarded with the scratch worktree → warn.
+    assert_fires(
+        "name: x\nsteps:\n  - { id: c, action: git.commit, scratch: true, with: { message: hi } }\n",
+        DiagCode::ScratchOnAction,
+    );
+}
+
+#[test]
+fn odin028_does_not_fire_for_scratch_provider_or_run() {
+    // scratch on provider/run is the intended use — no warning.
+    let r =
+        report("name: x\nmax_parallel: 2\nsteps:\n  - { id: a, run: \"true\", scratch: true }\n");
+    assert!(!r.contains(DiagCode::ScratchOnAction), "got:\n{r}");
 }
 
 #[test]

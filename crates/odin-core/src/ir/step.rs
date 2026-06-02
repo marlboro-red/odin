@@ -57,6 +57,20 @@ pub struct Step {
     /// DAG edges: ids of steps that must complete before this one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<StepId>,
+
+    /// Run this step in an isolated **scratch** workspace (a throwaway git worktree at the
+    /// run's base) instead of the shared workdir. Its file edits never touch the shared tree
+    /// — its diff is exposed as `steps.<id>.outputs.diff` — so scratch steps can run
+    /// concurrently (fan-out). Pass them data via templating (`steps.*`, `params.*`,
+    /// `trigger.*`), not via uncommitted files. See `max_parallel`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub scratch: bool,
+}
+
+// serde's `skip_serializing_if` requires `fn(&T) -> bool`, hence `&bool`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The body of a step. Exactly one variant is present in valid YAML.
@@ -219,6 +233,8 @@ struct StepRaw {
     when: Option<String>,
     #[serde(default)]
     depends_on: Vec<StepId>,
+    #[serde(default)]
+    scratch: bool,
 }
 
 impl<'de> Deserialize<'de> for Step {
@@ -244,6 +260,7 @@ impl<'de> Deserialize<'de> for Step {
             timeout: r.timeout,
             when: r.when,
             depends_on: r.depends_on,
+            scratch: r.scratch,
         })
     }
 }
