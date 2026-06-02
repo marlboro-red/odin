@@ -322,3 +322,24 @@ async fn missing_event_header_is_rejected() {
     );
     h.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redelivered_webhook_runs_only_once() {
+    let h = Harness::start(Some(SECRET)).await;
+    let body = labeled_payload();
+    let sig = sign(SECRET, &body);
+
+    // post_webhook sends a fixed X-GitHub-Delivery, so the second POST is a "redelivery".
+    let first = post_webhook(h.addr, "issues", &body, Some(&sig)).await;
+    assert!(first.contains("202"), "first delivery accepted: {first}");
+    let second = post_webhook(h.addr, "issues", &body, Some(&sig)).await;
+    assert!(
+        second.contains("200"),
+        "a duplicate delivery should be acked (200) but not re-run: {second}"
+    );
+
+    let (n, terminal) = wait_for_terminal_run(&h.store, Duration::from_secs(15)).await;
+    assert_eq!(n, 1, "a re-delivered webhook must not start a second run");
+    assert_eq!(terminal, Some(RunStatus::Succeeded));
+    h.shutdown().await;
+}

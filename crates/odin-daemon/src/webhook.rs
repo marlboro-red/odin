@@ -10,9 +10,22 @@
 //! Wiring: `new()` → `subscribe()` (once per declared webhook trigger, returns the
 //! [`GithubWebhookTrigger`] to register with the [`Daemon`](crate::Daemon)) → `bind()` →
 //! `serve(shutdown)`. The server and the daemon share one [`CancellationToken`].
+//!
+//! ## Hardening
+//!
+//! - **Signatures**: HMAC-SHA256 over the raw body, fail-closed when a secret is configured.
+//! - **Idempotency**: GitHub re-delivers on a non-2xx/timeout; recent `X-GitHub-Delivery`
+//!   ids are remembered ([`DeliveryDedup`]) so a retry doesn't start a duplicate run.
+//! - **Resource bounds**: a 25 MiB body cap, a bounded per-subscription queue (excess
+//!   dropped + logged), and the daemon's `max_concurrent_runs` together bound the work a
+//!   flood of *valid* deliveries can spawn — so HTTP-edge rate limiting is left to a fronting
+//!   reverse proxy rather than reimplemented here.
+//! - **TLS**: not built in — run behind a TLS-terminating reverse proxy (the server warns
+//!   when bound to a non-loopback address over plain HTTP).
 
+use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -39,6 +52,40 @@ const MAX_BODY_BYTES: usize = 25 * 1024 * 1024;
 /// Per-subscription queue depth. Events beyond this (a slow run during a burst) are dropped
 /// with a warning rather than applying unbounded back-pressure to the HTTP handler.
 const QUEUE_DEPTH: usize = 64;
+/// How many recent `X-GitHub-Delivery` ids to remember for retry de-duplication. GitHub
+/// re-delivers on a non-2xx/timeout; redelivery happens within minutes, so a bounded recent
+/// set is enough (it intentionally does not survive a daemon restart).
+const DEDUP_CAPACITY: usize = 2048;
+
+/// A bounded most-recent set of delivery ids (FIFO eviction) for idempotent webhook handling.
+struct DeliveryDedup {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl DeliveryDedup {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Records `id` and returns `true` if it is new, `false` if it was already seen.
+    fn check_and_record(&mut self, id: &str) -> bool {
+        if self.seen.contains(id) {
+            return false;
+        }
+        if self.order.len() >= DEDUP_CAPACITY {
+            if let Some(evicted) = self.order.pop_front() {
+                self.seen.remove(&evicted);
+            }
+        }
+        self.seen.insert(id.to_owned());
+        self.order.push_back(id.to_owned());
+        true
+    }
+}
 
 /// A parsed event matcher, e.g. `"issues.labeled"` → type `issues`, action `labeled`; a
 /// bare `"issues"` → type `issues`, action `None` (matches any action on that type).
@@ -196,6 +243,7 @@ impl WebhookServer {
             state: Arc::new(AppState {
                 secret: self.secret,
                 subscriptions: self.subscriptions,
+                dedup: Mutex::new(DeliveryDedup::new()),
             }),
         })
     }
@@ -245,6 +293,8 @@ impl BoundWebhookServer {
 struct AppState {
     secret: Option<String>,
     subscriptions: Vec<Subscription>,
+    /// Recent delivery ids, to drop GitHub's retries of an already-handled delivery.
+    dedup: Mutex<DeliveryDedup>,
 }
 
 #[allow(clippy::unused_async)] // axum route handlers must be async.
@@ -282,6 +332,13 @@ async fn handle_webhook(
         .and_then(serde_json::Value::as_str);
     let delivery = header_str(&headers, "x-github-delivery").unwrap_or("?");
     let label = event_label(event_type, action);
+
+    // Idempotency: GitHub re-delivers on timeout/error. Drop a delivery we've already
+    // handled (a verified, identified one) so a retry doesn't start a duplicate run.
+    if delivery != "?" && !state.dedup.lock().unwrap().check_and_record(delivery) {
+        eprintln!("odind: webhook: duplicate delivery {delivery} ignored");
+        return (StatusCode::OK, "duplicate delivery ignored").into_response();
+    }
 
     let mut matched = 0_usize;
     for sub in &state.subscriptions {
