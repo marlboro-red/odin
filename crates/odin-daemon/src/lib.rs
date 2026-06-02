@@ -8,6 +8,8 @@
 //! ## What's here
 //!
 //! - [`CronTrigger`] — a [`Trigger`] that fires on a standard 5-field cron schedule.
+//! - [`WebhookServer`] / [`GithubWebhookTrigger`] — a shared HTTP server that turns signed
+//!   GitHub webhook POSTs into trigger events (the event-driven slice).
 //! - [`Daemon`] — owns an [`Engine`] and a set of workflows, resumes any incomplete
 //!   runs on startup, then drives every registered trigger concurrently, dispatching a
 //!   run per event.
@@ -34,6 +36,8 @@
 
 mod daemon;
 mod trigger;
+mod webhook;
 
 pub use daemon::Daemon;
 pub use trigger::CronTrigger;
+pub use webhook::{BoundWebhookServer, GithubWebhookTrigger, WebhookServer};
