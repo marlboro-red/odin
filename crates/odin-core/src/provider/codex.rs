@@ -14,24 +14,42 @@ use crate::usage::Usage;
 ///
 /// The agent's final message is captured via `-o <file>` (clean text, no event parsing).
 /// Defaults to the `workspace-write` sandbox so the agent can edit the run's worktree;
-/// the binary name and flags are configurable.
+/// the binary name, registry id, pinned model, and sandbox flags are configurable.
+///
+/// Pin a model with [`with_model`](Self::with_model) (emits `--model <model>`); to mix
+/// models in one workflow, register several instances under distinct ids via
+/// [`with_id`](Self::with_id) and target each from a step's `provider:`.
 pub struct CodexProvider {
+    id: String,
     program: String,
+    model: Option<String>,
     extra_args: Vec<String>,
 }
 
 impl CodexProvider {
-    /// A provider invoking the `codex` binary on `PATH` with the default sandbox flags.
+    /// A provider invoking the `codex` binary on `PATH` with the default sandbox flags,
+    /// registered under the id `"codex"`.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            id: "codex".to_owned(),
             program: "codex".to_owned(),
+            model: None,
             extra_args: vec![
                 "--sandbox".to_owned(),
                 "workspace-write".to_owned(),
                 "--skip-git-repo-check".to_owned(),
             ],
         }
+    }
+
+    /// Overrides the registry id (the key a step's `provider:` matches). Use a distinct id
+    /// per instance to register several model-pinned providers; reusing `"codex"` replaces
+    /// the built-in.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Overrides the binary name/path.
@@ -41,11 +59,53 @@ impl CodexProvider {
         self
     }
 
+    /// Pins the model, passed to the CLI as `--model <model>`. Appended after the base and
+    /// extra args, so it composes with — and survives — [`with_extra_args`](Self::with_extra_args)
+    /// (which replaces the sandbox defaults).
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
     /// Replaces the extra CLI flags applied to every `codex exec` invocation.
     #[must_use]
     pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
         self.extra_args = args;
         self
+    }
+
+    /// Builds the full argument vector for one `codex exec`: the fixed flags, `extra_args`,
+    /// `--model` when pinned, then the prompt as the trailing positional argument.
+    fn build_args(&self, prompt: String, workdir: String, last_message_arg: String) -> Vec<String> {
+        let mut args = vec![
+            "exec".to_owned(),
+            // `--json` streams JSONL events to stdout (we parse token usage from them);
+            // `-o` still captures the clean final message to a file.
+            "--json".to_owned(),
+            "--cd".to_owned(),
+            workdir,
+            "-o".to_owned(),
+            last_message_arg,
+        ];
+        args.extend(self.extra_args.iter().cloned());
+        if let Some(model) = &self.model {
+            args.push("--model".to_owned());
+            args.push(model.clone());
+        }
+        // The prompt is the trailing positional arg, so it must be pushed last.
+        args.push(prompt);
+        args
+    }
+
+    /// Formats this provider's version string, folding in the pinned model when set. Surfaced
+    /// via `Provider::version`; once provider-version capture is wired into run state, it makes
+    /// two runs that differ only by model distinguishable for reproducibility.
+    fn version_string(&self, cli_version: &str) -> String {
+        match &self.model {
+            Some(model) => format!("{cli_version} (model={model})"),
+            None => cli_version.to_owned(),
+        }
     }
 }
 
@@ -58,7 +118,7 @@ impl Default for CodexProvider {
 #[async_trait]
 impl Provider for CodexProvider {
     fn id(&self) -> ProviderRef {
-        ProviderRef::new("codex")
+        ProviderRef::new(self.id.as_str())
     }
 
     async fn invoke(&self, ctx: InvocationCtx) -> Result<InvocationOutcome, ProviderError> {
@@ -71,18 +131,7 @@ impl Provider for CodexProvider {
             .join(format!(".odin-codex-{}.txt", uuid::Uuid::new_v4()));
         let last_message_arg = last_message.to_string_lossy().into_owned();
 
-        let mut args = vec![
-            "exec".to_owned(),
-            // `--json` streams JSONL events to stdout (we parse token usage from them);
-            // `-o` still captures the clean final message to a file.
-            "--json".to_owned(),
-            "--cd".to_owned(),
-            workdir,
-            "-o".to_owned(),
-            last_message_arg,
-        ];
-        args.extend(self.extra_args.iter().cloned());
-        args.push(prompt);
+        let args = self.build_args(prompt, workdir, last_message_arg);
 
         let opts = ProcessOptions {
             workdir: Some(ctx.workdir.clone()),
@@ -127,7 +176,7 @@ impl Provider for CodexProvider {
         .await
         .ok()?;
         let v = out.stdout.trim();
-        (!v.is_empty()).then(|| v.to_owned())
+        (!v.is_empty()).then(|| self.version_string(v))
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -200,6 +249,46 @@ mod tests {
     #[test]
     fn id_is_codex() {
         assert_eq!(CodexProvider::new().id().as_str(), "codex");
+    }
+
+    #[test]
+    fn with_id_overrides_the_registry_key() {
+        assert_eq!(
+            CodexProvider::new().with_id("impl-codex").id().as_str(),
+            "impl-codex"
+        );
+    }
+
+    #[test]
+    fn version_string_folds_in_the_pinned_model() {
+        assert_eq!(CodexProvider::new().version_string("0.136.0"), "0.136.0");
+        assert_eq!(
+            CodexProvider::new()
+                .with_model("gpt-5.5")
+                .version_string("0.136.0"),
+            "0.136.0 (model=gpt-5.5)"
+        );
+    }
+
+    #[test]
+    fn with_model_inserts_model_before_the_trailing_prompt() {
+        let args = CodexProvider::new().with_model("gpt-5.2-codex").build_args(
+            "do it".to_owned(),
+            "/wd".to_owned(),
+            "/wd/.odin-codex-x.txt".to_owned(),
+        );
+        // The prompt stays the final positional argument...
+        assert_eq!(args.last().map(String::as_str), Some("do it"));
+        // ...and `--model <name>` precedes it (codex would treat a trailing flag as part of
+        // the positional prompt otherwise).
+        let pos = args.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(args[pos + 1], "gpt-5.2-codex");
+        assert!(
+            pos + 1 < args.len() - 1,
+            "model must come before the prompt"
+        );
+        // The sandbox defaults still survive alongside the model.
+        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
     }
 
     #[test]

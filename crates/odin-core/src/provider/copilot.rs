@@ -20,19 +20,37 @@ use crate::usage::Usage;
 /// from `assistant.message` events rather than scraped from chrome-laden text. Copilot
 /// reports per-message *output* tokens (not input), so [`Usage`] carries output tokens with
 /// `input_tokens`/`cost_micros` left 0 (Copilot bills in "premium requests", not dollars).
+///
+/// Pin a model with [`with_model`](Self::with_model) (emits `--model <model>`); to mix
+/// models in one workflow, register several instances under distinct ids via
+/// [`with_id`](Self::with_id) and target each from a step's `provider:`.
 pub struct CopilotProvider {
+    id: String,
     program: String,
+    model: Option<String>,
     extra_args: Vec<String>,
 }
 
 impl CopilotProvider {
-    /// A provider invoking the `copilot` binary on `PATH` with full permissions.
+    /// A provider invoking the `copilot` binary on `PATH` with full permissions, registered
+    /// under the id `"copilot"`.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            id: "copilot".to_owned(),
             program: "copilot".to_owned(),
+            model: None,
             extra_args: vec!["--allow-all".to_owned(), "--no-color".to_owned()],
         }
+    }
+
+    /// Overrides the registry id (the key a step's `provider:` matches). Use a distinct id
+    /// per instance to register several model-pinned providers; reusing `"copilot"` replaces
+    /// the built-in.
+    #[must_use]
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Overrides the binary name/path.
@@ -42,30 +60,25 @@ impl CopilotProvider {
         self
     }
 
+    /// Pins the model, passed to the CLI as `--model <model>`. Appended after the base and
+    /// extra args, so it composes with — and survives — [`with_extra_args`](Self::with_extra_args)
+    /// (which replaces the permission defaults).
+    #[must_use]
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
     /// Replaces the extra CLI flags applied to every invocation.
     #[must_use]
     pub fn with_extra_args(mut self, args: Vec<String>) -> Self {
         self.extra_args = args;
         self
     }
-}
 
-impl Default for CopilotProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Provider for CopilotProvider {
-    fn id(&self) -> ProviderRef {
-        ProviderRef::new("copilot")
-    }
-
-    async fn invoke(&self, ctx: InvocationCtx) -> Result<InvocationOutcome, ProviderError> {
-        let prompt = ctx.prompt.clone().unwrap_or_default();
-        let workdir = ctx.workdir.to_string_lossy().into_owned();
-
+    /// Builds the full argument vector for one invocation: the fixed flags + prompt, any
+    /// `extra_args`, then `--model` when pinned.
+    fn build_args(&self, prompt: String, workdir: String) -> Vec<String> {
         let mut args = vec![
             "-p".to_owned(),
             prompt,
@@ -78,6 +91,41 @@ impl Provider for CopilotProvider {
             "json".to_owned(),
         ];
         args.extend(self.extra_args.iter().cloned());
+        if let Some(model) = &self.model {
+            args.push("--model".to_owned());
+            args.push(model.clone());
+        }
+        args
+    }
+
+    /// Formats this provider's version string, folding in the pinned model when set. Surfaced
+    /// via `Provider::version`; once provider-version capture is wired into run state, it makes
+    /// two runs that differ only by model distinguishable for reproducibility.
+    fn version_string(&self, cli_version: &str) -> String {
+        match &self.model {
+            Some(model) => format!("{cli_version} (model={model})"),
+            None => cli_version.to_owned(),
+        }
+    }
+}
+
+impl Default for CopilotProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl Provider for CopilotProvider {
+    fn id(&self) -> ProviderRef {
+        ProviderRef::new(self.id.as_str())
+    }
+
+    async fn invoke(&self, ctx: InvocationCtx) -> Result<InvocationOutcome, ProviderError> {
+        let prompt = ctx.prompt.clone().unwrap_or_default();
+        let workdir = ctx.workdir.to_string_lossy().into_owned();
+
+        let args = self.build_args(prompt, workdir);
 
         let opts = ProcessOptions {
             workdir: Some(ctx.workdir.clone()),
@@ -111,7 +159,7 @@ impl Provider for CopilotProvider {
         .await
         .ok()?;
         let v = out.stdout.trim();
-        (!v.is_empty()).then(|| v.to_owned())
+        (!v.is_empty()).then(|| self.version_string(v))
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -177,6 +225,36 @@ mod tests {
     #[test]
     fn id_is_copilot() {
         assert_eq!(CopilotProvider::new().id().as_str(), "copilot");
+    }
+
+    #[test]
+    fn with_id_overrides_the_registry_key() {
+        assert_eq!(
+            CopilotProvider::new().with_id("reviewer").id().as_str(),
+            "reviewer"
+        );
+    }
+
+    #[test]
+    fn version_string_folds_in_the_pinned_model() {
+        assert_eq!(CopilotProvider::new().version_string("1.0.57"), "1.0.57");
+        assert_eq!(
+            CopilotProvider::new()
+                .with_model("gpt-5.2")
+                .version_string("1.0.57"),
+            "1.0.57 (model=gpt-5.2)"
+        );
+    }
+
+    #[test]
+    fn with_model_appends_a_model_flag() {
+        let args = CopilotProvider::new()
+            .with_model("gpt-5.2")
+            .build_args("hi".to_owned(), "/wd".to_owned());
+        let pos = args.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(args[pos + 1], "gpt-5.2");
+        // The permission defaults still survive alongside the model.
+        assert!(args.iter().any(|a| a == "--allow-all"));
     }
 
     #[test]
