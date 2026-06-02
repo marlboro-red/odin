@@ -612,8 +612,10 @@ impl LocalEngine {
         // Anchor this transient snapshot under a step-scoped ref *separate* from the durable
         // per-run ref — otherwise it would move `refs/odin/run/<id>` off the commit the
         // persisted `RunState.snapshot` still names, leaving resume's target un-anchored and
-        // gc-collectable. (Step-scoped so concurrent scratch retry steps don't collide.)
-        let retry_ref = format!("refs/odin/retry/{run_id}-{}", step.id.as_str());
+        // gc-collectable. Nested under the run id (`refs/odin/retry/<id>/<step>`) so it is both
+        // step-scoped (concurrent scratch retry steps don't collide) and sweepable as a group
+        // by run-end cleanup if a crash/cancel mid-loop skips the per-step delete below.
+        let retry_ref = format!("refs/odin/retry/{run_id}/{}", step.id.as_str());
         let pre_step_snapshot = if max_attempts > 1 {
             match self.git_head(workdir, cancel).await {
                 Some(head) => {
@@ -870,11 +872,28 @@ impl LocalEngine {
         }
     }
 
-    /// Drops the durable per-run snapshot ref so its dangling commits become collectable.
+    /// Drops the run's snapshot refs so their dangling commits become collectable: the durable
+    /// per-run ref, plus any per-step retry rewind refs (`refs/odin/retry/<id>/*`) a crash or
+    /// cancel mid-retry-loop left behind (the happy path drops each one when its step settles).
     /// Best effort.
     async fn delete_snapshot_ref(&self, workdir: &Path, run_id: RunId, cancel: &CancelToken) {
         self.delete_ref(workdir, &format!("refs/odin/run/{run_id}"), cancel)
             .await;
+        let opts = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        // List the run's retry refs (a trailing `/` matches the whole hierarchy) and drop each.
+        let list = [
+            "for-each-ref".to_owned(),
+            "--format=%(refname)".to_owned(),
+            format!("refs/odin/retry/{run_id}/"),
+        ];
+        if let Ok(out) = run_process("git", &list, &opts, cancel).await {
+            for refname in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                self.delete_ref(workdir, refname, cancel).await;
+            }
+        }
     }
 
     /// Deletes a git ref (best effort), letting any commit it anchored become collectable.
