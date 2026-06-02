@@ -201,9 +201,16 @@ impl Daemon {
                             let engine = Arc::clone(&engine);
                             let workflows = Arc::clone(&workflows);
                             let permits = Arc::clone(&permits);
+                            let kind = kind.clone();
                             dispatches.spawn(async move {
                                 // Acquire a slot first; the permit is held for the whole run.
+                                // Acquire only fails if the semaphore was closed — unreachable
+                                // while this task holds an `Arc<Semaphore>`, but log rather than
+                                // drop the event silently if a future change ever closes it.
                                 let Ok(_permit) = permits.acquire_owned().await else {
+                                    eprintln!(
+                                        "odind: {kind} dispatch slot unavailable (semaphore closed); event dropped"
+                                    );
                                     return;
                                 };
                                 dispatch(engine.as_ref(), &workflows, event).await;
