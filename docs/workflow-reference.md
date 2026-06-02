@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN028`).
+(`ODIN001`–`ODIN030`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -212,13 +212,14 @@ params:
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `type` | `string` \| `number` \| `bool` | `string` | Expected value type. |
+| `type` | `string` \| `number` \| `bool` | `string` | Expected value type. **Enforced**: a supplied (or default) value of the wrong type fails the run at start with an input error. |
 | `required` | bool | `false` | Caller must supply it. |
-| `default` | any | — | Value when not supplied. |
+| `default` | any | — | Value when not supplied. Must match `type` ([ODIN030](#odin030)). |
 | `description` | string | — | Human description. |
 
-Reference params in templates as `{{ params.<name> }}`. A declared-but-never-referenced
-param warns ([ODIN024](#odin024)).
+Reference params in templates as `{{ params.<name> }}` (dot notation — a subscript like
+`params["<name>"]` isn't statically checked, [ODIN029](#odin029)). A declared-but-never-
+referenced param warns ([ODIN024](#odin024)).
 
 ---
 
@@ -343,7 +344,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN028`)
+## Diagnostics catalogue (`ODIN001`–`ODIN030`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -378,8 +379,10 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin026"></a>ODIN026 | **warning** | `schema_version` minor is newer than this engine supports. |
 | <a id="odin027"></a>ODIN027 | **warning** | A `github_webhook` trigger maps a param not declared in `params` (the mapping is inert). |
 | <a id="odin028"></a>ODIN028 | **warning** | An *action* step sets `scratch: true` (its side effects are discarded). |
+| <a id="odin029"></a>ODIN029 | **warning** | A template accesses a checked root (`params`/`steps`/`artifacts`) with **subscript** syntax (`steps["a"]`); only dot notation is statically checked, so the reference escapes the unknown-ref / upstream checks. |
+| <a id="odin030"></a>ODIN030 | error | A param's `default` value does not match its declared `type`. |
 
-¹ ODIN017, ODIN018, and ODIN024 require the `templating` feature (on by default).
+¹ ODIN017, ODIN018, ODIN024, and ODIN029 require the `templating` feature (on by default).
 
 A workflow validates **cleanly** when it has zero diagnostics; it's still **runnable** with
 warnings (only errors block a run). See [`examples/fix-flaky-test.yaml`](../examples/fix-flaky-test.yaml)

@@ -37,6 +37,29 @@ pub enum ParamType {
     Bool,
 }
 
+impl ParamType {
+    /// Whether `value` conforms to this declared type. Enforced at run start
+    /// ([`crate::error::Error::Input`]) and on a param `default` at validate time (`ODIN030`).
+    #[must_use]
+    pub fn matches(self, value: &Value) -> bool {
+        match self {
+            ParamType::String => value.is_string(),
+            ParamType::Number => value.is_number(),
+            ParamType::Bool => value.is_boolean(),
+        }
+    }
+
+    /// The lowercase type name (`"string"` / `"number"` / `"bool"`).
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            ParamType::String => "string",
+            ParamType::Number => "number",
+            ParamType::Bool => "bool",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ParamSpec, ParamType};
