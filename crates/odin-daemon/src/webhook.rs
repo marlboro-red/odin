@@ -16,10 +16,11 @@
 //! - **Signatures**: HMAC-SHA256 over the raw body, fail-closed when a secret is configured.
 //! - **Idempotency**: GitHub re-delivers on a non-2xx/timeout; recent `X-GitHub-Delivery`
 //!   ids are remembered ([`DeliveryDedup`]) so a retry doesn't start a duplicate run.
-//! - **Resource bounds**: a 25 MiB body cap, a bounded per-subscription queue (excess
-//!   dropped + logged), and the daemon's `max_concurrent_runs` together bound the work a
-//!   flood of *valid* deliveries can spawn — so HTTP-edge rate limiting is left to a fronting
-//!   reverse proxy rather than reimplemented here.
+//! - **Resource bounds**: a 25 MiB body cap, a bounded per-subscription queue, and the
+//!   daemon's `max_concurrent_runs` together bound the work a flood of *valid* deliveries can
+//!   spawn — so HTTP-edge rate limiting is left to a fronting reverse proxy rather than
+//!   reimplemented here. A full queue makes the delivery fail `503` (un-deduped so GitHub
+//!   retries): delivery is **at-least-once**, never silently dropped.
 //! - **TLS**: not built in — run behind a TLS-terminating reverse proxy (the server warns
 //!   when bound to a non-loopback address over plain HTTP).
 

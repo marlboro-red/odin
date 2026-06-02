@@ -112,8 +112,13 @@ Point a GitHub webhook (content type `application/json`, secret = your `--webhoo
    supported) into a typed run param — so a webhook can satisfy a required param. An
    unresolvable path is skipped (the run then fails param validation, surfacing the mistake;
    an undeclared mapping key warns at validate time, [ODIN027](workflow-reference.md#odin027)).
-5. **Dispatches** matching runs and returns `202 Accepted`. (Non-2xx would make GitHub retry,
-   so routing/queue problems are logged, never surfaced as a delivery failure.)
+5. **Dispatches** matching runs. If every matched subscription enqueues (and a no-match
+   delivery), the server returns `202 Accepted`. If a subscription's bounded queue is **full**,
+   the delivery is *un-deduped* (forgotten from step 2's recent-set) and the server returns
+   `503 Service Unavailable` so GitHub **retries** it — delivery is **at-least-once**, not
+   best-effort. A retry re-runs the match, so subscriptions that *did* enqueue on the first
+   attempt may enqueue again: a flooded delivery can start a run more than once, which is
+   preferred over silently losing the event.
 
 This unlocks the marquee flow — label an issue, and `issues.labeled → issue-to-pr` runs. See
 [`examples/issue-to-pr.yaml`](../examples/issue-to-pr.yaml).
@@ -121,9 +126,10 @@ This unlocks the marquee flow — label an issue, and `issues.labeled → issue-
 ### Limits
 
 - Request bodies are capped at **25 MiB** (GitHub's payload cap).
-- Each subscription has a bounded queue (64); during a slow run, excess events are dropped
-  with a log rather than applying unbounded back-pressure. Together with
-  `--max-concurrent-runs`, this bounds the work a flood of valid deliveries can spawn.
+- Each subscription has a bounded queue (64). When a burst outpaces a slow run and the queue
+  fills, the delivery fails with `503` (GitHub retries it — see step 5) rather than applying
+  unbounded back-pressure to the HTTP handler. Together with `--max-concurrent-runs`, this
+  bounds the work a flood of valid deliveries can spawn.
 
 ---
 

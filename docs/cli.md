@@ -79,6 +79,20 @@ usage: 41310 in / 2204 out tokens, $0.1234
 side-effects: 1
 ```
 
+When a step fails, its glyph is `✗`, the first line of the recorded failure reason is printed
+beneath it (`↳ …`), downstream steps are `⊘` skipped, and a final `error:` line carries the
+run-level terminal error:
+
+```text
+Run a91b… — failed
+  ✓ plan
+  ✗ implement (exit 1)
+      ↳ gate "tests" failed: cargo test exited 101
+  ⊘ review
+usage: 18992 in / 1043 out tokens, $0.0571
+error: step "implement" failed after 2 attempt(s)
+```
+
 Step glyphs: `✓` passed, `✗` failed, `⊘` skipped, `·` other. `--json` emits the full
 [`RunSummary`](#json-shapes).
 
@@ -106,11 +120,12 @@ List the most recent runs, newest first.
 | `--json` | off | Emit the listing as a JSON array. |
 
 ```text
-7f3c…  succeeded   issue-to-pr           2026-06-02T07:12:04Z
-a91b…  failed      nightly-maintenance   2026-06-01T03:00:11Z
+7f3c…  succeeded   issue-to-pr           2026-06-02T07:12:04.512874+00:00
+a91b…  failed      nightly-maintenance   2026-06-01T03:00:11.094233+00:00
 ```
 
-`--json` emits a reduced projection per run: `{run_id, workflow, status, updated_at}`.
+Timestamps are RFC 3339 (`DateTime::to_rfc3339()`): a `+00:00` UTC offset and sub-second
+precision, not a bare `…Z`. `--json` emits a reduced projection per run: `{run_id, workflow, status, updated_at}`.
 **Exit:** `0` (even with no database or no runs); `2` on a store error.
 
 ### `odin show <RUN_ID> [flags]`
@@ -127,8 +142,8 @@ Show one run's full state.
 run      7f3c…
 workflow issue-to-pr
 status   succeeded
-created  2026-06-02T07:10:55Z
-updated  2026-06-02T07:12:04Z
+created  2026-06-02T07:10:55.318204+00:00
+updated  2026-06-02T07:12:04.512874+00:00
 steps:
   plan         Passed
   implement    Passed exit 0
