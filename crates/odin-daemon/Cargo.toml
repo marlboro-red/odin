@@ -11,10 +11,27 @@ description = "Long-running daemon that drives Odin workflows from event trigger
 [lints]
 workspace = true
 
+[lib]
+name = "odin_daemon"
+path = "src/lib.rs"
+
 [[bin]]
 name = "odind"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
+clap = { version = "4.6.1", features = ["derive"] }
+cron = "0.12.1"
 odin-core = { workspace = true }
-# tokio/axum and trigger wiring arrive with the daemon milestone (post-MVP).
+tokio = { version = "1.52.3", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "signal",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

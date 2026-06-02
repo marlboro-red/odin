@@ -36,3 +36,18 @@ pub struct TriggerEvent {
     /// The assembled run input (trigger payload + params).
     pub input: RunInput,
 }
+
+impl TriggerEvent {
+    /// Assembles an event that will start `workflow`, tagged with the `source` that
+    /// produced it (e.g. `"cron:0 3 * * 1"`). The constructor exists because the struct
+    /// is `#[non_exhaustive]`: out-of-crate [`Trigger`] implementations (the daemon's
+    /// cron/webhook triggers) cannot use a struct literal, but must still emit events.
+    #[must_use]
+    pub fn new(source: impl Into<String>, workflow: WorkflowId, input: RunInput) -> Self {
+        Self {
+            source: source.into(),
+            workflow,
+            input,
+        }
+    }
+}
