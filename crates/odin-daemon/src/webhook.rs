@@ -72,10 +72,17 @@ impl DeliveryDedup {
         }
     }
 
-    /// Records `id` and returns `true` if it is new, `false` if it was already seen.
-    fn check_and_record(&mut self, id: &str) -> bool {
+    /// Whether `id` was already recorded (a delivery we've fully handled).
+    fn contains(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
+    /// Records `id` (idempotent), evicting the oldest when at capacity. Recorded only AFTER a
+    /// delivery is fully enqueued, so a partially-failed delivery stays un-recorded and
+    /// GitHub's retry is processed rather than deduped away.
+    fn record(&mut self, id: &str) {
         if self.seen.contains(id) {
-            return false;
+            return;
         }
         if self.order.len() >= DEDUP_CAPACITY {
             if let Some(evicted) = self.order.pop_front() {
@@ -84,16 +91,6 @@ impl DeliveryDedup {
         }
         self.seen.insert(id.to_owned());
         self.order.push_back(id.to_owned());
-        true
-    }
-
-    /// Forgets a previously-recorded `id` so a redelivery will be processed again. Used when
-    /// we recorded the delivery but then failed to enqueue it (queue overflow), so GitHub's
-    /// retry must not be dropped as a duplicate.
-    fn forget(&mut self, id: &str) {
-        if self.seen.remove(id) {
-            self.order.retain(|d| d != id);
-        }
     }
 }
 
@@ -343,9 +340,14 @@ async fn handle_webhook(
     let delivery = header_str(&headers, "x-github-delivery").unwrap_or("?");
     let label = event_label(event_type, action);
 
-    // Idempotency: GitHub re-delivers on timeout/error. Drop a delivery we've already
-    // handled (a verified, identified one) so a retry doesn't start a duplicate run.
-    if delivery != "?" && !state.dedup.lock().unwrap().check_and_record(delivery) {
+    // Idempotency: GitHub re-delivers on timeout/error. Drop a delivery we've already FULLY
+    // handled so a retry doesn't start a duplicate run. We record a delivery only AFTER every
+    // matched subscription is enqueued (below) — a delivery recorded up-front, then partially
+    // failed, would let a *concurrent* in-flight retry of the same id see it as a duplicate and
+    // get a 2xx, so GitHub would never retry and the un-enqueued subscriptions would be lost.
+    // Recording after success keeps the contract at-least-once: the worst case is two in-flight
+    // deliveries of one id both enqueuing (a duplicate run), never a dropped one.
+    if delivery != "?" && dedup(&state).contains(delivery) {
         eprintln!("odind: webhook: duplicate delivery {delivery} ignored");
         return (StatusCode::OK, "duplicate delivery ignored").into_response();
     }
@@ -371,13 +373,9 @@ async fn handle_webhook(
         }
     }
     if dropped > 0 {
-        // We recorded the delivery for dedup but couldn't enqueue every matched run (queue
-        // overflow). Forget it so GitHub's retry isn't dropped as a duplicate, and return a
-        // non-2xx so GitHub actually retries. (A partially-enqueued delivery may re-run the
-        // already-enqueued subscriptions on retry — preferred over silently losing the event.)
-        if delivery != "?" {
-            state.dedup.lock().unwrap().forget(delivery);
-        }
+        // Couldn't enqueue every matched run (queue overflow). Leave the delivery UN-recorded
+        // and return a non-2xx so GitHub retries it. (A retry may re-enqueue subscriptions that
+        // already accepted — at-least-once, preferred over silently losing the event.)
         eprintln!(
             "odind: webhook: {label} delivery={delivery} → {dropped}/{matched} enqueue(s) failed; asking GitHub to retry"
         );
@@ -387,8 +385,22 @@ async fn handle_webhook(
         )
             .into_response();
     }
+    // Fully enqueued (or nothing matched): record now so GitHub's later retry is deduped.
+    if delivery != "?" {
+        dedup(&state).record(delivery);
+    }
     eprintln!("odind: webhook: {label} delivery={delivery} → matched {matched} subscription(s)");
     (StatusCode::ACCEPTED, format!("accepted; matched {matched}")).into_response()
+}
+
+/// Locks the dedup set, recovering the guard if a previous holder panicked (poison) rather
+/// than propagating the panic — a poisoned lock must not permanently wedge webhook delivery.
+/// The guarded operations are infallible collection ops, so the recovered state is consistent.
+fn dedup(state: &AppState) -> std::sync::MutexGuard<'_, DeliveryDedup> {
+    state
+        .dedup
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Verifies `X-Hub-Signature-256` against the raw body. Returns `None` to accept (a
@@ -493,6 +505,30 @@ mod tests {
     fn event_matching_is_case_insensitive() {
         let spec = EventSpec::parse("Issues.Labeled");
         assert!(spec.matches("issues", Some("labeled")));
+    }
+
+    #[test]
+    fn dedup_records_after_success_is_idempotent_and_bounded() {
+        use super::{DEDUP_CAPACITY, DeliveryDedup};
+        let mut d = DeliveryDedup::new();
+        // A delivery is a duplicate only once recorded. The handler records only after a
+        // delivery fully enqueues, so a partial-enqueue failure leaves `contains` false and
+        // GitHub's retry is processed (the at-least-once contract) rather than deduped away.
+        assert!(!d.contains("a"));
+        d.record("a");
+        assert!(d.contains("a"));
+        d.record("a"); // idempotent — recording twice must not double-insert.
+        assert!(d.contains("a"));
+        // FIFO eviction keeps the set bounded: recording `DEDUP_CAPACITY` fresh ids past "a"
+        // evicts "a" (the oldest), while the newest id is retained.
+        for i in 0..DEDUP_CAPACITY {
+            d.record(&format!("k{i}"));
+        }
+        assert!(!d.contains("a"), "oldest id evicted once over capacity");
+        assert!(
+            d.contains(&format!("k{}", DEDUP_CAPACITY - 1)),
+            "newest id retained"
+        );
     }
 
     #[test]
