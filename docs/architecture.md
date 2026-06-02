@@ -283,8 +283,15 @@ the same trust as a shell script you are about to run.
 - **`prompt_file` is contained** under the repository root (absolute paths and `..`
   escapes are rejected). Git is always invoked with a fixed argument vector (never via a
   shell), and config-derived arguments are guarded: `git.push` rejects a remote or branch
-  beginning with `-` so it can't be misread as a flag, and diff capture appends a trailing
-  `--` to separate revisions from pathspecs.
+  beginning with `-`, and `github.open_pr` rejects a `base`/`head` beginning with `-`, so a
+  templated value can't be misread as a flag (argument injection); diff capture appends a
+  trailing `--` to separate revisions from pathspecs.
+- **Odin's own secrets are shielded from the agents it spawns.** Every subprocess Odin
+  launches — provider CLIs, `run:`/gate shells, and built-in actions — otherwise inherits the
+  launching process's full environment, so the engine scrubs its internal secrets
+  (currently `ODIN_WEBHOOK_SECRET`) from each child before exec. Unrelated environment is
+  still inherited by design (agent CLIs need `HOME`/`PATH`/their own auth), so don't place
+  unrelated secrets in the daemon's environment if the agents it runs are untrusted.
 
 ## Forward-compatibility seams
 

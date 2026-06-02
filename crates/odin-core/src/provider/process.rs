@@ -19,6 +19,13 @@ use tokio::process::Command;
 use crate::error::ProviderError;
 use crate::traits::CancelToken;
 
+/// Odin-internal secrets scrubbed from every spawned child's environment. Providers, actions,
+/// gates, and `run:` steps all spawn through [`run_process`], and an agent CLI (or any shell a
+/// `run:`/gate executes) inherits the launching process's environment — so without this the
+/// daemon's own webhook HMAC secret would be readable by every agent subprocess it starts.
+/// (Trusted internal `git` invocations spawn outside this path and run no untrusted code.)
+const SHIELDED_ENV: &[&str] = &["ODIN_WEBHOOK_SECRET"];
+
 /// Knobs for a single [`run_process`] invocation.
 #[derive(Clone, Debug, Default)]
 pub struct ProcessOptions {
@@ -84,6 +91,11 @@ pub async fn run_process(
     }
     for (k, v) in &opts.env {
         cmd.env(k, v);
+    }
+    // Strip Odin's own secrets last, so neither the inherited environment nor an explicit
+    // `opts.env` entry can leak them into the child (defense in depth).
+    for key in SHIELDED_ENV {
+        cmd.env_remove(key);
     }
 
     let mut child = match cmd.spawn() {
@@ -286,6 +298,33 @@ mod tests {
             "run_process must return promptly after timeout, took {:?}",
             started.elapsed()
         );
+    }
+
+    #[tokio::test]
+    async fn shields_odin_secret_from_the_child() {
+        // ODIN_WEBHOOK_SECRET must never reach a spawned child, even when present in its
+        // environment; an unrelated var must survive. (We seed it via `opts.env` rather than
+        // the parent process env because `std::env::set_var` is `unsafe`, which the crate
+        // forbids — and `env_remove` strips inherited and explicit entries alike.)
+        let opts = ProcessOptions {
+            env: vec![
+                ("ODIN_WEBHOOK_SECRET".to_owned(), "leaked".to_owned()),
+                ("ODIN_KEEP_ME".to_owned(), "kept".to_owned()),
+            ],
+            ..Default::default()
+        };
+        let out = run_process(
+            "sh",
+            &args(&[
+                "-c",
+                "echo \"${ODIN_WEBHOOK_SECRET:-CLEAN}:${ODIN_KEEP_ME:-MISSING}\"",
+            ]),
+            &opts,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.stdout.trim(), "CLEAN:kept");
     }
 
     #[tokio::test]
