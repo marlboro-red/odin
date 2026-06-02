@@ -86,6 +86,9 @@ struct StepOutcome {
     gates: IndexMap<String, bool>,
     side_effects: Vec<SideEffect>,
     error: Option<String>,
+    /// Captured stderr from the dispatch (provider/`run:`), folded into `error` on failure.
+    /// Transient — not persisted to `StepState`.
+    stderr: String,
     attempts: u8,
     judge_score: Option<f32>,
 }
@@ -100,6 +103,7 @@ impl StepOutcome {
             gates: IndexMap::new(),
             side_effects: Vec::new(),
             error: Some(error.into()),
+            stderr: String::new(),
             attempts: 1,
             judge_score: None,
         }
@@ -114,6 +118,7 @@ impl StepOutcome {
             gates: IndexMap::new(),
             side_effects: Vec::new(),
             error: None,
+            stderr: String::new(),
             attempts: 1,
             judge_score: None,
         }
@@ -216,6 +221,7 @@ impl LocalEngine {
                 step: id.clone(),
                 status: outcome.status,
                 exit_code: outcome.exit_code,
+                error: outcome.error.clone(),
                 at: Utc::now(),
             },
         )
@@ -241,6 +247,7 @@ impl LocalEngine {
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                error: None,
             },
         );
         state.updated_at = Utc::now();
@@ -349,7 +356,9 @@ impl LocalEngine {
                         outputs
                             .entry("stdout".to_owned())
                             .or_insert(Value::String(o.stdout));
-                        StepOutcome::passing(o.exit_code, outputs, o.usage)
+                        let mut outcome = StepOutcome::passing(o.exit_code, outputs, o.usage);
+                        outcome.stderr = o.stderr;
+                        outcome
                     }
                     Err(e) => StepOutcome::failed(format!("provider error: {e}")),
                 }
@@ -360,10 +369,12 @@ impl LocalEngine {
                     Err(e) => return StepOutcome::failed(e.to_string()),
                 };
                 match self.shell(&cmd, workdir, timeout, cancel).await {
-                    Ok((code, stdout)) => {
+                    Ok((code, stdout, stderr)) => {
                         let mut outputs = IndexMap::new();
                         outputs.insert("stdout".to_owned(), Value::String(stdout));
-                        StepOutcome::passing(code, outputs, None)
+                        let mut outcome = StepOutcome::passing(code, outputs, None);
+                        outcome.stderr = stderr;
+                        outcome
                     }
                     Err(e) => StepOutcome::failed(format!("run error: {e}")),
                 }
@@ -415,9 +426,9 @@ impl LocalEngine {
         }
         if outcome.exit_code.unwrap_or(0) != 0 {
             outcome.status = StepStatus::Failed;
-            outcome.error = Some(format!(
-                "exited with code {}",
-                outcome.exit_code.unwrap_or(-1)
+            outcome.error = Some(with_stderr_tail(
+                &format!("exited with code {}", outcome.exit_code.unwrap_or(-1)),
+                &outcome.stderr,
             ));
             return outcome;
         }
@@ -432,11 +443,17 @@ impl LocalEngine {
                     return outcome;
                 }
             };
-            let passed = matches!(self.shell(&cmd, workdir, timeout, cancel).await, Ok((0, _)));
+            let (passed, gate_stderr) = match self.shell(&cmd, workdir, timeout, cancel).await {
+                Ok((code, _, stderr)) => (code == 0, stderr),
+                Err(e) => (false, e.to_string()),
+            };
             outcome.gates.insert(name.as_str().to_owned(), passed);
             if !passed {
                 outcome.status = StepStatus::Failed;
-                outcome.error = Some(format!("gate {:?} failed", name.as_str()));
+                outcome.error = Some(with_stderr_tail(
+                    &format!("gate {:?} failed", name.as_str()),
+                    &gate_stderr,
+                ));
             }
         }
 
@@ -589,7 +606,7 @@ impl LocalEngine {
         workdir: &Path,
         timeout: Option<Duration>,
         cancel: &CancelToken,
-    ) -> Result<(i32, String)> {
+    ) -> Result<(i32, String, String)> {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             timeout,
@@ -598,7 +615,7 @@ impl LocalEngine {
         };
         let args = vec!["-c".to_owned(), command.to_owned()];
         let out = run_process("sh", &args, &opts, cancel).await?;
-        Ok((out.exit_code, out.stdout))
+        Ok((out.exit_code, out.stdout, out.stderr))
     }
 
     /// Captures the working-tree diff in `workdir`, including agent-created files.
@@ -946,6 +963,7 @@ impl LocalEngine {
                 usage: outcome.usage,
                 gates: outcome.gates.clone(),
                 judge_score: outcome.judge_score,
+                error: outcome.error.clone(),
             };
             state.steps.insert(id.clone(), step_state.clone());
             if matches!(
@@ -1167,6 +1185,19 @@ impl LocalEngine {
         } else {
             RunStatus::Succeeded
         };
+        // Surface *why* the run failed: prefer an explicit run-level error, else the first
+        // failed step's recorded reason (so `summary.error` isn't a contentless placeholder).
+        let error = error.or_else(|| {
+            exec.steps
+                .iter()
+                .find(|s| matches!(s.status, StepStatus::Failed))
+                .map(|s| {
+                    s.error.clone().map_or_else(
+                        || format!("step {:?} failed", s.id.as_str()),
+                        |e| format!("step {:?} failed: {e}", s.id.as_str()),
+                    )
+                })
+        });
         let summary = RunSummary {
             run_id,
             workflow: workflow.name.clone(),
@@ -1283,13 +1314,8 @@ impl Engine for LocalEngine {
                 Some(e.to_string()),
             ),
         };
-        let error = error.or_else(|| {
-            exec.steps
-                .iter()
-                .find(|s| matches!(s.status, StepStatus::Failed))
-                .map(|s| format!("step {:?} failed", s.id.as_str()))
-        });
-
+        // A step failure leaves `error` None here; `summarize` derives the run-level error
+        // from the first failed step's recorded reason (single source of truth).
         let (status, summary) = Self::summarize(run_id, workflow, exec, error, started_at);
         state.status = status;
         state.error = summary.error.clone();
@@ -1349,16 +1375,13 @@ impl Engine for LocalEngine {
                             .await;
                         match exec {
                             Ok(result) => {
-                                let error = result
-                                    .steps
-                                    .iter()
-                                    .find(|s| matches!(s.status, StepStatus::Failed))
-                                    .map(|s| format!("step {:?} failed", s.id.as_str()));
+                                // `summarize` derives the run-level error from the first failed
+                                // step's recorded reason (single source of truth).
                                 let (status, summary) = Self::summarize(
                                     state.run_id,
                                     workflow,
                                     result,
-                                    error,
+                                    None,
                                     started_at,
                                 );
                                 state.status = status;
@@ -1437,6 +1460,7 @@ fn skipped_outcome() -> StepOutcome {
         gates: IndexMap::new(),
         side_effects: Vec::new(),
         error: None,
+        stderr: String::new(),
         attempts: 1,
         judge_score: None,
     }
@@ -1463,7 +1487,30 @@ fn step_result(id: &StepId, state: &StepState) -> StepResult {
         gates: state.gates.clone(),
         judge_score: state.judge_score,
         usage: state.usage,
+        error: state.error.clone(),
     }
+}
+
+/// Appends a truncated tail of `stderr` to a failure `message`, so a failed step records the
+/// actual cause (compiler errors, an auth failure, a stack trace) rather than just an exit
+/// code. Keeps the *end* of stderr (where the real error usually is), on a char boundary.
+fn with_stderr_tail(message: &str, stderr: &str) -> String {
+    const MAX: usize = 2000;
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        return message.to_owned();
+    }
+    if stderr.len() <= MAX {
+        return format!("{message}\nstderr:\n{stderr}");
+    }
+    let mut start = stderr.len() - MAX;
+    while start < stderr.len() && !stderr.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "{message}\nstderr (last {MAX} bytes):\n…{}",
+        &stderr[start..]
+    )
 }
 
 /// Base inter-attempt retry delay.
@@ -1683,6 +1730,59 @@ steps:
     }
 
     #[tokio::test]
+    async fn failed_step_records_reason_and_stderr() {
+        // A failed step must surface WHY it failed — the exit code + the stderr tail — on the
+        // StepResult, in the persisted StepState, and in the run-level summary.error.
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: f\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: boom, run: \"echo the-real-error 1>&2; exit 3\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+
+        assert_eq!(summary.status, RunStatus::Failed);
+        let boom = summary
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == "boom")
+            .unwrap();
+        assert_eq!(boom.status, StepStatus::Failed);
+        let err = boom.error.as_deref().expect("step error is recorded");
+        assert!(
+            err.contains("exited with code 3"),
+            "exit code in error: {err}"
+        );
+        assert!(
+            err.contains("the-real-error"),
+            "stderr folded into error: {err}"
+        );
+
+        // The run-level error names the failed step and its reason (not a bare placeholder).
+        let run_err = summary.error.as_deref().expect("summary.error is set");
+        assert!(
+            run_err.contains("boom") && run_err.contains("exited with code 3"),
+            "summary.error: {run_err}"
+        );
+
+        // And it survives a reload from the store (StepState.error is persisted).
+        let reloaded = eng.summary(summary.run_id).await.unwrap().unwrap();
+        let boom2 = reloaded
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == "boom")
+            .unwrap();
+        assert!(
+            boom2
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("the-real-error"),
+            "persisted error survives reload"
+        );
+    }
+
+    #[tokio::test]
     async fn when_false_skips_the_step() {
         let repo = init_repo().await;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -1832,6 +1932,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                error: None,
             },
         );
         let state = RunState {
@@ -1917,6 +2018,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                error: None,
             },
         );
         let state = RunState {
@@ -1998,6 +2100,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                error: None,
             },
         );
         let state = RunState {
@@ -2111,6 +2214,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                error: None,
             },
         );
         let state = RunState {
@@ -2178,6 +2282,7 @@ steps:
                     usage: None,
                     gates: IndexMap::new(),
                     judge_score: None,
+                    error: None,
                 },
             );
         }

@@ -123,6 +123,11 @@ pub struct StepState {
     /// LLM-as-judge score, if a judge ran.
     #[serde(default)]
     pub judge_score: Option<f32>,
+    /// Why the step failed (exit code + stderr tail, a failed gate, a sub-threshold judge, a
+    /// provider/action error) — or, for a `Skipped` step, why it was skipped (an upstream
+    /// dependency failed). Persisted so a failed run is debuggable. `None` for a passed step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// An immutable audit-log entry. Both the enum and each variant are `#[non_exhaustive]`,
@@ -181,6 +186,9 @@ pub enum RunEvent {
         status: StepStatus,
         /// Exit code, if any.
         exit_code: Option<i32>,
+        /// Why it failed, if it did (mirrors `StepState.error`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
         /// When.
         at: DateTime<Utc>,
     },

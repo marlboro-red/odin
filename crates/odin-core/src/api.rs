@@ -115,6 +115,11 @@ pub struct StepResult {
     pub judge_score: Option<f32>,
     /// Usage for this step.
     pub usage: Option<Usage>,
+    /// Why the step failed (exit code + stderr tail, a failed gate, a sub-threshold judge,
+    /// a provider/action error) — or, for a `Skipped` step, why it was skipped. `None` for a
+    /// step that passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Lifecycle status of a run.

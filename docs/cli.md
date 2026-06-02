@@ -161,9 +161,11 @@ Events are `run_started`, `step_started`, `gate_result`, `judge_result`, `step_f
 - **`validate --json`** → a `ValidationReport`: `{ "diagnostics": [ { "severity", "code"
   ("ODIN0NN"), "message", "pointer", "help" }, … ] }`.
 - **`run --json`** → a `RunSummary`: `{ "run_id", "workflow", "status", "steps": [ {
-  "id", "status", "attempts", "exit_code", "outputs", "gates", "judge_score", "usage" } ],
-  "usage": { "input_tokens", "output_tokens", "cost_micros" }, "side_effects", "diff",
-  "error", "started_at", "finished_at" }`.
+  "id", "status", "attempts", "exit_code", "outputs", "gates", "judge_score", "usage",
+  "error" } ], "usage": { "input_tokens", "output_tokens", "cost_micros" }, "side_effects",
+  "diff", "error", "started_at", "finished_at" }`. A failed step's `error` carries the exit
+  code + a stderr tail (or the failed gate / sub-threshold judge), and the run-level `error`
+  names the first failed step and its reason.
 - **`show --json`** → the full `RunState` (the persisted checkpoint).
 - **`list --json`** → `[{ "run_id", "workflow", "status", "updated_at" }, …]`.
 - **`logs --json`** → an array of `RunEvent` (each tagged by `kind`).

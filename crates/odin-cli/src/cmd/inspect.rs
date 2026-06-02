@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use anyhow::Context as _;
 use odin_core::traits::{RunEvent, RunState};
-use odin_core::{ArtifactName, RunId, RunStatus, SqliteStore, Store};
+use odin_core::{ArtifactName, RunId, RunStatus, SqliteStore, StepStatus, Store};
 
 /// Resolves the state DB path (`--db`, else `<repo>/.odin/state.db`) and opens it if it
 /// exists. `Ok(None)` means there is no database yet (printed for the caller to handle).
@@ -168,6 +168,11 @@ fn print_run(state: &RunState) {
                 String::new()
             };
             println!("  {id:<12} {:?}{exit}{attempts}", step.status);
+            if step.status == StepStatus::Failed {
+                if let Some(reason) = step.error.as_deref().and_then(|e| e.lines().next()) {
+                    println!("  {:<12}   ↳ {reason}", "");
+                }
+            }
         }
     }
     if state.artifacts.contains_key(&ArtifactName::new("DIFF")) {
