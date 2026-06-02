@@ -13,6 +13,10 @@ use crate::traits::{CancelToken, InvocationCtx, InvocationOutcome, Provider};
 /// Defaults to `--allow-all` (tools/paths/urls), required for non-interactive autonomy;
 /// the run executes in an isolated worktree, so that blast radius is contained. The
 /// binary name and flags are configurable.
+///
+/// Unlike the claude/codex adapters (which isolate the agent's final message), copilot's
+/// captured `stdout` is best-effort: `--no-color`/`--log-level none` strip ANSI and the
+/// log stream, but the CLI may still print session chrome around the result.
 pub struct CopilotProvider {
     program: String,
     extra_args: Vec<String>,

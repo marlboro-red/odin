@@ -79,6 +79,13 @@ impl Action for GitPush {
                 .to_owned(),
         };
 
+        // Refuse a remote/branch that git would parse as an option (these come from
+        // templated `with:` values that may include trigger data).
+        if remote.starts_with('-') || branch.starts_with('-') {
+            return Err(ActionError::Other(anyhow::anyhow!(
+                "git.push: remote/branch must not start with '-' (remote={remote:?}, branch={branch:?})"
+            )));
+        }
         super::checked(
             "git",
             &["push", "--set-upstream", remote.as_str(), branch.as_str()],

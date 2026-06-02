@@ -98,3 +98,12 @@ fn list_show_logs_a_persisted_run() {
     ]);
     assert_eq!(missing.status.code(), Some(1));
 }
+
+#[test]
+fn list_json_on_missing_db_emits_empty_array() {
+    // A fresh dir with no .odin/state.db — `--json` must still emit valid JSON to stdout.
+    let dir = tempfile::tempdir().unwrap();
+    let out = odin(&["list", "--repo", dir.path().to_str().unwrap(), "--json"]);
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
+}

@@ -110,6 +110,12 @@ pub struct StepState {
     pub outputs: IndexMap<String, serde_json::Value>,
     /// Usage for this step's invocations.
     pub usage: Option<Usage>,
+    /// Gate name → passed, for the step's last attempt.
+    #[serde(default)]
+    pub gates: IndexMap<String, bool>,
+    /// LLM-as-judge score, if a judge ran.
+    #[serde(default)]
+    pub judge_score: Option<f32>,
 }
 
 /// An immutable audit-log entry. Both the enum and each variant are `#[non_exhaustive]`,

@@ -144,7 +144,8 @@ impl Store for SqliteStore {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let conn = self.conn.lock().await;
         let mut stmt =
-            db(conn.prepare("SELECT state FROM runs ORDER BY updated_at DESC LIMIT ?1"))?;
+            db(conn
+                .prepare("SELECT state FROM runs ORDER BY updated_at DESC, run_id DESC LIMIT ?1"))?;
         let rows = db(stmt.query_map(params![limit], |row| row.get::<_, String>(0)))?;
         let mut out = Vec::new();
         for row in rows {

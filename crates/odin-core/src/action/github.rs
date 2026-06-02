@@ -45,11 +45,20 @@ impl Action for OpenPr {
             )));
         }
 
-        // gh prints the PR URL on stdout; the number is its last path segment.
-        let url = out.stdout.lines().last().unwrap_or("").trim().to_owned();
+        // gh prints the PR URL on its last non-empty stdout line; the number is the last
+        // non-empty path segment (tolerant of a trailing slash).
+        let url = out
+            .stdout
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_owned();
         let number = url
             .rsplit('/')
-            .next()
+            .find(|s| !s.is_empty())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 

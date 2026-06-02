@@ -149,9 +149,47 @@ impl LocalEngine {
         }
     }
 
+    /// Appends the gate/judge/finished audit events for a completed step.
+    async fn emit_step_events(&self, run_id: RunId, id: &StepId, outcome: &StepOutcome) {
+        for (gate, passed) in &outcome.gates {
+            self.emit(
+                run_id,
+                RunEvent::GateResult {
+                    step: id.clone(),
+                    gate: gate.clone(),
+                    passed: *passed,
+                    at: Utc::now(),
+                },
+            )
+            .await;
+        }
+        if let Some(score) = outcome.judge_score {
+            self.emit(
+                run_id,
+                RunEvent::JudgeResult {
+                    step: id.clone(),
+                    score,
+                    passed: outcome.status == StepStatus::Passed,
+                    at: Utc::now(),
+                },
+            )
+            .await;
+        }
+        self.emit(
+            run_id,
+            RunEvent::StepFinished {
+                step: id.clone(),
+                status: outcome.status,
+                exit_code: outcome.exit_code,
+                at: Utc::now(),
+            },
+        )
+        .await;
+    }
+
     /// Records a step `Running` and checkpoints it — the durability boundary written
     /// before dispatch, so a step interrupted mid-flight is distinguishable from one not
-    /// yet started.
+    /// yet started. (The `StepStarted` event is emitted per attempt by `run_with_retry`.)
     async fn mark_running(
         &self,
         workflow: &Workflow,
@@ -166,20 +204,12 @@ impl LocalEngine {
                 exit_code: None,
                 outputs: IndexMap::new(),
                 usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
             },
         );
         state.updated_at = Utc::now();
-        self.checkpoint(workflow.durable, state).await?;
-        self.emit(
-            state.run_id,
-            RunEvent::StepStarted {
-                step: id.clone(),
-                attempt: 1,
-                at: Utc::now(),
-            },
-        )
-        .await;
-        Ok(())
+        self.checkpoint(workflow.durable, state).await
     }
 
     /// Resolves declared params (input value or default), erroring on a missing required
@@ -453,8 +483,10 @@ impl LocalEngine {
 
     /// Decides a step's outcome: skip if a dependency failed or `when` is false, else run
     /// it (with retry).
+    #[allow(clippy::too_many_arguments)]
     async fn decide_outcome(
         &self,
+        run_id: RunId,
         step: &Step,
         ctx: &minijinja::Value,
         workdir: &Path,
@@ -468,35 +500,47 @@ impl LocalEngine {
         match step.when.as_deref() {
             Some(expr) => match eval_when(expr, ctx) {
                 Ok(true) => {
-                    self.run_with_retry(step, ctx, workdir, timeout, cancel)
+                    self.run_with_retry(run_id, step, ctx, workdir, timeout, cancel)
                         .await
                 }
                 Ok(false) => skipped_outcome(),
                 Err(e) => StepOutcome::failed(format!("when: {e}")),
             },
             None => {
-                self.run_with_retry(step, ctx, workdir, timeout, cancel)
+                self.run_with_retry(run_id, step, ctx, workdir, timeout, cancel)
                     .await
             }
         }
     }
 
     /// Runs a step, retrying on failure per its retry policy with backoff between attempts.
+    /// Emits a `StepStarted` event per attempt.
     async fn run_with_retry(
         &self,
+        run_id: RunId,
         step: &Step,
         ctx: &minijinja::Value,
         workdir: &Path,
         timeout: Option<Duration>,
         cancel: &CancelToken,
     ) -> StepOutcome {
-        let max_extra = step.retry.max;
-        let mut attempt: u8 = 0;
+        // u32 so a (valid) `retry.max` of 255 can't overflow the attempt counter.
+        let max_attempts = 1 + u32::from(step.retry.max);
+        let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            self.emit(
+                run_id,
+                RunEvent::StepStarted {
+                    step: step.id.clone(),
+                    attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
+                    at: Utc::now(),
+                },
+            )
+            .await;
             let mut outcome = self.exec_step(step, ctx, workdir, timeout, cancel).await;
-            if outcome.status != StepStatus::Failed || attempt > max_extra {
-                outcome.attempts = attempt;
+            if outcome.status != StepStatus::Failed || attempt >= max_attempts {
+                outcome.attempts = u8::try_from(attempt).unwrap_or(u8::MAX);
                 return outcome;
             }
             tokio::time::sleep(backoff_delay(step.retry.backoff, attempt)).await;
@@ -573,7 +617,7 @@ impl LocalEngine {
             // Already done (resume): keep its state, surface it in the summary.
             if let Some(existing) = state.steps.get(id) {
                 if matches!(existing.status, StepStatus::Passed | StepStatus::Skipped) {
-                    summary.push(step_result(id, existing, IndexMap::new(), None));
+                    summary.push(step_result(id, existing));
                     continue;
                 }
             }
@@ -602,7 +646,15 @@ impl LocalEngine {
             self.mark_running(workflow, state, id).await?;
 
             let outcome = self
-                .decide_outcome(step, &ctx, workdir, timeout, deps_passed, cancel)
+                .decide_outcome(
+                    state.run_id,
+                    step,
+                    &ctx,
+                    workdir,
+                    timeout,
+                    deps_passed,
+                    cancel,
+                )
                 .await;
 
             if let Some(u) = &outcome.usage {
@@ -617,6 +669,8 @@ impl LocalEngine {
                 exit_code: outcome.exit_code,
                 outputs: outcome.outputs.clone(),
                 usage: outcome.usage,
+                gates: outcome.gates.clone(),
+                judge_score: outcome.judge_score,
             };
             state.steps.insert(id.clone(), step_state.clone());
             if matches!(outcome.status, StepStatus::Passed) {
@@ -627,23 +681,9 @@ impl LocalEngine {
             }
             state.updated_at = Utc::now();
             self.checkpoint(workflow.durable, state).await?;
-            self.emit(
-                state.run_id,
-                RunEvent::StepFinished {
-                    step: id.clone(),
-                    status: outcome.status,
-                    exit_code: outcome.exit_code,
-                    at: Utc::now(),
-                },
-            )
-            .await;
+            self.emit_step_events(state.run_id, id, &outcome).await;
 
-            summary.push(step_result(
-                id,
-                &step_state,
-                outcome.gates,
-                outcome.judge_score,
-            ));
+            summary.push(step_result(id, &step_state));
         }
 
         Ok(ExecResult {
@@ -704,9 +744,9 @@ impl LocalEngine {
             steps: state
                 .steps
                 .iter()
-                .map(|(id, st)| step_result(id, st, IndexMap::new(), None))
+                .map(|(id, st)| step_result(id, st))
                 .collect(),
-            usage: Usage::default(),
+            usage: total_usage(&state.steps),
             side_effects: Vec::new(),
             diff: state
                 .artifacts
@@ -877,18 +917,19 @@ impl Engine for LocalEngine {
         let steps = state
             .steps
             .iter()
-            .map(|(id, st)| step_result(id, st, IndexMap::new(), None))
+            .map(|(id, st)| step_result(id, st))
             .collect();
         let diff = state
             .artifacts
             .get(&crate::ids::ArtifactName::new(DIFF))
             .cloned();
+        let usage = total_usage(&state.steps);
         Ok(Some(RunSummary {
             run_id: state.run_id,
             workflow: state.workflow,
             status: state.status,
             steps,
-            usage: Usage::default(),
+            usage,
             side_effects: Vec::new(),
             diff,
             error: state.error,
@@ -920,20 +961,26 @@ fn skipped_outcome() -> StepOutcome {
     }
 }
 
-fn step_result(
-    id: &StepId,
-    state: &StepState,
-    gates: IndexMap<String, bool>,
-    judge_score: Option<f32>,
-) -> StepResult {
+/// Sums the persisted per-step usage across a run's steps.
+fn total_usage(steps: &IndexMap<StepId, StepState>) -> Usage {
+    let mut usage = Usage::default();
+    for step in steps.values() {
+        if let Some(u) = step.usage {
+            usage.add(u);
+        }
+    }
+    usage
+}
+
+fn step_result(id: &StepId, state: &StepState) -> StepResult {
     StepResult {
         id: id.clone(),
         status: state.status,
         attempts: state.attempts,
         exit_code: state.exit_code,
         outputs: state.outputs.clone(),
-        gates,
-        judge_score,
+        gates: state.gates.clone(),
+        judge_score: state.judge_score,
         usage: state.usage,
     }
 }
@@ -942,23 +989,64 @@ fn step_result(
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 /// The delay before re-attempting after `completed_attempt` failed.
-fn backoff_delay(backoff: Backoff, completed_attempt: u8) -> Duration {
+fn backoff_delay(backoff: Backoff, completed_attempt: u32) -> Duration {
     match backoff {
         Backoff::Fixed => RETRY_BASE_DELAY,
         Backoff::Exponential => {
-            RETRY_BASE_DELAY * 2u32.pow(u32::from(completed_attempt.saturating_sub(1)).min(6))
+            RETRY_BASE_DELAY * 2u32.pow(completed_attempt.saturating_sub(1).min(6))
         }
     }
 }
 
-/// Extracts a `0.0..=1.0` score from judge output (a JSON object with a `score` field).
-#[allow(clippy::cast_possible_truncation)]
+/// Extracts a `0.0..=1.0` score from judge output: a JSON object with a `score` field,
+/// even when the model wraps it in prose or other braces.
 fn parse_score(text: &str) -> Option<f32> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let value: Value = serde_json::from_str(text.get(start..=end)?).ok()?;
-    let score = value.get("score")?.as_f64()?;
-    Some((score as f32).clamp(0.0, 1.0))
+    // Fast path: the whole output is the JSON object.
+    if let Some(score) = score_from_json(text.trim()) {
+        return Some(score);
+    }
+    // Otherwise scan each `{` for the balanced object it opens and try that.
+    for (start, _) in text.match_indices('{') {
+        let mut depth = 0usize;
+        for (offset, ch) in text[start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(slice) = text.get(start..=start + offset) {
+                            if let Some(score) = score_from_json(slice) {
+                                return Some(score);
+                            }
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// Parses one JSON document and pulls a `score` out of it (anywhere in the tree).
+fn score_from_json(s: &str) -> Option<f32> {
+    let value: Value = serde_json::from_str(s).ok()?;
+    extract_score(&value)
+}
+
+/// Finds a `score` value (number or numeric string) anywhere in a JSON value.
+#[allow(clippy::cast_possible_truncation)]
+fn extract_score(value: &Value) -> Option<f32> {
+    if let Some(score) = value.get("score") {
+        let n = score
+            .as_f64()
+            .or_else(|| score.as_str().and_then(|s| s.trim().parse::<f64>().ok()));
+        if let Some(n) = n {
+            return Some((n as f32).clamp(0.0, 1.0));
+        }
+    }
+    value.as_object()?.values().find_map(extract_score)
 }
 
 /// Builds the minijinja context from the run state assembled so far.
@@ -1162,6 +1250,8 @@ steps:
                 exit_code: Some(0),
                 outputs: IndexMap::new(),
                 usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
             },
         );
         let state = RunState {
@@ -1228,6 +1318,8 @@ steps:
                     exit_code: Some(0),
                     outputs: IndexMap::new(),
                     usage: None,
+                    gates: IndexMap::new(),
+                    judge_score: None,
                 },
             );
         }
@@ -1426,6 +1518,17 @@ steps:
             Some(1.0)
         );
         assert_eq!(super::parse_score("no json here"), None);
+        // Verdict wrapped in brace-bearing prose (common for real LLM judges).
+        assert_eq!(
+            super::parse_score("Looking at {correctness}. Final: {\"score\": 0.85}"),
+            Some(0.85)
+        );
+        // Score as a string, or under a nested key.
+        assert_eq!(super::parse_score(r#"{"score": "0.9"}"#), Some(0.9));
+        assert_eq!(
+            super::parse_score(r#"{"result": {"score": 0.7}}"#),
+            Some(0.7)
+        );
     }
 
     #[tokio::test]
@@ -1449,6 +1552,18 @@ steps:
         let a = &summary.steps[0];
         assert_eq!(a.status, StepStatus::Passed);
         assert!((a.judge_score.unwrap() - 0.9).abs() < 0.001);
+
+        // The judge score (and gates) must survive a durable reload, not just live.
+        let reloaded = eng.summary(summary.run_id).await.unwrap().unwrap();
+        let ra = reloaded
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == "a")
+            .unwrap();
+        assert!(
+            (ra.judge_score.unwrap() - 0.9).abs() < 0.001,
+            "judge score must be persisted and reloadable"
+        );
     }
 
     #[tokio::test]

@@ -46,6 +46,9 @@ pub(crate) fn list(
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let Some(store) = open(repo, db)? else {
+        if json {
+            println!("[]");
+        }
         return Ok(ExitCode::SUCCESS);
     };
     runtime()?.block_on(async {
@@ -89,11 +92,17 @@ pub(crate) fn show(
 ) -> anyhow::Result<ExitCode> {
     let run_id: RunId = run_id.parse().context("invalid run id (expected a UUID)")?;
     let Some(store) = open(repo, db)? else {
+        if json {
+            println!("null");
+        }
         return Ok(ExitCode::from(1));
     };
     runtime()?.block_on(async {
         match store.load_run(run_id).await? {
             None => {
+                if json {
+                    println!("null");
+                }
                 eprintln!("no run {run_id}");
                 Ok(ExitCode::from(1))
             }
@@ -118,6 +127,9 @@ pub(crate) fn logs(
 ) -> anyhow::Result<ExitCode> {
     let run_id: RunId = run_id.parse().context("invalid run id (expected a UUID)")?;
     let Some(store) = open(repo, db)? else {
+        if json {
+            println!("[]");
+        }
         return Ok(ExitCode::from(1));
     };
     runtime()?.block_on(async {

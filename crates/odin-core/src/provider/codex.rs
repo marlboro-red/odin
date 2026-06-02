@@ -86,12 +86,15 @@ impl Provider for CodexProvider {
             stdin: None,
         };
         let out = run_process(&self.program, &args, &opts, &ctx.cancel).await?;
+
+        // Read the captured final message and remove the temp file on EVERY path (incl.
+        // timeout), so it never leaks into the worktree or the auto-captured DIFF.
+        let text = std::fs::read_to_string(&last_message).unwrap_or_else(|_| out.stdout.clone());
+        let _ = std::fs::remove_file(&last_message);
+
         if out.timed_out {
             return Err(ProviderError::Timeout(ctx.timeout.unwrap_or_default()));
         }
-
-        let text = std::fs::read_to_string(&last_message).unwrap_or_else(|_| out.stdout.clone());
-        let _ = std::fs::remove_file(&last_message);
 
         Ok(InvocationOutcome {
             exit_code: out.exit_code,
