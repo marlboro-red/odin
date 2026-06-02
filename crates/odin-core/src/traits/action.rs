@@ -1,0 +1,50 @@
+//! The [`Action`] trait: a built-in, named side-effect step.
+
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use indexmap::IndexMap;
+use serde_json::Value;
+
+use crate::api::SideEffect;
+use crate::error::ActionError;
+use crate::ids::StepId;
+
+/// A first-class, reusable side-effect available by name in `action:`
+/// (`github.open_pr`, `git.commit`, `shell.exec`). Distinct from a non-deterministic
+/// [`Provider`](crate::traits::Provider) and from an arbitrary `run:` hook.
+#[async_trait]
+pub trait Action: Send + Sync {
+    /// The name authors reference in `action:`.
+    fn name(&self) -> &str;
+
+    /// Executes the action against the prepared context.
+    ///
+    /// # Errors
+    /// Returns an [`ActionError`] if the action fails.
+    async fn run(&self, ctx: ActionCtx) -> Result<ActionOutcome, ActionError>;
+}
+
+/// Everything an action needs.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ActionCtx {
+    /// The step being run.
+    pub step_id: StepId,
+    /// Working directory.
+    pub workdir: PathBuf,
+    /// The step's `with:` args, already templated.
+    pub args: IndexMap<String, Value>,
+}
+
+/// What an action produced.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct ActionOutcome {
+    /// 0 = success. Mirrors the provider/run convention so gate logic is uniform.
+    pub exit_code: i32,
+    /// Outputs exposed to later steps as `steps.<id>.outputs.*`.
+    pub outputs: IndexMap<String, Value>,
+    /// Externally-visible effects, surfaced in [`crate::api::RunSummary`].
+    pub side_effects: Vec<SideEffect>,
+}

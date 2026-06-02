@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Odin runtime state (durable run store + per-run artifacts/logs)
+.odin/
+
+# Editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
