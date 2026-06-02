@@ -75,6 +75,11 @@ pub(crate) struct LocalEngine {
     /// Serializes `git worktree add/remove/prune`: git's worktree metadata is not safe for
     /// concurrent mutation, and scratch steps provision worktrees in parallel.
     worktree_lock: tokio::sync::Mutex<()>,
+    /// Cache of the built-in workspace per (kind, config) so every run — and every resume —
+    /// shares ONE instance. This is what makes `slot_pool`'s concurrency cap hold across
+    /// concurrent runs (its lease state is in-memory and per-instance); a fresh instance per
+    /// run would each get a full set of permits and hand out the same slot to everyone.
+    workspaces: std::sync::Mutex<HashMap<String, Arc<dyn Workspace>>>,
 }
 
 /// What executing a single step produced (richer than the persisted `StepState`).
@@ -144,6 +149,7 @@ impl LocalEngine {
             store,
             repo_root,
             worktree_lock: tokio::sync::Mutex::new(()),
+            workspaces: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -161,7 +167,14 @@ impl LocalEngine {
         if let Some(workspace) = self.registry.workspace(kind) {
             return Arc::clone(workspace);
         }
-        match cfg {
+        // Cache one built-in instance per (kind, config) for the engine's lifetime, so all
+        // runs and resumes share it. `slot_pool`'s concurrency cap and lease bookkeeping are
+        // in-memory and per-instance — a fresh instance per run would defeat them entirely.
+        let key = format!("{kind}|{}", serde_json::to_string(cfg).unwrap_or_default());
+        if let Some(workspace) = self.workspaces.lock().unwrap().get(&key) {
+            return Arc::clone(workspace);
+        }
+        let workspace: Arc<dyn Workspace> = match cfg {
             WorkspaceConfig::Worktree(_) => {
                 Arc::new(WorktreeWorkspace::new(self.repo_root.clone()))
             }
@@ -171,7 +184,12 @@ impl LocalEngine {
                 c.pool as usize,
                 c.reset,
             )),
-        }
+        };
+        self.workspaces
+            .lock()
+            .unwrap()
+            .insert(key, Arc::clone(&workspace));
+        workspace
     }
 
     async fn checkpoint(&self, durable: bool, state: &RunState) -> Result<()> {
@@ -585,9 +603,28 @@ impl LocalEngine {
     ) -> StepOutcome {
         // u32 so a (valid) `retry.max` of 255 can't overflow the attempt counter.
         let max_attempts = 1 + u32::from(step.retry.max);
+        // If the step can retry, snapshot the tree as it is BEFORE the first attempt, so each
+        // retry runs against that clean state rather than on top of the failed attempt's
+        // partial edits (a failing `run:` that mutated the workdir would otherwise double-
+        // apply). Best-effort and git-only: a non-git workdir yields `None` and we just retry
+        // in place, as before. Applies to the shared workdir and to scratch worktrees alike.
+        let pre_step_snapshot = if max_attempts > 1 {
+            match self.git_head(workdir, cancel).await {
+                Some(head) => self.snapshot_workdir(workdir, &head, run_id, cancel).await,
+                None => None,
+            }
+        } else {
+            None
+        };
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
+            // Before a *retry*, rewind the workdir to the pre-step snapshot.
+            if attempt > 1 {
+                if let Some(snapshot) = &pre_step_snapshot {
+                    self.restore_workdir(workdir, snapshot, cancel).await;
+                }
+            }
             self.emit(
                 run_id,
                 RunEvent::StepStarted {
@@ -1302,11 +1339,10 @@ impl Engine for LocalEngine {
             .execute(workflow, &mut state, &workdir, &params, &cancel)
             .await;
         // The run is terminal now — drop the snapshot ref so its commits can be collected.
-        // Unconditional for durable runs: a run that snapshotted then disengaged (committed)
-        // has `snapshot == None` yet still left the ref behind, so gating on it would leak.
-        if workflow.durable {
-            self.delete_snapshot_ref(&workdir, run_id, &cancel).await;
-        }
+        // Fully unconditional: durable runs snapshot per step, AND a retrying step snapshots
+        // even in a NON-durable run (for per-retry workdir restore), so either kind can leave
+        // the ref behind. `delete_snapshot_ref` is a no-op when no ref was created.
+        self.delete_snapshot_ref(&workdir, run_id, &cancel).await;
         let _ = workspace.release(handle).await;
 
         let (exec, error) = match exec {
@@ -2604,10 +2640,15 @@ steps:
             repo.path(),
             Arc::new(SqliteStore::open_in_memory().unwrap()),
         );
-        // Fails the first attempt (creates a marker), passes the second.
-        let wf = parse(
-            "name: r\nworkspace: { type: worktree }\nsteps:\n  - id: flaky\n    run: \"test -f .marker || (touch .marker; exit 1)\"\n    retry: { max: 1 }\n",
-        );
+        // Model real flakiness with state OUTSIDE the workdir (an external resource that
+        // becomes available on retry): the marker lives in a temp dir, NOT the workdir, so the
+        // per-retry workdir restore doesn't wipe it. Fails the first attempt, passes the second.
+        let ext = tempfile::tempdir().unwrap();
+        let marker = ext.path().join("marker");
+        let wf = parse(&format!(
+            "name: r\nworkspace: {{ type: worktree }}\nsteps:\n  - id: flaky\n    run: \"test -f {m} || (touch {m}; exit 1)\"\n    retry: {{ max: 1 }}\n",
+            m = marker.display()
+        ));
         let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
         assert_eq!(
             summary.status,
@@ -2618,6 +2659,57 @@ steps:
         let flaky = &summary.steps[0];
         assert_eq!(flaky.status, StepStatus::Passed);
         assert_eq!(flaky.attempts, 2, "should have retried once");
+    }
+
+    #[tokio::test]
+    async fn retry_rewinds_the_workdir_between_attempts() {
+        // Regression: a workdir mutation by a failed attempt must NOT persist into the retry.
+        // An in-workdir marker created on attempt 1 is wiped before attempt 2, so the step
+        // never "recovers" off its own partial edits — it exhausts its retries and fails.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: r\nworkspace: { type: worktree }\nsteps:\n  - id: flaky\n    run: \"test -f .marker || (touch .marker; exit 1)\"\n    retry: { max: 1 }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Failed);
+        let flaky = &summary.steps[0];
+        assert_eq!(flaky.status, StepStatus::Failed);
+        assert_eq!(flaky.attempts, 2, "both attempts ran against a clean tree");
+    }
+
+    #[tokio::test]
+    async fn non_durable_retry_does_not_leak_a_snapshot_ref() {
+        // A retrying step snapshots the tree even in a non-durable run; the snapshot ref must
+        // still be reclaimed at run end (cleanup is gated on durable elsewhere, so this guards
+        // the unconditional run-path delete).
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: r\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: flaky, run: \"echo x >> f.txt && false\", retry: { max: 1 }}\n",
+        );
+        let _ = eng.run(&wf, RunInput::manual()).await.unwrap();
+        // No refs/odin/* may remain pinning dangling snapshot commits.
+        let refs = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.path().to_str().unwrap(),
+                "for-each-ref",
+                "refs/odin/",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            refs.stdout.is_empty(),
+            "leaked snapshot ref(s): {}",
+            String::from_utf8_lossy(&refs.stdout)
+        );
     }
 
     #[tokio::test]
