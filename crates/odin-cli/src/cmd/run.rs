@@ -124,6 +124,12 @@ fn print_summary(summary: &RunSummary) {
             .exit_code
             .map_or(String::new(), |c| format!(" (exit {c})"));
         println!("  {} {}{exit}", glyph(step.status), step.id);
+        // Surface why a step failed (first line of the recorded reason) right under it.
+        if step.status == StepStatus::Failed {
+            if let Some(reason) = step.error.as_deref().and_then(|e| e.lines().next()) {
+                println!("      ↳ {reason}");
+            }
+        }
     }
     println!(
         "usage: {} in / {} out tokens, ${:.4}",
