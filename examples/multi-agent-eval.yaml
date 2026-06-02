@@ -60,6 +60,8 @@ steps:
       {{ steps.cand_codex.outputs.diff }}
       === copilot ===
       {{ steps.cand_copilot.outputs.diff }}
-  # To complete the loop, add a step that applies the winning candidate's diff to the shared
-  # tree (e.g. `run: "printf '%s' '{{ steps.cand_codex.outputs.diff }}' | git apply"` gated
-  # on `when: "steps.judge.outputs.stdout == 'codex'"`), then commit + open a PR.
+  # To complete the loop, apply the winning candidate's diff to the shared tree, gated on
+  # `when: "steps.judge.outputs.stdout == 'codex'"`, then commit + open a PR. Do NOT interpolate
+  # the diff into a shell string — a `'{{ ...diff }}'` literal breaks on any quote in the diff
+  # and treats untrusted agent output as shell code. Instead write the chosen diff to a file
+  # (a provider/action step) and `git apply <file>`, so the diff is never shell-parsed.

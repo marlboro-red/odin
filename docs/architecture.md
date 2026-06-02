@@ -154,8 +154,10 @@ and an error string if it failed. Pure serializable data — no engine internals
 
 ## Templating & context
 
-Prompts, `with:` arguments, gate commands, judge criteria, and `when:` conditionals are
-[minijinja](https://docs.rs/minijinja) templates. References are checked **statically**
+Prompts, `run` commands, `with:` arguments, gate commands, and `when:` conditionals are
+[minijinja](https://docs.rs/minijinja) templates rendered at run time. (Judge `criteria` is
+*statically* reference-checked too, but is passed to the judge model verbatim — not rendered.)
+References are checked **statically**
 during validation and evaluated with strict undefined-behavior at run time (a typo is an
 error, never a silent empty string).
 
@@ -264,6 +266,18 @@ the same trust as a shell script you are about to run.
 - **Run agents in a sandbox.** Provider steps execute real coding-agent CLIs with
   file/shell access in the run's workspace. Per-run worktrees and the slot pool isolate
   the working tree, not the host; run the engine where that blast radius is acceptable.
+  The built-in providers ship with **autonomy enabled by default** (so a headless run
+  isn't blocked on interactive approval), and the worktree bounds the *working tree* but
+  **not network egress**:
+
+  | Provider | Default flags | What they grant |
+  |----------|---------------|-----------------|
+  | `claude` | *(none)* | relies on the `claude` CLI's own config/permissions |
+  | `codex` | `--sandbox workspace-write --skip-git-repo-check` | the agent may write the worktree |
+  | `copilot` | `--allow-all` | tools, paths, **and network** allowed |
+
+  Tighten or loosen this per provider with `with_extra_args` (e.g. pin codex to
+  `--sandbox read-only`); see the integration guide's *Selecting models* section.
 - **`prompt_file` is contained** under the repository root (absolute paths and `..`
   escapes are rejected). Git is always invoked with a fixed argument vector (never via a
   shell), and config-derived arguments are guarded: `git.push` rejects a remote or branch

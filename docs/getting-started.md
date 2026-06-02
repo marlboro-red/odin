@@ -20,7 +20,7 @@ Start by writing — or borrowing — a workflow and checking it. `odin validate
 problem in one pass, with "did you mean" hints:
 
 ```sh
-odin run --help                            # (or: cargo run -p odin-cli -- …)
+odin validate --help                       # (or: cargo run -p odin-cli -- …)
 odin validate examples/issue-to-pr.yaml
 # ✓ examples/issue-to-pr.yaml is valid
 ```
@@ -92,7 +92,9 @@ odind --workflows ./cron-only --repo .          # no webhook triggers → no sec
 ```
 
 For local development you can serve webhook workflows without a secret by adding
-`--webhook-allow-unsigned` (loopback only — it disables signature verification).
+`--webhook-allow-unsigned` — it disables signature verification (it does *not* restrict the
+bind address, so pair it with a loopback `--webhook-addr` like `127.0.0.1:9292`; a non-loopback
+bind only warns). Intended for local testing only.
 
 The daemon resumes incomplete runs on startup, dispatches up to `--max-concurrent-runs`
 (default 4) at once, and drains in-flight runs on `ctrl-c`. See the

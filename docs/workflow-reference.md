@@ -225,8 +225,10 @@ referenced param warns ([ODIN024](#odin024)).
 
 ## Templating
 
-Prompts, `run` commands, action `with:` values, and `when:` expressions are
-[minijinja](https://docs.rs/minijinja) templates rendered against a per-step context:
+Prompts, `run` commands, action `with:` values, gate commands, and `when:` expressions are
+[minijinja](https://docs.rs/minijinja) templates rendered against a per-step context (judge
+`criteria` is reference-checked the same way but passed to the judge model verbatim, **not**
+rendered):
 
 | Reference | What it is |
 |-----------|-----------|
@@ -236,6 +238,7 @@ Prompts, `run` commands, action `with:` values, and `when:` expressions are
 | `{{ steps.<id>.exit_code }}` | An upstream step's process exit code, e.g. `when: "steps.build.exit_code == 0"`. |
 | `{{ artifacts.DIFF }}` | The cumulative git diff captured so far (vs the run's base commit, refreshed after each passing non-`scratch` step). |
 | `{{ trigger.* }}` | The free-form trigger payload (e.g. a webhook event body). |
+| `{{ run.id }}` / `{{ run.workflow }}` | This run's id and its workflow name. |
 
 References are checked statically: an unknown `params`/`steps`/`artifacts` reference, or a
 `steps.<id>` that isn't an upstream dependency, is [ODIN017](#odin017); a template that

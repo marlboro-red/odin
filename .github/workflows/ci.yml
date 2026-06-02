@@ -29,3 +29,46 @@ jobs:
         run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show && rustup component add clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      # Each feature subset of odin-core must build clean on its own, so a runtime-only
+      # dependency can't silently leak into the parse-only paths.
+      - name: Clippy each feature subset
+        run: |
+          for feats in ir "ir,templating" runtime mock full; do
+            echo "::group::--features $feats"
+            cargo clippy -p odin-core --no-default-features --features "$feats" --all-targets
+            echo "::endgroup::"
+          done
+      # The headline guarantee: a parse-only (`ir`) build pulls in none of the async stack.
+      - name: Assert the `ir` build is dependency-light
+        run: |
+          tree=$(cargo tree -p odin-core --no-default-features --features ir -e normal)
+          echo "$tree"
+          for forbidden in tokio async-trait rusqlite minijinja futures-util; do
+            if echo "$tree" | grep -qi "$forbidden"; then
+              echo "::error::parse-only \`ir\` build unexpectedly pulls in $forbidden"
+              exit 1
+            fi
+          done
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Verify the crate actually builds on the MSRV declared in Cargo.toml (rust-version).
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85 --profile minimal
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Check on 1.85
+        run: cargo +1.85 check --workspace --all-features
