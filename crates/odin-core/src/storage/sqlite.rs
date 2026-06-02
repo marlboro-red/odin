@@ -140,6 +140,20 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    async fn recent(&self, limit: usize) -> Result<Vec<RunState>, StoreError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let conn = self.conn.lock().await;
+        let mut stmt =
+            db(conn
+                .prepare("SELECT state FROM runs ORDER BY updated_at DESC, run_id DESC LIMIT ?1"))?;
+        let rows = db(stmt.query_map(params![limit], |row| row.get::<_, String>(0)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(serde_json::from_str(&db(row)?)?);
+        }
+        Ok(out)
+    }
+
     async fn load_run(&self, run_id: RunId) -> Result<Option<RunState>, StoreError> {
         let conn = self.conn.lock().await;
         let run_id = run_id.to_string();
@@ -246,6 +260,21 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], RunEvent::RunStarted { .. }));
         assert!(matches!(events[1], RunEvent::RunFinished { .. }));
+    }
+
+    #[tokio::test]
+    async fn recent_returns_newest_first_and_respects_limit() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut older = run_state(RunStatus::Succeeded);
+        older.updated_at = Utc::now() - chrono::Duration::seconds(30);
+        let newer = run_state(RunStatus::Running);
+        store.checkpoint(&older).await.unwrap();
+        store.checkpoint(&newer).await.unwrap();
+
+        let recent = store.recent(10).await.unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].run_id, newer.run_id, "newest first");
+        assert_eq!(store.recent(1).await.unwrap().len(), 1, "limit respected");
     }
 
     #[tokio::test]

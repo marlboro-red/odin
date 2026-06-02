@@ -39,6 +39,16 @@ pub trait Store: Send + Sync {
     /// Returns a [`StoreError`] if the backend read fails.
     async fn load_incomplete(&self) -> Result<Vec<RunState>, StoreError>;
 
+    /// Loads the most-recently-updated runs (newest first), up to `limit`, for listing.
+    /// Defaults to empty, so listing is an optional capability.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backend read fails.
+    async fn recent(&self, limit: usize) -> Result<Vec<RunState>, StoreError> {
+        let _ = limit;
+        Ok(Vec::new())
+    }
+
     /// Loads a single run by id (`None` if unknown).
     ///
     /// # Errors
@@ -100,6 +110,12 @@ pub struct StepState {
     pub outputs: IndexMap<String, serde_json::Value>,
     /// Usage for this step's invocations.
     pub usage: Option<Usage>,
+    /// Gate name → passed, for the step's last attempt.
+    #[serde(default)]
+    pub gates: IndexMap<String, bool>,
+    /// LLM-as-judge score, if a judge ran.
+    #[serde(default)]
+    pub judge_score: Option<f32>,
 }
 
 /// An immutable audit-log entry. Both the enum and each variant are `#[non_exhaustive]`,

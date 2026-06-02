@@ -22,14 +22,21 @@ pub struct Registry {
 impl Registry {
     /// A registry with all built-in providers/workspaces/actions/triggers registered.
     ///
-    /// Currently registers the [`ClaudeProvider`](crate::provider::ClaudeProvider); the
-    /// codex/copilot providers, the worktree/slot-pool workspaces, and the
-    /// github/git/shell actions arrive in later milestones. Parse-only validation (the
-    /// `ir` feature) instead uses [`KnownNames::builtin`].
+    /// Registers the claude/codex/copilot providers and the github/git/shell actions.
+    /// Workspaces are constructed per-workflow by the engine (not registry singletons).
+    /// Parse-only validation (the `ir` feature) instead uses [`KnownNames::builtin`].
     #[must_use]
     pub fn with_builtins() -> Self {
         let mut registry = Self::default();
-        registry.register_provider(Arc::new(crate::provider::ClaudeProvider::new()));
+        registry
+            .register_provider(Arc::new(crate::provider::ClaudeProvider::new()))
+            .register_provider(Arc::new(crate::provider::CodexProvider::new()))
+            .register_provider(Arc::new(crate::provider::CopilotProvider::new()));
+        registry
+            .register_action(Arc::new(crate::action::ShellExec))
+            .register_action(Arc::new(crate::action::GitCommit))
+            .register_action(Arc::new(crate::action::GitPush))
+            .register_action(Arc::new(crate::action::OpenPr));
         registry
     }
 
@@ -102,12 +109,18 @@ mod tests {
     use super::Registry;
 
     #[test]
-    fn builtins_register_claude() {
+    fn builtins_register_providers_and_actions() {
         let r = Registry::with_builtins();
-        assert!(r.provider("claude").is_some());
-        assert!(r.known_names().providers.contains(&"claude"));
-        // Not yet implemented providers are absent.
-        assert!(r.provider("codex").is_none());
+        for provider in ["claude", "codex", "copilot"] {
+            assert!(
+                r.provider(provider).is_some(),
+                "{provider} should be registered"
+            );
+            assert!(r.known_names().providers.contains(&provider));
+        }
+        for action in ["shell.exec", "git.commit", "git.push", "github.open_pr"] {
+            assert!(r.action(action).is_some(), "{action} should be registered");
+        }
     }
 
     #[test]
