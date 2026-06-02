@@ -650,17 +650,21 @@ impl LocalEngine {
             async move { run_process("git", &args, &opts, cancel).await.ok() }
         };
         // Seed a throwaway index from HEAD, stage every change (tracked + untracked), write
-        // the tree, and commit it parented on the run's base — no branch is moved.
-        let read = run_git(vec!["read-tree".to_owned(), "HEAD".to_owned()]).await?;
-        if read.exit_code != 0 {
-            let _ = std::fs::remove_file(&index_path);
-            return None;
-        }
-        let _ = run_git(vec!["add".to_owned(), "-A".to_owned()]).await;
-        let tree_out = run_git(vec!["write-tree".to_owned()]).await?;
-        let tree = tree_out.stdout.trim().to_owned();
-        let commit = if tree_out.exit_code == 0 && !tree.is_empty() {
-            run_git(vec![
+        // the tree, and commit it parented on the run's base — no branch is moved. Compute
+        // the SHA, then remove the temp index on EVERY path (a `?` here returns from the
+        // block, not the function, so the cleanup below always runs).
+        let sha = async {
+            let read = run_git(vec!["read-tree".to_owned(), "HEAD".to_owned()]).await?;
+            if read.exit_code != 0 {
+                return None;
+            }
+            let _ = run_git(vec!["add".to_owned(), "-A".to_owned()]).await;
+            let tree_out = run_git(vec!["write-tree".to_owned()]).await?;
+            let tree = tree_out.stdout.trim().to_owned();
+            if tree_out.exit_code != 0 || tree.is_empty() {
+                return None;
+            }
+            let commit = run_git(vec![
                 "commit-tree".to_owned(),
                 tree,
                 "-p".to_owned(),
@@ -668,16 +672,13 @@ impl LocalEngine {
                 "-m".to_owned(),
                 "odin snapshot".to_owned(),
             ])
-            .await
-        } else {
-            None
-        };
-        let _ = std::fs::remove_file(&index_path);
-        let commit = commit?;
-        let sha = commit.stdout.trim().to_owned();
-        if commit.exit_code != 0 || sha.is_empty() {
-            return None;
+            .await?;
+            let sha = commit.stdout.trim().to_owned();
+            (commit.exit_code == 0 && !sha.is_empty()).then_some(sha)
         }
+        .await;
+        let _ = std::fs::remove_file(&index_path);
+        let sha = sha?;
         // Anchor the dangling commit so it survives until the run completes.
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
@@ -697,22 +698,37 @@ impl LocalEngine {
         Some(sha)
     }
 
-    /// Resets the workspace (index + worktree) to `target`, dropping any leftover untracked
-    /// files — so a step interrupted mid-edit re-runs from a clean, known state.
+    /// Resets the workspace (index + worktree) to `target`, then drops leftover untracked
+    /// files — so a step interrupted mid-edit re-runs from a clean, known state. HEAD is not
+    /// moved; callers only restore while HEAD is still at the run's base (no commits), so the
+    /// worktree and HEAD stay consistent.
+    ///
+    /// `git clean -fd` discards every *non-ignored* untracked file in the workspace created
+    /// since `target`. That is the intended blast radius — the run's worktree is a throwaway
+    /// per-run checkout, not the user's repo — but ignored files (`.gitignore`d build caches,
+    /// local `.env`, etc.) are deliberately left untouched and so are NOT rewound; a step's
+    /// side effects on ignored paths are outside snapshot/restore.
+    ///
+    /// If `read-tree` fails (e.g. the snapshot commit was reaped), the restore is abandoned
+    /// WITHOUT running `clean`, leaving the workspace untouched rather than half-reset.
     async fn restore_workdir(&self, workdir: &Path, target: &str, cancel: &CancelToken) {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             ..ProcessOptions::default()
         };
         let read = ["read-tree", "-u", "--reset", target].map(str::to_owned);
-        let _ = run_process("git", &read, &opts, cancel).await;
-        let _ = run_process(
-            "git",
-            &["clean".to_owned(), "-fd".to_owned()],
-            &opts,
-            cancel,
-        )
-        .await;
+        let reset_ok = run_process("git", &read, &opts, cancel)
+            .await
+            .is_ok_and(|o| o.exit_code == 0);
+        if reset_ok {
+            let _ = run_process(
+                "git",
+                &["clean".to_owned(), "-fd".to_owned()],
+                &opts,
+                cancel,
+            )
+            .await;
+        }
     }
 
     /// Drops the per-run snapshot ref so its dangling commits become collectable. Best effort.
@@ -752,16 +768,36 @@ impl LocalEngine {
             self.cleanup_scratch(run_id, workdir, cancel).await;
         }
 
-        // Per-step snapshots (durable runs only): record the base commit once, and on resume
-        // restore the workdir to the last snapshot so a step interrupted mid-edit re-runs
-        // from a clean state instead of double-applying.
+        // Record the run's base commit once (used as the diff base for all runs, and the
+        // snapshot anchor for durable ones).
         let resuming = !state.steps.is_empty();
-        if workflow.durable && state.base_commit.is_none() {
+        if state.base_commit.is_none() {
             state.base_commit = self.git_head(workdir, cancel).await;
         }
         let base_commit = state.base_commit.clone();
+
+        // On resume, restore the workdir to the last snapshot so a step interrupted mid-edit
+        // re-runs from a clean tree. Safety (see snapshot block below): `state.snapshot` is
+        // `Some` ONLY when it captures the most-recent passed step *and* nothing has been
+        // committed (HEAD still at base), so restoring to it never rewinds past committed work
+        // or a passed step. If it is `None`, we restore to `base` ONLY when no shared-workdir
+        // step has passed yet (a clean first-step rewind); otherwise we skip the restore
+        // entirely rather than risk discarding completed work.
         if workflow.durable && resuming {
-            if let Some(target) = state.snapshot.clone().or_else(|| base_commit.clone()) {
+            let any_shared_passed = state.steps.iter().any(|(id, st)| {
+                matches!(st.status, StepStatus::Passed)
+                    && !by_id.get(id.as_str()).is_some_and(|s| s.scratch)
+            });
+            let target = match &state.snapshot {
+                Some(snapshot) => Some(snapshot.clone()),
+                None if !any_shared_passed
+                    && self.git_head(workdir, cancel).await == base_commit =>
+                {
+                    base_commit.clone()
+                }
+                None => None,
+            };
+            if let Some(target) = target {
                 self.restore_workdir(workdir, &target, cancel).await;
             }
         }
@@ -887,10 +923,21 @@ impl LocalEngine {
                 if let Some(d) = &diff {
                     state.artifacts.insert(DIFF.into(), d.clone());
                 }
-                if let Some(base) = &base_commit {
-                    if let Some(snap) = self.snapshot_workdir(workdir, base, run_id, cancel).await {
-                        state.snapshot = Some(snap);
-                    }
+                if workflow.durable {
+                    // Snapshot only while nothing has been committed yet (HEAD still at base):
+                    // once a step commits, git is the durable record and rewinding past it
+                    // would corrupt the run branch, so we disengage. Set `snapshot`
+                    // UNCONDITIONALLY here — a failed or disengaged snapshot must become `None`,
+                    // never a stale pointer a later resume would rewind to (which would discard
+                    // this completed step's work).
+                    let at_base = base_commit.is_some()
+                        && self.git_head(workdir, cancel).await == base_commit;
+                    state.snapshot = match (at_base, &base_commit) {
+                        (true, Some(base)) => {
+                            self.snapshot_workdir(workdir, base, run_id, cancel).await
+                        }
+                        _ => None,
+                    };
                 }
             }
             state.updated_at = Utc::now();
@@ -955,8 +1002,8 @@ impl LocalEngine {
                 // *or* Failed (a failed candidate's partial work is still worth inspecting by
                 // a downstream judge). A `Skipped` step (e.g. `when: false`) ran nothing.
                 if !matches!(outcome.status, StepStatus::Skipped) {
-                    // The scratch worktree is detached at the run's base, so a plain diff
-                    // (vs its HEAD) is exactly the candidate's changes.
+                    // The scratch worktree is detached at the shared tree's HEAD, so a plain
+                    // diff (vs its own HEAD) is exactly this candidate's changes.
                     if let Some(d) = self.capture_diff(&scratch, None, cancel).await {
                         outcome.outputs.insert("diff".to_owned(), Value::String(d));
                     }
@@ -1207,8 +1254,15 @@ impl Engine for LocalEngine {
             workflows.iter().map(|w| (w.name.as_str(), w)).collect();
 
         let mut summaries = Vec::new();
+        let sweep_cancel = CancelToken::new();
         for mut state in store.load_incomplete().await? {
             let Some(workflow) = by_name.get(state.workflow.as_str()).copied() else {
+                // The run targets a workflow we no longer serve — best-effort reclaim its
+                // snapshot ref so the dangling commits aren't pinned forever.
+                if let (Some(handle), true) = (&state.workspace, state.snapshot.is_some()) {
+                    self.delete_snapshot_ref(&handle.path, state.run_id, &sweep_cancel)
+                        .await;
+                }
                 continue;
             };
             let Some(handle) = state.workspace.clone() else {
@@ -1730,6 +1784,115 @@ steps:
             diff.matches("+line").count(),
             1,
             "expected one added line (no double-apply), diff:\n{diff}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_does_not_rewind_past_a_passed_step_when_its_snapshot_is_missing() {
+        // The data-loss blocker: a non-scratch step PASSED but its best-effort snapshot
+        // failed (state.snapshot is None). Resume must NOT rewind to base and delete that
+        // step's completed work — it should skip the restore entirely.
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: nodataloss\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - { id: a, run: \"echo aaa > a.txt\" }\n  - { id: b, run: \"echo bbb > b.txt\", depends_on: [a] }\n",
+        );
+
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: wf.workspace.clone(),
+            })
+            .await
+            .unwrap();
+        let wpath = handle.path.clone();
+        // `a` already passed and produced a.txt; its snapshot is MISSING (None).
+        std::fs::write(wpath.join("a.txt"), "aaa\n").unwrap();
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&wpath)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+        let mut steps = IndexMap::new();
+        steps.insert(
+            StepId::new("a"),
+            StepState {
+                status: StepStatus::Passed,
+                attempts: 1,
+                exit_code: Some(0),
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+            },
+        );
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: Some(handle),
+            base_commit: Some(base),
+            snapshot: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        let s = &summaries[0];
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        // Both files must be present: `a`'s work survived (no rewind to base), and `b` ran.
+        let diff = s.diff.as_deref().unwrap_or_default();
+        assert!(
+            diff.contains("a.txt"),
+            "a's work was discarded! diff:\n{diff}"
+        );
+        assert!(diff.contains("b.txt"), "b did not run. diff:\n{diff}");
+    }
+
+    #[tokio::test]
+    async fn durable_workflow_that_commits_mid_run_succeeds_with_a_base_relative_diff() {
+        // A step that COMMITs moves HEAD off base; snapshotting must disengage (not rewind
+        // the branch), and the DIFF must stay cumulative-vs-base (committed + uncommitted).
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: commits\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - { id: commit_step, run: \"echo f > f.txt && git add -A && git commit -q -m s1\" }\n  - { id: more, run: \"echo g > g.txt\", depends_on: [commit_step] }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        // DIFF vs base shows the committed file AND the later uncommitted one.
+        let diff = summary.diff.as_deref().unwrap_or_default();
+        assert!(
+            diff.contains("f.txt"),
+            "committed file missing from DIFF:\n{diff}"
+        );
+        assert!(
+            diff.contains("g.txt"),
+            "later file missing from DIFF:\n{diff}"
         );
     }
 
