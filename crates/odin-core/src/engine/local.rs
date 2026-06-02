@@ -608,16 +608,27 @@ impl LocalEngine {
         // partial edits (a failing `run:` that mutated the workdir would otherwise double-
         // apply). Best-effort and git-only: a non-git workdir yields `None` and we just retry
         // in place, as before. Applies to the shared workdir and to scratch worktrees alike.
+        //
+        // Anchor this transient snapshot under a step-scoped ref *separate* from the durable
+        // per-run ref — otherwise it would move `refs/odin/run/<id>` off the commit the
+        // persisted `RunState.snapshot` still names, leaving resume's target un-anchored and
+        // gc-collectable. Nested under the run id (`refs/odin/retry/<id>/<step>`) so it is both
+        // step-scoped (concurrent scratch retry steps don't collide) and sweepable as a group
+        // by run-end cleanup if a crash/cancel mid-loop skips the per-step delete below.
+        let retry_ref = format!("refs/odin/retry/{run_id}/{}", step.id.as_str());
         let pre_step_snapshot = if max_attempts > 1 {
             match self.git_head(workdir, cancel).await {
-                Some(head) => self.snapshot_workdir(workdir, &head, run_id, cancel).await,
+                Some(head) => {
+                    self.snapshot_to_ref(workdir, &head, run_id, &retry_ref, cancel)
+                        .await
+                }
                 None => None,
             }
         } else {
             None
         };
         let mut attempt: u32 = 0;
-        loop {
+        let outcome = loop {
             attempt += 1;
             // Before a *retry*, rewind the workdir to the pre-step snapshot.
             if attempt > 1 {
@@ -637,10 +648,16 @@ impl LocalEngine {
             let mut outcome = self.exec_step(step, ctx, workdir, timeout, cancel).await;
             if outcome.status != StepStatus::Failed || attempt >= max_attempts {
                 outcome.attempts = u8::try_from(attempt).unwrap_or(u8::MAX);
-                return outcome;
+                break outcome;
             }
             tokio::time::sleep(backoff_delay(step.retry.backoff, attempt)).await;
+        };
+        // The retry rewind point is dead once the step settles; drop its ref so the snapshot
+        // commit becomes collectable (and doesn't outlive the run as a dangling anchor).
+        if pre_step_snapshot.is_some() {
+            self.delete_ref(workdir, &retry_ref, cancel).await;
         }
+        outcome
     }
 
     /// Runs a shell command in `workdir`, returning `(exit_code, stdout)`.
@@ -716,14 +733,38 @@ impl LocalEngine {
 
     /// Snapshots the current workspace tree as an off-branch commit parented on `base`,
     /// kept alive by the per-run ref `refs/odin/run/<run_id>` so [`restore_workdir`] can
-    /// reach it on resume. Returns the commit SHA, or `None` on any git failure (snapshots
-    /// are best-effort — resume idempotency degrades gracefully without one). Does not touch
-    /// the branch, HEAD, or the working index (it stages into a throwaway index file).
+    /// reach it on resume — this is the **durable** snapshot the persisted `RunState.snapshot`
+    /// points at. Returns the commit SHA, or `None` on any git failure.
     async fn snapshot_workdir(
         &self,
         workdir: &Path,
         base: &str,
         run_id: RunId,
+        cancel: &CancelToken,
+    ) -> Option<String> {
+        self.snapshot_to_ref(
+            workdir,
+            base,
+            run_id,
+            &format!("refs/odin/run/{run_id}"),
+            cancel,
+        )
+        .await
+    }
+
+    /// Snapshots the workspace tree as an off-branch commit parented on `base`, anchored by
+    /// `snapshot_ref` so [`restore_workdir`] can reach it. Returns the commit SHA, or `None` on
+    /// any git failure (snapshots are best-effort — resume idempotency degrades gracefully
+    /// without one). Does not touch the branch, HEAD, or the working index (it stages into a
+    /// throwaway index file). The caller chooses the ref so a transient snapshot (e.g. the
+    /// per-step retry rewind point) can use a *separate* ref and not disturb the durable
+    /// per-run ref that resume relies on.
+    async fn snapshot_to_ref(
+        &self,
+        workdir: &Path,
+        base: &str,
+        run_id: RunId,
+        snapshot_ref: &str,
         cancel: &CancelToken,
     ) -> Option<String> {
         let index_path =
@@ -788,7 +829,7 @@ impl LocalEngine {
             "git",
             &[
                 "update-ref".to_owned(),
-                format!("refs/odin/run/{run_id}"),
+                snapshot_ref.to_owned(),
                 sha.clone(),
             ],
             &opts,
@@ -831,8 +872,32 @@ impl LocalEngine {
         }
     }
 
-    /// Drops the per-run snapshot ref so its dangling commits become collectable. Best effort.
+    /// Drops the run's snapshot refs so their dangling commits become collectable: the durable
+    /// per-run ref, plus any per-step retry rewind refs (`refs/odin/retry/<id>/*`) a crash or
+    /// cancel mid-retry-loop left behind (the happy path drops each one when its step settles).
+    /// Best effort.
     async fn delete_snapshot_ref(&self, workdir: &Path, run_id: RunId, cancel: &CancelToken) {
+        self.delete_ref(workdir, &format!("refs/odin/run/{run_id}"), cancel)
+            .await;
+        let opts = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        // List the run's retry refs (a trailing `/` matches the whole hierarchy) and drop each.
+        let list = [
+            "for-each-ref".to_owned(),
+            "--format=%(refname)".to_owned(),
+            format!("refs/odin/retry/{run_id}/"),
+        ];
+        if let Ok(out) = run_process("git", &list, &opts, cancel).await {
+            for refname in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                self.delete_ref(workdir, refname, cancel).await;
+            }
+        }
+    }
+
+    /// Deletes a git ref (best effort), letting any commit it anchored become collectable.
+    async fn delete_ref(&self, workdir: &Path, ref_name: &str, cancel: &CancelToken) {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             ..ProcessOptions::default()
@@ -840,7 +905,7 @@ impl LocalEngine {
         let args = [
             "update-ref".to_owned(),
             "-d".to_owned(),
-            format!("refs/odin/run/{run_id}"),
+            ref_name.to_owned(),
         ];
         let _ = run_process("git", &args, &opts, cancel).await;
     }
@@ -1191,6 +1256,12 @@ impl LocalEngine {
             ..ProcessOptions::default()
         };
         let prefix = format!("odin-scratch-{run_id}-");
+        // Serialize against acquire/release_scratch: `git worktree remove` and especially
+        // `git worktree prune` (a *global* operation on `.git/worktrees/`) race with a
+        // concurrent run's `git worktree add`, corrupting git's worktree metadata. Hold the
+        // same lock those paths take for the whole cleanup (it is rare — once per resuming
+        // run that has scratch steps). The filesystem reads/removes are cheap to keep inside.
+        let _guard = self.worktree_lock.lock().await;
         if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
             for entry in entries.flatten() {
                 if !entry.file_name().to_string_lossy().starts_with(&prefix) {
@@ -2708,6 +2779,38 @@ steps:
         assert!(
             refs.stdout.is_empty(),
             "leaked snapshot ref(s): {}",
+            String::from_utf8_lossy(&refs.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_retry_run_cleans_up_both_the_durable_and_retry_refs() {
+        // A durable run whose step also carries a retry takes BOTH a durable per-run snapshot
+        // (anchored by refs/odin/run/<id>) and a transient pre-step retry snapshot (anchored by
+        // a separate refs/odin/retry/<id>-<step> ref). After the run, NEITHER may linger — the
+        // retry ref is dropped when the step settles, the durable ref at run end.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: r\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: write, run: \"echo hi > f.txt\", retry: { max: 1 }}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Succeeded);
+        let refs = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.path().to_str().unwrap(),
+                "for-each-ref",
+                "refs/odin/",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            refs.stdout.is_empty(),
+            "leaked ref(s) after a durable+retry run: {}",
             String::from_utf8_lossy(&refs.stdout)
         );
     }
