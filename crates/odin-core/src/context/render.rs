@@ -89,9 +89,13 @@ mod tests {
 
     #[test]
     fn evaluates_when() {
-        let ctx = build_context(&json!({ "steps": { "a": { "exit_code": 0 } } }));
+        let ctx =
+            build_context(&json!({ "steps": { "a": { "exit_code": 0, "status": "passed" } } }));
         assert!(eval_when("steps.a.exit_code == 0", &ctx).unwrap());
         assert!(!eval_when("steps.a.exit_code == 1", &ctx).unwrap());
+        // The documented status-gate idiom: status is a snake_case string.
+        assert!(eval_when("steps.a.status == 'passed'", &ctx).unwrap());
+        assert!(!eval_when("steps.a.status == 'failed'", &ctx).unwrap());
         assert!(eval_when("  ", &ctx).unwrap(), "empty when is true");
     }
 }

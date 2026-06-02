@@ -74,15 +74,25 @@ All three read the same store `odin run` (and the daemon) write to, and accept `
 ## 4. Serve workflows on events
 
 `odind` runs workflows from **cron schedules** and **GitHub webhooks** instead of an explicit
-`odin run`. Point it at a directory of workflows:
+`odin run`. Point it at a *directory* (it loads every `.yaml` inside):
 
 ```sh
-# A nightly maintenance workflow (cron-triggered, no secret needed):
-odind --workflows examples --repo .
-
-# Webhooks need a secret (fail-closed); the server starts only if a workflow declares one:
+# The example set includes two workflows with `github_webhook` triggers, so the daemon
+# fails closed unless you give it a verification secret:
 ODIN_WEBHOOK_SECRET=… odind --workflows examples --repo . --webhook-addr 127.0.0.1:9292
 ```
+
+The webhook listener starts **only** if some loaded workflow declares a `github_webhook`
+trigger. A directory of purely cron-scheduled workflows (like
+[`nightly-maintenance.yaml`](../examples/nightly-maintenance.yaml)) starts no listener and
+needs no secret:
+
+```sh
+odind --workflows ./cron-only --repo .          # no webhook triggers → no secret
+```
+
+For local development you can serve webhook workflows without a secret by adding
+`--webhook-allow-unsigned` (loopback only — it disables signature verification).
 
 The daemon resumes incomplete runs on startup, dispatches up to `--max-concurrent-runs`
 (default 4) at once, and drains in-flight runs on `ctrl-c`. See the

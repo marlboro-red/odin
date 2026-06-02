@@ -51,9 +51,14 @@
 //!
 //! - `ir` — parse + validate workflows. No async runtime, no templating engine.
 //! - `templating` — render prompts/conditionals and statically check template refs.
-//! - `runtime` — the five integration traits, the registry, and the engine façade.
-//! - `mock` — ships Noop/Mock trait impls for downstream tests.
-//! - `full` (default) — all of the above.
+//! - `runtime` — the five integration traits, the registry, and the provider/store/
+//!   workspace/action implementations.
+//! - `mock` — in-memory test doubles ([`mock::EchoProvider`], [`mock::MemStore`], …) for
+//!   downstream tests. Opt-in; *not* included in `full`.
+//! - `full` (default) — `ir` + `templating` + `runtime` (not `mock`).
+//!
+//! The [`Engine`] façade requires **both** `runtime` and `templating` (it renders prompts),
+//! so it is available under `full`.
 //!
 //! A parse-only embedder (a linter or LSP) can depend on `odin-core` with
 //! `default-features = false, features = ["ir"]` and pull in none of `tokio`.

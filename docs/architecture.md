@@ -65,9 +65,11 @@ crates/
 
 ## The integration surface
 
-Five object-safe (`Arc<dyn _>`, via `async-trait`) traits. Each has one required method
-plus defaulted optionals, and exchanges owned, serializable context/outcome structs so
-implementations can live in other crates — or, later, other processes.
+Five object-safe (`Arc<dyn _>`, via `async-trait`) traits. Each pairs a cheap identity
+accessor (`id`/`kind`/`name`) with one or more required core methods — and, for `Provider`
+and `Store`, a couple of defaulted optionals — and exchanges owned, serializable
+context/outcome structs so implementations can live in other crates — or, later, other
+processes.
 
 ```rust
 trait Provider {                                   // a coding-agent CLI
@@ -87,6 +89,7 @@ trait Store {                                      // durable, crash-resumable s
     async fn checkpoint(&self, state: &RunState) -> Result<(), StoreError>;
     async fn append_event(&self, run: RunId, event: &RunEvent) -> Result<(), StoreError>;
     async fn load_incomplete(&self) -> Result<Vec<RunState>, StoreError>;
+    async fn recent(&self, limit: usize) -> Result<Vec<RunState>, StoreError> { Ok(vec![]) }
     async fn load_run(&self, run: RunId) -> Result<Option<RunState>, StoreError>;
     async fn events(&self, run: RunId) -> Result<Vec<RunEvent>, StoreError> { Ok(vec![]) }
 }
@@ -103,8 +106,10 @@ trait Trigger {                                    // a source of run-starting e
 ```
 
 Each trait returns its **own** small error enum (so an implementor reads a focused 3–4
-variant type, not a crate-wide god-error), and each enum ends in a `#[non_exhaustive]`
-`Other(anyhow::Error)` escape hatch.
+variant type, not a crate-wide god-error). Each enum is `#[non_exhaustive]` (so adding a
+variant is non-breaking) and, under the `runtime` feature, carries an
+`Other(anyhow::Error)` escape hatch — a parse-only `ir` build has the enum without that
+variant.
 
 The **`Store` contract is snapshot-primary**: `checkpoint` persists the whole
 `Serialize`-able `RunState`, so a backend (SQLite blob, Postgres `jsonb`, files) can
@@ -126,8 +131,10 @@ Three contracts move data through a run:
 ```
 
 **2. Step boundary** — the shared worktree is the primary channel (steps edit files);
-named **artifacts** layer explicit handoffs on top. The engine auto-captures the git
-diff after each step as the reserved artifact `DIFF`.
+named **artifacts** layer explicit handoffs on top. After each **passing, non-`scratch`**
+step the engine auto-captures the cumulative git diff (vs the run's base commit) as the
+reserved artifact `DIFF`; a `scratch` step's diff stays local to it, exposed as that step's
+`outputs.diff`.
 
 ```
 INPUTS                          STEP                       OUTPUTS
@@ -258,8 +265,10 @@ the same trust as a shell script you are about to run.
   file/shell access in the run's workspace. Per-run worktrees and the slot pool isolate
   the working tree, not the host; run the engine where that blast radius is acceptable.
 - **`prompt_file` is contained** under the repository root (absolute paths and `..`
-  escapes are rejected), and git invocations use `--` to prevent argument injection from
-  config values.
+  escapes are rejected). Git is always invoked with a fixed argument vector (never via a
+  shell), and config-derived arguments are guarded: `git.push` rejects a remote or branch
+  beginning with `-` so it can't be misread as a flag, and diff capture appends a trailing
+  `--` to separate revisions from pathspecs.
 
 ## Forward-compatibility seams
 

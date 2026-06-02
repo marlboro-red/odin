@@ -104,8 +104,9 @@ Point a GitHub webhook (content type `application/json`, secret = your `--webhoo
    redelivery is acked `200` without starting a second run (a bounded recent-set; resets on
    restart).
 3. **Matches** the event: `X-GitHub-Event` + the payload's `action` against each
-   subscription's `events` (`"issues.labeled"` is exact; bare `"issues"` matches any action),
-   filtered by the optional case-insensitive `repo`.
+   subscription's `events` (`"issues.labeled"` is exact; bare `"issues"` matches any action) —
+   the event type and action are compared case-insensitively — filtered by the optional
+   `repo` (also case-insensitive).
 4. **Maps params**: the full event payload is delivered to the run as `trigger.*`, and each
    `params` entry extracts a field by dot-path (object keys only; array indices aren't
    supported) into a typed run param — so a webhook can satisfy a required param. An

@@ -39,8 +39,8 @@ Everything you need to embed Odin lives here.
 | `ir` | serde only | parse + validate workflows |
 | `templating` | minijinja | render prompts/conditionals and statically check `{{ refs }}` |
 | `runtime` | tokio, async-trait, rusqlite | the five traits, the registry, the durable store |
-| `mock` | (runtime) | `Noop`/`Mock` trait impls for *your* tests |
-| `full` *(default)* | all of the above | running workflows |
+| `mock` | (`runtime`) | in-memory test doubles (`EchoProvider`, `MemStore`, `NoopAction`, …) for *your* tests |
+| `full` *(default)* | `ir` + `templating` + `runtime` (**not** `mock`) | running workflows, the CLI, the daemon |
 
 A parse-only embedder (a linter, an editor plugin) pulls in none of `tokio`:
 
@@ -84,8 +84,9 @@ async fn main() -> anyhow::Result<()> {
 
 `EngineBuilder::new()` seeds the registry with the built-in providers and actions. Without a
 `.store(...)`, durable workflows still run — they just aren't checkpointed (no resume).
-`Engine::run` validates the input against the workflow's params first and returns
-`Error::Validation` (carrying every diagnostic) if the workflow has errors.
+`Engine::run` first validates the **workflow** and returns `Error::Validation` (carrying every
+diagnostic) if it has errors; it then resolves the run's **params** against the workflow's
+declared `params`, returning `Error::Input` if a required one is missing.
 
 The `Engine` trait is the whole driving surface:
 

@@ -77,7 +77,7 @@ steps:
     action: github.open_pr
     with: { title: "Implement {{ params.issue_url }}" }
     depends_on: [review]
-    when: "steps.review.outputs.passed == true"
+    when: "steps.review.status == 'passed'"
 ```
 
 See [`examples/`](examples/) for fully-annotated workflows:
@@ -116,9 +116,12 @@ A parse-only embedder (a linter or an editor plugin) pays nothing for the async 
 |---------|----------|------------|
 | `ir` | serde only | parse + validate workflows |
 | `templating` | minijinja | render prompts + statically check `{{ refs }}` |
-| `runtime` | tokio, async-trait | the five traits, the registry, the engine |
-| `mock` | (runtime) | Noop trait impls for downstream tests |
-| `full` *(default)* | all of the above | |
+| `runtime` | tokio, async-trait | the five traits, the registry, provider/store/workspace/action impls |
+| `mock` | (`runtime`) | in-memory test doubles (`EchoProvider`, `MemStore`, …) for downstream tests |
+| `full` *(default)* | `ir` + `templating` + `runtime` | running workflows, the CLI, the daemon |
+
+The `Engine` façade needs **both** `runtime` and `templating` (it renders prompts), so `full`
+bundles both. `mock` is opt-in and is *not* part of `full`.
 
 ```toml
 # A linter that only parses and validates:

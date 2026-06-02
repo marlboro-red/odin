@@ -15,8 +15,10 @@ Commands:
   logs <RUN_ID>        Show a run's event log
 ```
 
-Every command takes `--json` for machine-readable output on stdout. Errors and notices go to
-stderr.
+Every command takes `--json` for machine-readable output on **stdout**. A command's normal
+report — including `validate`'s diagnostics, errors and all — also goes to stdout; only
+process-level failures (a parse/IO error, a bad UUID, a store error) print an `error: …`
+line to **stderr** before the process exits non-zero.
 
 ---
 
@@ -34,7 +36,7 @@ $ odin validate examples/issue-to-pr.yaml
 ✓ examples/issue-to-pr.yaml is valid
 
 $ odin validate examples/fix-flaky-test.yaml
-warning[ODIN023]: retry.on_fallback_provider is set but inert in v1
+warning[ODIN023]: on_fallback_provider is declared but routing/fallback is not implemented in v1; this field is inert
   --> steps[1].retry.on_fallback_provider
 
 ✓ examples/fix-flaky-test.yaml is valid (1 warning(s))

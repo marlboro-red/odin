@@ -230,8 +230,10 @@ Prompts, `run` commands, action `with:` values, and `when:` expressions are
 | Reference | What it is |
 |-----------|-----------|
 | `{{ params.<name> }}` | A declared workflow param's value. |
-| `{{ steps.<id>.outputs.<key> }}` | A named output of an **upstream** step. Always present: `stdout`. For `scratch` steps, also `diff`. |
-| `{{ artifacts.DIFF }}` | The cumulative git diff captured so far. |
+| `{{ steps.<id>.outputs.<key> }}` | A named output of an **upstream** step. Provider and `run:` steps expose `stdout`; an action step exposes only what that action returns (`shell.exec` → `stdout`; `git.commit` → `sha`, `branch`; `git.push` → `branch`, `remote`; `github.open_pr` → `url`, `number`). A `scratch` step additionally exposes `diff`. |
+| `{{ steps.<id>.status }}` | An upstream step's outcome as a snake_case string (`passed`, `failed`, `skipped`, …). Use it in a `when:` guard, e.g. `when: "steps.review.status == 'passed'"`. |
+| `{{ steps.<id>.exit_code }}` | An upstream step's process exit code, e.g. `when: "steps.build.exit_code == 0"`. |
+| `{{ artifacts.DIFF }}` | The cumulative git diff captured so far (vs the run's base commit, refreshed after each passing non-`scratch` step). |
 | `{{ trigger.* }}` | The free-form trigger payload (e.g. a webhook event body). |
 
 References are checked statically: an unknown `params`/`steps`/`artifacts` reference, or a
