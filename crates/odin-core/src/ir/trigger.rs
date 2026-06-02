@@ -1,7 +1,10 @@
 //! Declared triggers. v1 *executes* only `Manual`; others parse & validate now so a
 //! workflow file is forward-compatible with the daemon milestone.
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+
+use crate::ids::ParamName;
 
 /// A declared trigger. `#[non_exhaustive]` so new kinds are additive.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -22,15 +25,31 @@ pub enum TriggerDecl {
 }
 
 /// Declaration of a GitHub webhook trigger.
+///
+/// When the daemon serves this trigger, the full event payload is delivered to the run as
+/// `trigger.*` (reachable in templates). To satisfy a workflow's typed `params` from the
+/// event, map each param to a dot-path into the payload via [`params`](Self::params).
+///
+/// Note: for a `durable` workflow the payload is checkpointed verbatim into the run's
+/// persisted state. GitHub events can carry PII (logins, emails, commit authors); store the
+/// state DB accordingly, and prefer mapping the few fields you need into `params` over
+/// relying on `trigger.*` if you would rather not persist the whole event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct GithubWebhookDecl {
-    /// Event names, e.g. `["pull_request.opened", "issues.labeled"]`.
+    /// Event names, e.g. `["pull_request.opened", "issues.labeled"]`. A bare event type
+    /// (`"issues"`) matches any action on that type.
     pub events: Vec<String>,
-    /// Optional `owner/repo` filter.
+    /// Optional `owner/repo` filter, matched against the payload's `repository.full_name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Maps a declared workflow param to a dot-path into the event payload, e.g.
+    /// `issue_url: issue.html_url`. Each entry is extracted from the incoming event and
+    /// supplied as a run param, so a webhook can satisfy a required param. Absent paths are
+    /// skipped (the run then fails param validation, surfacing the misconfiguration).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub params: IndexMap<ParamName, String>,
 }
 
 /// Declaration of a cron trigger.
@@ -53,14 +72,23 @@ mod tests {
 - type: github_webhook
   events: ["issues.labeled"]
   repo: marlboro-red/odin
+  params:
+    issue_url: issue.html_url
 - type: cron
   schedule: "0 3 * * 1"
 "#;
         let triggers: Vec<TriggerDecl> = serde_yaml_ng::from_str(y).unwrap();
         assert_eq!(triggers.len(), 3);
         assert!(matches!(triggers[0], TriggerDecl::Manual { .. }));
-        assert!(matches!(triggers[1], TriggerDecl::GithubWebhook(_)));
         assert!(matches!(triggers[2], TriggerDecl::Cron(_)));
+        let TriggerDecl::GithubWebhook(wh) = &triggers[1] else {
+            panic!("expected github_webhook");
+        };
+        assert_eq!(
+            wh.params.get(&crate::ids::ParamName::from("issue_url")),
+            Some(&"issue.html_url".to_owned())
+        );
+        assert_eq!(wh.repo.as_deref(), Some("marlboro-red/odin"));
 
         // `type: manual` round-trips through the struct variant.
         let back = serde_yaml_ng::to_string(&triggers[0]).unwrap();

@@ -18,6 +18,13 @@ use crate::trigger::CronTrigger;
 /// A failing run never takes the daemon down: the error is logged and the trigger keeps
 /// firing. A trigger that errors or is exhausted (`Ok(None)`) simply stops; the others
 /// continue.
+///
+/// [`from_workflows`](Daemon::from_workflows) derives only `cron` triggers. `github_webhook`
+/// triggers need an HTTP listener, so an embedder must build a [`WebhookServer`] and
+/// [`add_trigger`](Daemon::add_trigger) its [`subscribe`](crate::WebhookServer::subscribe)
+/// handles (the `odind` binary does exactly this).
+///
+/// [`WebhookServer`]: crate::WebhookServer
 pub struct Daemon {
     engine: Arc<dyn Engine>,
     workflows: Arc<HashMap<WorkflowId, Workflow>>,
@@ -59,9 +66,10 @@ impl Daemon {
     }
 
     /// Builds a daemon whose triggers are derived from each workflow's `triggers:` block:
-    /// `cron` declarations become [`CronTrigger`]s. `manual` triggers are skipped — they
-    /// fire via `odin run`, not the daemon — and `github_webhook` triggers are not served
-    /// yet (a notice is logged so the omission is visible).
+    /// `cron` declarations become [`CronTrigger`]s. `manual` triggers are skipped (they fire
+    /// via `odin run`), and `github_webhook` triggers are wired separately through a
+    /// [`WebhookServer`](crate::WebhookServer) — they need an HTTP listener, not just the
+    /// supervisor loop — so they are not derived here.
     ///
     /// # Errors
     /// Returns an error if a declared cron expression is invalid.
@@ -73,23 +81,13 @@ impl Daemon {
         let mut triggers: Vec<Box<dyn Trigger>> = Vec::new();
         for workflow in daemon.workflows.values() {
             for decl in &workflow.triggers {
-                match decl {
-                    TriggerDecl::Cron(cron) => {
-                        triggers.push(Box::new(CronTrigger::new(
-                            &cron.schedule,
-                            workflow.name.clone(),
-                        )?));
-                    }
-                    TriggerDecl::GithubWebhook(_) => {
-                        eprintln!(
-                            "odind: workflow {:?} declares a github_webhook trigger, \
-                             which is not served yet (cron + manual only)",
-                            workflow.name.as_str()
-                        );
-                    }
-                    // `manual` runs via `odin run`, not the daemon; the wildcard also
-                    // covers future #[non_exhaustive] trigger kinds.
-                    _ => {}
+                // Only `cron` is derived here. `github_webhook` is wired by the
+                // WebhookServer (it needs an HTTP listener); `manual` runs via `odin run`.
+                if let TriggerDecl::Cron(cron) = decl {
+                    triggers.push(Box::new(CronTrigger::new(
+                        &cron.schedule,
+                        workflow.name.clone(),
+                    )?));
                 }
             }
         }

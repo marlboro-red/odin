@@ -17,6 +17,10 @@ triggers:
   - type: github_webhook
     events: ["issues.labeled"]
     repo: marlboro-red/odin
+    # Supply the required `issue_url` param from the webhook payload, so the same workflow
+    # runs from a label event or a manual `--param issue_url=…`.
+    params:
+      issue_url: issue.html_url
 
 params:
   issue_url:

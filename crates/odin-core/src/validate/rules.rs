@@ -340,8 +340,8 @@ pub(crate) fn workspace(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 /// ODIN020 — cron triggers carry a structurally valid 5-field schedule.
 pub(crate) fn triggers(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     for (i, t) in wf.triggers.iter().enumerate() {
-        if let TriggerDecl::Cron(c) = t {
-            if !is_valid_cron(&c.schedule) {
+        match t {
+            TriggerDecl::Cron(c) if !is_valid_cron(&c.schedule) => {
                 d.push(Diagnostic::new(
                     DiagCode::InvalidCron,
                     format!("triggers[{i}].schedule"),
@@ -351,6 +351,24 @@ pub(crate) fn triggers(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                     ),
                 ));
             }
+            // ODIN027 — a webhook param mapping whose key is not a declared param is inert;
+            // the extracted value would go nowhere. Catch the typo at validate time.
+            TriggerDecl::GithubWebhook(g) => {
+                for name in g.params.keys() {
+                    if !wf.params.contains_key(name) {
+                        d.push(Diagnostic::new(
+                            DiagCode::WebhookParamUndeclared,
+                            format!("triggers[{i}].params.{name}"),
+                            format!(
+                                "webhook maps param {:?}, which is not declared in `params`; \
+                                 the mapping is inert",
+                                name.as_str()
+                            ),
+                        ));
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
