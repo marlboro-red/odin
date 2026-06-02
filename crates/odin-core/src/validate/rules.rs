@@ -477,19 +477,100 @@ fn is_valid_id(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Month names the runtime cron parser (the `cron` crate) accepts.
+const CRON_MONTHS: [&str; 12] = [
+    "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+];
+/// Day-of-week names the runtime cron parser accepts.
+const CRON_DAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+
+/// Best-effort structural **and range** check of a standard 5-field cron expression, kept in
+/// sync with what the daemon's runtime parser (`odin-daemon`'s `parse_5field`/`normalize_dow`)
+/// actually accepts: each field is range-checked, month/day *names* and the Quartz `?`
+/// placeholder are accepted, and `*`, lists (`,`), ranges (`-`), and steps (`/`) are supported.
+/// It is intentionally not a full cron grammar — its job is to flag, at `odin validate` time,
+/// the schedules that would otherwise abort the daemon at startup, without pulling the `cron`
+/// crate into the parse-only validation path.
 fn is_valid_cron(s: &str) -> bool {
     let fields: Vec<&str> = s.split_whitespace().collect();
-    fields.len() == 5
-        && fields.iter().all(|f| {
-            let only_allowed = f
-                .chars()
-                .all(|c| c.is_ascii_digit() || matches!(c, '*' | ',' | '/' | '-'));
-            // Reject separator-only fields like `-`, `/`, `,,,`: a field must carry an
-            // actual value (a digit or `*`). This stays a structural check, not a full
-            // cron grammar.
-            let has_value = f.chars().any(|c| c.is_ascii_digit() || c == '*');
-            only_allowed && has_value
-        })
+    if fields.len() != 5 {
+        return false;
+    }
+    // (min, max, names, `?` allowed, wrap-range allowed) for minute, hour, day-of-month,
+    // month, day-of-week. Only day-of-week permits a "backwards" range (`6-0` = Sat,Sun): the
+    // daemon normalizes those by expansion, whereas the `cron` crate rejects a backwards range
+    // in every other field — so accepting one here would be a clean-validate-then-silently-
+    // skipped trap. Day-of-week is 0..=7 (POSIX: both 0 and 7 are Sunday).
+    let specs: [(u8, u8, &[&str], bool, bool); 5] = [
+        (0, 59, &[], false, false),
+        (0, 23, &[], false, false),
+        (1, 31, &[], true, false),
+        (1, 12, &CRON_MONTHS, false, false),
+        (0, 7, &CRON_DAYS, true, true),
+    ];
+    fields.iter().zip(specs).all(|(field, spec)| {
+        let (min, max, names, allow_q, allow_wrap) = spec;
+        cron_field_ok(field, min, max, names, allow_q, allow_wrap)
+    })
+}
+
+/// Validates one cron field against its numeric range / allowed names, supporting `*`, comma
+/// lists, ranges (`a-b`), and `/step`. A range endpoint may be a digit or an allowed name; a
+/// backwards range (`hi < lo`) is rejected unless `allow_wrap` (day-of-week only), matching
+/// what the daemon's runtime parser accepts.
+fn cron_field_ok(
+    field: &str,
+    min: u8,
+    max: u8,
+    names: &[&str],
+    allow_q: bool,
+    allow_wrap: bool,
+) -> bool {
+    if field.is_empty() {
+        return false;
+    }
+    // Numeric value of a token (digit in range, or a name's position offset by `min`); `None`
+    // if out of range / not a recognized name. Names are ordered from `min` (months start at
+    // JAN=1, days at SUN=0).
+    let value = |t: &str| -> Option<u8> {
+        let t = t.trim();
+        if let Ok(n) = t.parse::<u8>() {
+            return (min..=max).contains(&n).then_some(n);
+        }
+        if t.is_empty() {
+            return None;
+        }
+        names
+            .iter()
+            .position(|name| name.eq_ignore_ascii_case(t))
+            .map(|i| min + u8::try_from(i).unwrap_or(u8::MAX))
+    };
+    field.split(',').all(|item| {
+        if item.is_empty() {
+            return false;
+        }
+        let (base, step) = match item.split_once('/') {
+            Some((b, s)) => (b, Some(s)),
+            None => (item, None),
+        };
+        // A step, if present, must be a positive integer.
+        if let Some(s) = step {
+            if !matches!(s.trim().parse::<u32>(), Ok(n) if n > 0) {
+                return false;
+            }
+        }
+        match base.trim() {
+            "*" => true,
+            "?" => allow_q,
+            b => match b.split_once('-') {
+                Some((lo, hi)) => match (value(lo), value(hi)) {
+                    (Some(l), Some(h)) => allow_wrap || l <= h,
+                    _ => false,
+                },
+                None => value(b).is_some(),
+            },
+        }
+    })
 }
 
 /// Returns the closest candidate within edit distance 2, for a "did you mean" hint.
@@ -534,11 +615,36 @@ mod tests {
     fn cron_shape() {
         assert!(is_valid_cron("0 3 * * 1"));
         assert!(is_valid_cron("*/5 0 * * 1-5"));
+        assert!(is_valid_cron("0 3 * * 1-7")); // every day (used to abort the daemon)
         assert!(!is_valid_cron("* * *"));
         assert!(!is_valid_cron("0 3 * * x"));
         // Separator-only fields carry no value and must be rejected.
         assert!(!is_valid_cron("- - - - -"));
         assert!(!is_valid_cron(", , , , ,"));
+        // Range-checked per field, kept in sync with the daemon's runtime parser: out-of-range
+        // values that would abort the daemon at startup are now rejected at validate time...
+        assert!(!is_valid_cron("99 99 * * *"));
+        assert!(!is_valid_cron("61 3 * * 1"));
+        assert!(!is_valid_cron("0 3 32 13 1"));
+        assert!(!is_valid_cron("0 0 0 * *")); // day-of-month 0 is invalid
+        assert!(!is_valid_cron("0 3 * * 8")); // day-of-week 8 is invalid
+        // ...and names / the Quartz `?` placeholder that the runtime accepts are no longer
+        // wrongly flagged.
+        assert!(is_valid_cron("0 3 * * MON"));
+        assert!(is_valid_cron("0 3 * JAN-MAR 1"));
+        assert!(is_valid_cron("0 3 ? * MON-FRI"));
+        assert!(is_valid_cron("0 3 * * ?"));
+        // Backwards ranges in non-day-of-week fields are rejected — the runtime parser
+        // rejects them too, so accepting them would be a clean-validate-then-silently-skipped
+        // trap (the dangerous drift direction).
+        assert!(!is_valid_cron("5-3 3 * * 1")); // minute
+        assert!(!is_valid_cron("0 20-5 * * *")); // hour
+        assert!(!is_valid_cron("0 3 31-1 * *")); // day-of-month
+        assert!(!is_valid_cron("0 3 * NOV-FEB *")); // month (named, backwards)
+        assert!(!is_valid_cron("0 3 * 12-1 *")); // month (numeric, backwards)
+        // ...but a backwards *day-of-week* range is a valid POSIX wrap the daemon normalizes.
+        assert!(is_valid_cron("0 3 * * 6-0")); // Sat..Sun
+        assert!(is_valid_cron("0 3 * * FRI-MON"));
     }
 
     #[test]

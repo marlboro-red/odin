@@ -85,6 +85,15 @@ impl DeliveryDedup {
         self.order.push_back(id.to_owned());
         true
     }
+
+    /// Forgets a previously-recorded `id` so a redelivery will be processed again. Used when
+    /// we recorded the delivery but then failed to enqueue it (queue overflow), so GitHub's
+    /// retry must not be dropped as a duplicate.
+    fn forget(&mut self, id: &str) {
+        if self.seen.remove(id) {
+            self.order.retain(|d| d != id);
+        }
+    }
 }
 
 /// A parsed event matcher, e.g. `"issues.labeled"` → type `issues`, action `labeled`; a
@@ -341,6 +350,7 @@ async fn handle_webhook(
     }
 
     let mut matched = 0_usize;
+    let mut dropped = 0_usize;
     for sub in &state.subscriptions {
         if sub.matches(event_type, action, repo_full_name) {
             matched += 1;
@@ -351,12 +361,30 @@ async fn handle_webhook(
                 input,
             );
             if let Err(e) = sub.tx.try_send(event) {
+                dropped += 1;
                 eprintln!(
                     "odind: webhook: dropping {label} event for {} ({e})",
                     sub.workflow.as_str()
                 );
             }
         }
+    }
+    if dropped > 0 {
+        // We recorded the delivery for dedup but couldn't enqueue every matched run (queue
+        // overflow). Forget it so GitHub's retry isn't dropped as a duplicate, and return a
+        // non-2xx so GitHub actually retries. (A partially-enqueued delivery may re-run the
+        // already-enqueued subscriptions on retry — preferred over silently losing the event.)
+        if delivery != "?" {
+            state.dedup.lock().unwrap().forget(delivery);
+        }
+        eprintln!(
+            "odind: webhook: {label} delivery={delivery} → {dropped}/{matched} enqueue(s) failed; asking GitHub to retry"
+        );
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("enqueue failed for {dropped}/{matched}; please retry"),
+        )
+            .into_response();
     }
     eprintln!("odind: webhook: {label} delivery={delivery} → matched {matched} subscription(s)");
     (StatusCode::ACCEPTED, format!("accepted; matched {matched}")).into_response()

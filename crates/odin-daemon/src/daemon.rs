@@ -89,8 +89,15 @@ impl Daemon {
     /// [`WebhookServer`](crate::WebhookServer) — they need an HTTP listener, not just the
     /// supervisor loop — so they are not derived here.
     ///
+    /// A cron expression that fails to parse is **skipped with a warning** rather than
+    /// aborting the daemon — one malformed schedule must not take down every workflow in the
+    /// directory (mirroring the skip-unreadable-workflow-file behavior). `odin validate`
+    /// (ODIN020) is the first line of defense; this is the runtime backstop.
+    ///
     /// # Errors
-    /// Returns an error if a declared cron expression is invalid.
+    /// Currently infallible; returns `Result` for forward-compatibility (future wiring may
+    /// reintroduce a fallible step here).
+    #[allow(clippy::unnecessary_wraps)]
     pub fn from_workflows(
         engine: Arc<dyn Engine>,
         workflows: impl IntoIterator<Item = Workflow>,
@@ -102,10 +109,13 @@ impl Daemon {
                 // Only `cron` is derived here. `github_webhook` is wired by the
                 // WebhookServer (it needs an HTTP listener); `manual` runs via `odin run`.
                 if let TriggerDecl::Cron(cron) = decl {
-                    triggers.push(Box::new(CronTrigger::new(
-                        &cron.schedule,
-                        workflow.name.clone(),
-                    )?));
+                    match CronTrigger::new(&cron.schedule, workflow.name.clone()) {
+                        Ok(trigger) => triggers.push(Box::new(trigger)),
+                        Err(e) => eprintln!(
+                            "odind: skipping cron trigger for workflow {:?}: {e}",
+                            workflow.name.as_str()
+                        ),
+                    }
                 }
             }
         }

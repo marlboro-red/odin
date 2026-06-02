@@ -225,13 +225,20 @@ fn shipped_nightly_example_derives_a_cron_trigger() {
 }
 
 #[test]
-fn from_workflows_rejects_an_invalid_cron_expression() {
-    // A cron decl that passes IR shape-checking but is semantically unparseable must fail
-    // fast at daemon construction rather than at the first (never-arriving) fire.
+fn from_workflows_skips_an_invalid_cron_without_aborting() {
+    // A cron decl that passes IR shape-checking but is semantically unparseable must NOT
+    // abort the whole daemon — it is skipped with a warning, so other workflows still run.
+    // (`odin validate`/ODIN020 is the first line of defense against shipping such a schedule.)
     let engine = EngineBuilder::new().build().unwrap();
     let bad = Workflow::from_yaml_str(
         "name: bad\ntriggers: [{ type: cron, schedule: \"99 99 * * *\" }]\nsteps: [{ id: s, run: \"true\" }]\n",
     )
     .unwrap();
-    assert!(Daemon::from_workflows(engine, [bad]).is_err());
+    let good = Workflow::from_yaml_str(
+        "name: good\ntriggers: [{ type: cron, schedule: \"0 3 * * 1-7\" }]\nsteps: [{ id: s, run: \"true\" }]\n",
+    )
+    .unwrap();
+    let daemon = Daemon::from_workflows(engine, [bad, good]).expect("must not abort on a bad cron");
+    // Only the valid schedule (incl. the every-day `1-7` that used to crash) is registered.
+    assert_eq!(daemon.trigger_count(), 1);
 }
