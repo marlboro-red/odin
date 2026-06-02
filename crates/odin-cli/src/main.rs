@@ -1,7 +1,7 @@
 //! `odin` — the command-line runner for the Odin workflow engine.
 //!
-//! `validate` is fully implemented; the execution subcommands (`run`, `list`, `show`,
-//! `logs`) are scaffolded and arrive with the engine milestone.
+//! Subcommands: `validate` (parse + check a workflow), `run` (execute one), and the
+//! read commands `list` / `show` / `logs` over the durable run store.
 
 mod cmd;
 
@@ -52,18 +52,53 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List runs (arrives with the durable-store milestone).
-    List,
-    /// Show a run's details (arrives with the durable-store milestone).
+    /// List the most recent runs from the store.
+    List {
+        /// The git repository whose `.odin/state.db` to read. Defaults to the current dir.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Path to the run-state SQLite database. Overrides `--repo`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Maximum number of runs to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit the listing as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a run's details.
     Show {
-        /// The run id.
+        /// The run id (UUID).
         run_id: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Emit the full run state as JSON.
+        #[arg(long)]
+        json: bool,
     },
-    /// Tail a run's logs (arrives with the execution milestone).
+    /// Show a run's event log.
     Logs {
-        /// The run id.
+        /// The run id (UUID).
         run_id: String,
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Emit the events as a JSON array.
+        #[arg(long)]
+        json: bool,
     },
+}
+
+/// Maps a command result to a process exit code, printing any error.
+fn finish(result: anyhow::Result<ExitCode>) -> ExitCode {
+    result.unwrap_or_else(|e| {
+        eprintln!("error: {e:#}");
+        ExitCode::from(2)
+    })
 }
 
 fn main() -> ExitCode {
@@ -102,11 +137,23 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Command::List | Command::Show { .. } | Command::Logs { .. } => {
-            eprintln!(
-                "error: this subcommand is not implemented yet (tracked for a later milestone)"
-            );
-            ExitCode::from(2)
-        }
+        Command::List {
+            repo,
+            db,
+            limit,
+            json,
+        } => finish(cmd::inspect::list(repo, db, limit, json)),
+        Command::Show {
+            run_id,
+            repo,
+            db,
+            json,
+        } => finish(cmd::inspect::show(&run_id, repo, db, json)),
+        Command::Logs {
+            run_id,
+            repo,
+            db,
+            json,
+        } => finish(cmd::inspect::logs(&run_id, repo, db, json)),
     }
 }
