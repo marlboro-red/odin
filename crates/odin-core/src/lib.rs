@@ -39,7 +39,7 @@ pub mod ir;
 pub mod usage;
 pub mod validate;
 
-#[cfg(feature = "runtime")]
+#[cfg(all(feature = "runtime", feature = "templating"))]
 pub mod engine;
 #[cfg(all(feature = "runtime", any(test, feature = "mock")))]
 pub mod mock;
@@ -68,7 +68,7 @@ pub use validate::{
     DiagCode, Diagnostic, KnownNames, Severity, ValidationReport, validate, validate_source,
 };
 
-#[cfg(feature = "runtime")]
+#[cfg(all(feature = "runtime", feature = "templating"))]
 pub use engine::{Engine, EngineBuilder};
 #[cfg(feature = "runtime")]
 pub use provider::ClaudeProvider;

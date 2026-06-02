@@ -1,15 +1,17 @@
-//! The [`Engine`] façade: the API embedders drive.
+//! The [`Engine`] façade and its builder, plus the built-in linear executor.
 //!
-//! The concrete implementation lands at the execution milestone; this trait and its
-//! builder are fixed now so the public driving API does not churn when the executor
-//! arrives. An external tool depends on this surface, not on engine internals.
+//! Embedders construct an engine with [`EngineBuilder`], register any custom plugins,
+//! and drive workflows via [`Engine::run`] / [`Engine::resume_all`].
 
+mod local;
+
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::api::{RunInput, RunSummary};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::ids::RunId;
 use crate::ir::Workflow;
 use crate::registry::Registry;
@@ -31,20 +33,21 @@ pub trait Engine: Send + Sync {
     ///
     /// # Errors
     /// Returns an [`crate::error::Error`] if recovery fails.
-    async fn resume_all(&self) -> Result<Vec<RunSummary>>;
+    async fn resume_all(&self, workflows: &[Workflow]) -> Result<Vec<RunSummary>>;
 
-    /// Fetches the summary of a known run id.
+    /// Fetches the summary of a known run id from the [`Store`].
     ///
     /// # Errors
     /// Returns an [`crate::error::Error`] if the store read fails.
     async fn summary(&self, run_id: RunId) -> Result<Option<RunSummary>>;
 }
 
-/// Wires a [`Registry`] of plugins and a [`Store`] into a concrete engine.
+/// Wires a [`Registry`] of plugins, a repository root, and a [`Store`] into an engine.
 #[derive(Default)]
 pub struct EngineBuilder {
     registry: Registry,
     store: Option<Arc<dyn Store>>,
+    repo_root: Option<PathBuf>,
 }
 
 impl EngineBuilder {
@@ -54,10 +57,18 @@ impl EngineBuilder {
         Self {
             registry: Registry::with_builtins(),
             store: None,
+            repo_root: None,
         }
     }
 
-    /// Provides the durable store.
+    /// Sets the git repository the engine provisions workspaces from. Defaults to `.`.
+    #[must_use]
+    pub fn repo(mut self, repo_root: impl Into<PathBuf>) -> Self {
+        self.repo_root = Some(repo_root.into());
+        self
+    }
+
+    /// Provides the durable store. Without one, runs are not checkpointed.
     #[must_use]
     pub fn store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
@@ -72,15 +83,14 @@ impl EngineBuilder {
     /// Finalizes into a runnable engine.
     ///
     /// # Errors
-    /// Until the execution milestone lands, this returns [`Error::Unimplemented`] — a
-    /// *recoverable* error, never a panic, so integration code written against this frozen
-    /// API can be exercised end-to-end today. Later it will also error if required plugins
-    /// are missing.
+    /// Currently infallible, but returns `Result` so future validation (e.g. required
+    /// plugins) is non-breaking.
     pub fn build(self) -> Result<Arc<dyn Engine>> {
-        // Touch the fields so they are not dead code before the executor consumes them.
-        let _ = (&self.registry, &self.store);
-        Err(Error::Unimplemented {
-            feature: "engine executor",
-        })
+        let repo_root = self.repo_root.unwrap_or_else(|| PathBuf::from("."));
+        Ok(Arc::new(local::LocalEngine::new(
+            self.registry,
+            self.store,
+            repo_root,
+        )))
     }
 }
