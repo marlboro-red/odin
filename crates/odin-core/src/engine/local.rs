@@ -4,10 +4,12 @@
 //! the template context from the run state so far, evaluates `when`, renders the prompt /
 //! command / args, dispatches to the pinned provider, a shell `run:` hook, or a
 //! registered action, runs the gates, auto-captures the git `DIFF`, and checkpoints the
-//! [`RunState`] — so a crashed run can be resumed from the last completed step.
+//! [`RunState`] — so a crashed run can be resumed from the last completed step. A step
+//! that declares a `judge:` is scored by that provider and fails below its threshold; a
+//! failed step is retried per its `retry:` policy with backoff.
 //!
-//! v1 is linear (one shared workspace, single attempt, no judge); these are additive
-//! refinements on top of this structure.
+//! v1 is linear (one shared workspace, sequential steps); parallel-DAG execution is an
+//! additive refinement on top of this structure.
 //!
 //! ## Resume semantics
 //!
@@ -34,7 +36,7 @@ use crate::api::{RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepSt
 use crate::context::render::{build_context, eval_when, render_template};
 use crate::error::{Error, Result};
 use crate::ids::{RunId, StepId};
-use crate::ir::{Step, StepKind, Workflow, WorkspaceConfig};
+use crate::ir::{Backoff, JudgeSpec, Step, StepKind, Workflow, WorkspaceConfig};
 use crate::provider::process::{ProcessOptions, run_process};
 use crate::registry::Registry;
 use crate::traits::{
@@ -63,6 +65,8 @@ struct StepOutcome {
     gates: IndexMap<String, bool>,
     side_effects: Vec<SideEffect>,
     error: Option<String>,
+    attempts: u8,
+    judge_score: Option<f32>,
 }
 
 impl StepOutcome {
@@ -75,6 +79,8 @@ impl StepOutcome {
             gates: IndexMap::new(),
             side_effects: Vec::new(),
             error: Some(error.into()),
+            attempts: 1,
+            judge_score: None,
         }
     }
 
@@ -87,6 +93,8 @@ impl StepOutcome {
             gates: IndexMap::new(),
             side_effects: Vec::new(),
             error: None,
+            attempts: 1,
+            judge_score: None,
         }
     }
 }
@@ -366,7 +374,133 @@ impl LocalEngine {
                 outcome.error = Some(format!("gate {:?} failed", name.as_str()));
             }
         }
+
+        // LLM-as-judge: if the step otherwise passed, score its output against criteria.
+        if outcome.status == StepStatus::Passed {
+            if let Some(judge) = &step.judge {
+                let output = outcome
+                    .outputs
+                    .get("stdout")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                match self
+                    .run_judge(step, judge, &output, workdir, timeout, cancel)
+                    .await
+                {
+                    Ok(score) => {
+                        outcome.judge_score = Some(score);
+                        if score < judge.threshold {
+                            outcome.status = StepStatus::Failed;
+                            outcome.error = Some(format!(
+                                "judge score {score:.2} below threshold {:.2}",
+                                judge.threshold
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        outcome.status = StepStatus::Failed;
+                        outcome.error = Some(format!("judge error: {e}"));
+                    }
+                }
+            }
+        }
         outcome
+    }
+
+    /// Scores a step's output via the judge provider, returning a `0.0..=1.0` score.
+    async fn run_judge(
+        &self,
+        step: &Step,
+        judge: &JudgeSpec,
+        output: &str,
+        workdir: &Path,
+        timeout: Option<Duration>,
+        cancel: &CancelToken,
+    ) -> std::result::Result<f32, String> {
+        let provider = self
+            .registry
+            .provider(judge.provider.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "judge provider {:?} is not registered",
+                    judge.provider.as_str()
+                )
+            })?;
+        let prompt = format!(
+            "You are scoring whether an output satisfies the given criteria. Respond with ONLY a \
+             JSON object of the form {{\"score\": <number between 0.0 and 1.0>}}.\n\n\
+             Criteria:\n{}\n\nOutput to score:\n{output}",
+            judge.criteria
+        );
+        let ictx = InvocationCtx {
+            step_id: step.id.clone(),
+            workdir: workdir.to_path_buf(),
+            prompt: Some(prompt),
+            inputs: IndexMap::new(),
+            timeout,
+            cancel: cancel.clone(),
+        };
+        let out = provider.invoke(ictx).await.map_err(|e| e.to_string())?;
+        parse_score(&out.stdout).ok_or_else(|| {
+            format!(
+                "could not parse a score from judge output: {}",
+                out.stdout.trim()
+            )
+        })
+    }
+
+    /// Decides a step's outcome: skip if a dependency failed or `when` is false, else run
+    /// it (with retry).
+    async fn decide_outcome(
+        &self,
+        step: &Step,
+        ctx: &minijinja::Value,
+        workdir: &Path,
+        timeout: Option<Duration>,
+        deps_passed: bool,
+        cancel: &CancelToken,
+    ) -> StepOutcome {
+        if !deps_passed {
+            return StepOutcome::failed("an upstream dependency did not pass").skipped();
+        }
+        match step.when.as_deref() {
+            Some(expr) => match eval_when(expr, ctx) {
+                Ok(true) => {
+                    self.run_with_retry(step, ctx, workdir, timeout, cancel)
+                        .await
+                }
+                Ok(false) => skipped_outcome(),
+                Err(e) => StepOutcome::failed(format!("when: {e}")),
+            },
+            None => {
+                self.run_with_retry(step, ctx, workdir, timeout, cancel)
+                    .await
+            }
+        }
+    }
+
+    /// Runs a step, retrying on failure per its retry policy with backoff between attempts.
+    async fn run_with_retry(
+        &self,
+        step: &Step,
+        ctx: &minijinja::Value,
+        workdir: &Path,
+        timeout: Option<Duration>,
+        cancel: &CancelToken,
+    ) -> StepOutcome {
+        let max_extra = step.retry.max;
+        let mut attempt: u8 = 0;
+        loop {
+            attempt += 1;
+            let mut outcome = self.exec_step(step, ctx, workdir, timeout, cancel).await;
+            if outcome.status != StepStatus::Failed || attempt > max_extra {
+                outcome.attempts = attempt;
+                return outcome;
+            }
+            tokio::time::sleep(backoff_delay(step.retry.backoff, attempt)).await;
+        }
     }
 
     /// Runs a shell command in `workdir`, returning `(exit_code, stdout)`.
@@ -439,7 +573,7 @@ impl LocalEngine {
             // Already done (resume): keep its state, surface it in the summary.
             if let Some(existing) = state.steps.get(id) {
                 if matches!(existing.status, StepStatus::Passed | StepStatus::Skipped) {
-                    summary.push(step_result(id, existing, IndexMap::new()));
+                    summary.push(step_result(id, existing, IndexMap::new(), None));
                     continue;
                 }
             }
@@ -467,18 +601,9 @@ impl LocalEngine {
             // Durability boundary before acting (see `mark_running`).
             self.mark_running(workflow, state, id).await?;
 
-            let outcome = if deps_passed {
-                match step.when.as_deref() {
-                    Some(expr) => match eval_when(expr, &ctx) {
-                        Ok(true) => self.exec_step(step, &ctx, workdir, timeout, cancel).await,
-                        Ok(false) => skipped_outcome(),
-                        Err(e) => StepOutcome::failed(format!("when: {e}")),
-                    },
-                    None => self.exec_step(step, &ctx, workdir, timeout, cancel).await,
-                }
-            } else {
-                StepOutcome::failed("an upstream dependency did not pass").skipped()
-            };
+            let outcome = self
+                .decide_outcome(step, &ctx, workdir, timeout, deps_passed, cancel)
+                .await;
 
             if let Some(u) = &outcome.usage {
                 usage.add(*u);
@@ -488,7 +613,7 @@ impl LocalEngine {
             // Persist step state, then refresh DIFF for subsequent steps.
             let step_state = StepState {
                 status: outcome.status,
-                attempts: 1,
+                attempts: outcome.attempts,
                 exit_code: outcome.exit_code,
                 outputs: outcome.outputs.clone(),
                 usage: outcome.usage,
@@ -513,7 +638,12 @@ impl LocalEngine {
             )
             .await;
 
-            summary.push(step_result(id, &step_state, outcome.gates));
+            summary.push(step_result(
+                id,
+                &step_state,
+                outcome.gates,
+                outcome.judge_score,
+            ));
         }
 
         Ok(ExecResult {
@@ -574,7 +704,7 @@ impl LocalEngine {
             steps: state
                 .steps
                 .iter()
-                .map(|(id, st)| step_result(id, st, IndexMap::new()))
+                .map(|(id, st)| step_result(id, st, IndexMap::new(), None))
                 .collect(),
             usage: Usage::default(),
             side_effects: Vec::new(),
@@ -747,7 +877,7 @@ impl Engine for LocalEngine {
         let steps = state
             .steps
             .iter()
-            .map(|(id, st)| step_result(id, st, IndexMap::new()))
+            .map(|(id, st)| step_result(id, st, IndexMap::new(), None))
             .collect();
         let diff = state
             .artifacts
@@ -785,10 +915,17 @@ fn skipped_outcome() -> StepOutcome {
         gates: IndexMap::new(),
         side_effects: Vec::new(),
         error: None,
+        attempts: 1,
+        judge_score: None,
     }
 }
 
-fn step_result(id: &StepId, state: &StepState, gates: IndexMap<String, bool>) -> StepResult {
+fn step_result(
+    id: &StepId,
+    state: &StepState,
+    gates: IndexMap<String, bool>,
+    judge_score: Option<f32>,
+) -> StepResult {
     StepResult {
         id: id.clone(),
         status: state.status,
@@ -796,9 +933,32 @@ fn step_result(id: &StepId, state: &StepState, gates: IndexMap<String, bool>) ->
         exit_code: state.exit_code,
         outputs: state.outputs.clone(),
         gates,
-        judge_score: None,
+        judge_score,
         usage: state.usage,
     }
+}
+
+/// Base inter-attempt retry delay.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+
+/// The delay before re-attempting after `completed_attempt` failed.
+fn backoff_delay(backoff: Backoff, completed_attempt: u8) -> Duration {
+    match backoff {
+        Backoff::Fixed => RETRY_BASE_DELAY,
+        Backoff::Exponential => {
+            RETRY_BASE_DELAY * 2u32.pow(u32::from(completed_attempt.saturating_sub(1)).min(6))
+        }
+    }
+}
+
+/// Extracts a `0.0..=1.0` score from judge output (a JSON object with a `score` field).
+#[allow(clippy::cast_possible_truncation)]
+fn parse_score(text: &str) -> Option<f32> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let value: Value = serde_json::from_str(text.get(start..=end)?).ok()?;
+    let score = value.get("score")?.as_f64()?;
+    Some((score as f32).clamp(0.0, 1.0))
 }
 
 /// Builds the minijinja context from the run state assembled so far.
@@ -1222,5 +1382,136 @@ steps:
             "expected a Commit side-effect, got {:?}",
             summary.side_effects
         );
+    }
+
+    /// A provider that always replies with a fixed string (a stand-in judge/agent).
+    struct FixedProvider {
+        id: &'static str,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::Provider for FixedProvider {
+        fn id(&self) -> crate::ids::ProviderRef {
+            crate::ids::ProviderRef::new(self.id)
+        }
+        async fn invoke(
+            &self,
+            _ctx: crate::traits::InvocationCtx,
+        ) -> std::result::Result<crate::traits::InvocationOutcome, crate::error::ProviderError>
+        {
+            Ok(crate::traits::InvocationOutcome::success(
+                self.reply.clone(),
+            ))
+        }
+    }
+
+    fn engine_with(repo: &Path, store: Arc<dyn Store>, scorer_reply: &str) -> Arc<dyn Engine> {
+        let mut builder = EngineBuilder::new().repo(repo).store(store);
+        builder
+            .registry_mut()
+            .register_provider(Arc::new(EchoProvider::new("echo")))
+            .register_provider(Arc::new(FixedProvider {
+                id: "scorer",
+                reply: scorer_reply.to_owned(),
+            }));
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn parse_score_reads_json() {
+        assert_eq!(super::parse_score(r#"{"score": 0.8}"#), Some(0.8));
+        assert_eq!(
+            super::parse_score("noise before {\"score\": 1.5} after"),
+            Some(1.0)
+        );
+        assert_eq!(super::parse_score("no json here"), None);
+    }
+
+    #[tokio::test]
+    async fn judge_passes_a_step_above_threshold() {
+        let repo = init_repo().await;
+        let eng = engine_with(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            r#"{"score": 0.9}"#,
+        );
+        let wf = parse(
+            "name: j\nworkspace: { type: worktree }\nsteps:\n  - id: a\n    provider: echo\n    prompt: hi\n    judge: { provider: scorer, criteria: ok, threshold: 0.7 }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        let a = &summary.steps[0];
+        assert_eq!(a.status, StepStatus::Passed);
+        assert!((a.judge_score.unwrap() - 0.9).abs() < 0.001);
+    }
+
+    #[tokio::test]
+    async fn judge_fails_a_step_below_threshold() {
+        let repo = init_repo().await;
+        let eng = engine_with(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            r#"{"score": 0.2}"#,
+        );
+        let wf = parse(
+            "name: j\nworkspace: { type: worktree }\nsteps:\n  - id: a\n    provider: echo\n    prompt: hi\n    judge: { provider: scorer, criteria: ok, threshold: 0.7 }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Failed);
+        let a = &summary.steps[0];
+        assert_eq!(a.status, StepStatus::Failed);
+        assert!((a.judge_score.unwrap() - 0.2).abs() < 0.001);
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("judge score")
+                || a.status == StepStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_recovers_a_flaky_step() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // Fails the first attempt (creates a marker), passes the second.
+        let wf = parse(
+            "name: r\nworkspace: { type: worktree }\nsteps:\n  - id: flaky\n    run: \"test -f .marker || (touch .marker; exit 1)\"\n    retry: { max: 1 }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        let flaky = &summary.steps[0];
+        assert_eq!(flaky.status, StepStatus::Passed);
+        assert_eq!(flaky.attempts, 2, "should have retried once");
+    }
+
+    #[tokio::test]
+    async fn retry_exhausts_then_fails() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: r\nworkspace: { type: worktree }\nsteps:\n  - {id: boom, run: \"exit 1\", retry: { max: 1 }}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Failed);
+        assert_eq!(summary.steps[0].attempts, 2, "1 + max attempts");
     }
 }
