@@ -8,9 +8,11 @@ No async deps present. On Rust 1.85, native `async fn` in traits is stable but *
 > [`../architecture.md`](../architecture.md) and the source. Known deviations from §6
 > below:
 > - "Prompt on an action/run step" is a **parse-time error** (in `StepKind::from_discriminants`),
->   not a diagnostic. The §6 row for it was dropped and the codes renumbered **contiguously to
->   26** total: unknown-root-field is **ODIN025**, newer-schema-minor is **ODIN026**. There is
->   **no ODIN027**.
+>   not a diagnostic. The §6 row for it was dropped and the codes renumbered: unknown-root-field
+>   is **ODIN025**, newer-schema-minor is **ODIN026**. Since then the live catalogue has grown
+>   to **28 codes** — **ODIN027** (`github_webhook` maps an undeclared param) and **ODIN028**
+>   (`scratch: true` on an action step) were added with later features. See the
+>   [workflow reference](../workflow-reference.md) for the authoritative, current catalogue.
 > - In the §6 orchestration sketch: `ODIN024` (unused param) is emitted by
 >   `context::refs::check` (templating-gated), not `rules::params` (which emits only ODIN022);
 >   and the cycle check is `rules::cycles` (calling `graph::find_cycle`), not `graph::cycles`.

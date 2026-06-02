@@ -71,8 +71,10 @@ enum Command {
     Show {
         /// The run id (UUID).
         run_id: String,
+        /// The git repository whose `.odin/state.db` to read. Defaults to the current dir.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Path to the run-state SQLite database. Overrides `--repo`.
         #[arg(long)]
         db: Option<PathBuf>,
         /// Emit the full run state as JSON.
@@ -83,8 +85,10 @@ enum Command {
     Logs {
         /// The run id (UUID).
         run_id: String,
+        /// The git repository whose `.odin/state.db` to read. Defaults to the current dir.
         #[arg(long)]
         repo: Option<PathBuf>,
+        /// Path to the run-state SQLite database. Overrides `--repo`.
         #[arg(long)]
         db: Option<PathBuf>,
         /// Emit the events as a JSON array.
