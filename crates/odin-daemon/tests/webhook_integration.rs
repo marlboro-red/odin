@@ -277,3 +277,48 @@ async fn health_endpoint_responds_without_a_signature() {
     );
     h.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dev_mode_accepts_unsigned_and_runs() {
+    // No secret configured (dev mode): an unsigned, matching event is accepted and runs.
+    let h = Harness::start(None).await;
+    let body = labeled_payload();
+
+    let status = post_webhook(h.addr, "issues", &body, None).await;
+    assert!(
+        status.contains("202"),
+        "dev mode should accept unsigned, got: {status}"
+    );
+
+    let (n, terminal) = wait_for_terminal_run(&h.store, Duration::from_secs(15)).await;
+    assert_eq!(n, 1, "dev-mode unsigned event should run");
+    assert_eq!(terminal, Some(RunStatus::Succeeded));
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_json_body_is_rejected() {
+    let h = Harness::start(None).await;
+    let status = post_webhook(h.addr, "issues", b"{not valid json", None).await;
+    assert!(
+        status.contains("400"),
+        "malformed JSON should be 400, got: {status}"
+    );
+    // Nothing should run.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.store.recent(10).await.unwrap().len(), 0);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_event_header_is_rejected() {
+    let h = Harness::start(None).await;
+    // An empty X-GitHub-Event value is treated as missing.
+    let status = post_webhook(h.addr, "", &labeled_payload(), None).await;
+    assert!(
+        status.contains("400"),
+        "missing X-GitHub-Event should be 400, got: {status}"
+    );
+    h.shutdown().await;
+}

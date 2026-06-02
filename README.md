@@ -9,7 +9,7 @@ step, and Odin runs it: planning, implementing, self-reviewing, and opening a PR
 every step checkpointed so a crashed run resumes where it left off.
 
 > **Status: runs end-to-end, on a schedule and on events.** The workflow IR, the full
-> validator (26 diagnostics), the templating/context model, the five integration traits,
+> validator (27 diagnostics), the templating/context model, the five integration traits,
 > the durable SQLite store, the worktree + slot-pool workspaces, all three provider
 > adapters (Claude / Codex / Copilot), the built-in actions (`shell.exec`, `git.commit`,
 > `git.push`, `github.open_pr`), LLM-as-judge + retry, the executor, the `odin` CLI

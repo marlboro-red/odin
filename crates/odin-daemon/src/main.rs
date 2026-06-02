@@ -39,9 +39,14 @@ struct Cli {
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:9292")]
     webhook_addr: SocketAddr,
     /// HMAC secret for verifying GitHub webhook signatures; falls back to
-    /// `$ODIN_WEBHOOK_SECRET`. Without one, the server accepts unsigned requests (dev mode).
+    /// `$ODIN_WEBHOOK_SECRET`. Required if any workflow declares a `github_webhook` trigger,
+    /// unless `--webhook-allow-unsigned` is given.
     #[arg(long, value_name = "SECRET")]
     webhook_secret: Option<String>,
+    /// Explicitly run the webhook server WITHOUT signature verification (local testing
+    /// only). Without this, a declared webhook trigger and no secret is a startup error.
+    #[arg(long)]
+    webhook_allow_unsigned: bool,
 }
 
 fn main() -> ExitCode {
@@ -89,6 +94,7 @@ fn real_main() -> anyhow::Result<()> {
         .webhook_secret
         .or_else(|| std::env::var("ODIN_WEBHOOK_SECRET").ok())
         .filter(|s| !s.is_empty());
+    let has_secret = secret.is_some();
     let mut webhook_server = WebhookServer::new(cli.webhook_addr, secret);
     let mut webhook_triggers = Vec::new();
     for workflow in &workflows {
@@ -97,6 +103,16 @@ fn real_main() -> anyhow::Result<()> {
                 webhook_triggers.push(webhook_server.subscribe(github, workflow.name.clone()));
             }
         }
+    }
+
+    // Fail closed: a network-facing webhook trigger without a verification secret would
+    // accept requests from anyone. Only an explicit opt-in permits running unsigned.
+    if !webhook_server.is_empty() && !has_secret && !cli.webhook_allow_unsigned {
+        anyhow::bail!(
+            "a github_webhook trigger is declared but no secret is configured; set \
+             --webhook-secret or $ODIN_WEBHOOK_SECRET (or pass --webhook-allow-unsigned for \
+             local testing without signature verification)"
+        );
     }
 
     let mut daemon = Daemon::from_workflows(engine, workflows)?;
@@ -120,7 +136,20 @@ fn real_main() -> anyhow::Result<()> {
         let result = if webhook_server.is_empty() {
             daemon.run().await
         } else {
+            eprintln!(
+                "odind: webhook server: {} subscription(s), 25 MiB body cap",
+                webhook_server.subscription_count()
+            );
             let bound = webhook_server.bind().await?;
+            // No built-in TLS: a non-loopback bind over plain HTTP must sit behind a
+            // TLS-terminating reverse proxy, or signatures travel in cleartext.
+            if !bound.local_addr().ip().is_loopback() {
+                eprintln!(
+                    "odind: WARNING webhook server bound to non-loopback {} over plain HTTP; \
+                     terminate TLS at a reverse proxy in front of it",
+                    bound.local_addr()
+                );
+            }
             eprintln!(
                 "odind: webhook server listening on http://{}/webhook",
                 bound.local_addr()

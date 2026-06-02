@@ -242,7 +242,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Milestone status
 
-**Done:** workspace scaffold, IR, validator + 26 diagnostics, templating/context model,
+**Done:** workspace scaffold, IR, validator + 27 diagnostics, templating/context model,
 the five traits + registry + engine façade + mocks, `odin validate`, examples, full test
 suite (clippy-pedantic clean, docs clean).
 

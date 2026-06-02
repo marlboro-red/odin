@@ -29,6 +29,11 @@ pub enum TriggerDecl {
 /// When the daemon serves this trigger, the full event payload is delivered to the run as
 /// `trigger.*` (reachable in templates). To satisfy a workflow's typed `params` from the
 /// event, map each param to a dot-path into the payload via [`params`](Self::params).
+///
+/// Note: for a `durable` workflow the payload is checkpointed verbatim into the run's
+/// persisted state. GitHub events can carry PII (logins, emails, commit authors); store the
+/// state DB accordingly, and prefer mapping the few fields you need into `params` over
+/// relying on `trigger.*` if you would rather not persist the whole event.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]

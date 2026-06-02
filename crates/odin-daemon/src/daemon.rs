@@ -18,6 +18,13 @@ use crate::trigger::CronTrigger;
 /// A failing run never takes the daemon down: the error is logged and the trigger keeps
 /// firing. A trigger that errors or is exhausted (`Ok(None)`) simply stops; the others
 /// continue.
+///
+/// [`from_workflows`](Daemon::from_workflows) derives only `cron` triggers. `github_webhook`
+/// triggers need an HTTP listener, so an embedder must build a [`WebhookServer`] and
+/// [`add_trigger`](Daemon::add_trigger) its [`subscribe`](crate::WebhookServer::subscribe)
+/// handles (the `odind` binary does exactly this).
+///
+/// [`WebhookServer`]: crate::WebhookServer
 pub struct Daemon {
     engine: Arc<dyn Engine>,
     workflows: Arc<HashMap<WorkflowId, Workflow>>,

@@ -218,6 +218,24 @@ fn odin024_unused_param() {
 }
 
 #[test]
+fn odin027_webhook_param_undeclared() {
+    // `ghost` is mapped by the webhook but never declared in `params` → inert mapping.
+    assert_fires(
+        "name: x\ntriggers:\n  - type: github_webhook\n    events: [\"issues.labeled\"]\n    params:\n      ghost: issue.html_url\nsteps:\n  - {id: a, run: ./x}\n",
+        DiagCode::WebhookParamUndeclared,
+    );
+}
+
+#[test]
+fn odin027_does_not_fire_for_a_declared_mapped_param() {
+    // A mapping to a declared (and used) param is clean.
+    let r = report(
+        "name: x\ntriggers:\n  - type: github_webhook\n    events: [\"issues.labeled\"]\n    params:\n      url: issue.html_url\nparams:\n  url: {required: true}\nsteps:\n  - {id: a, run: \"./x {{ params.url }}\"}\n",
+    );
+    assert!(!r.contains(DiagCode::WebhookParamUndeclared), "got:\n{r}");
+}
+
+#[test]
 fn odin025_unknown_root_field() {
     assert_fires(
         "name: x\nmystery: 1\nsteps:\n  - {id: a, run: ./x}\n",

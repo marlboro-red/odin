@@ -90,6 +90,9 @@ pub enum DiagCode {
     UnknownRootField,
     /// ODIN026 — the schema minor is newer than this engine (warning).
     NewerSchemaMinor,
+    /// ODIN027 — a `github_webhook` trigger maps a param that the workflow does not
+    /// declare; the mapping is inert (warning).
+    WebhookParamUndeclared,
 }
 
 impl DiagCode {
@@ -123,6 +126,7 @@ impl DiagCode {
             DiagCode::UnusedParam => "ODIN024",
             DiagCode::UnknownRootField => "ODIN025",
             DiagCode::NewerSchemaMinor => "ODIN026",
+            DiagCode::WebhookParamUndeclared => "ODIN027",
         }
     }
 
@@ -135,7 +139,8 @@ impl DiagCode {
             | DiagCode::InertFallbackProvider
             | DiagCode::UnusedParam
             | DiagCode::UnknownRootField
-            | DiagCode::NewerSchemaMinor => Severity::Warning,
+            | DiagCode::NewerSchemaMinor
+            | DiagCode::WebhookParamUndeclared => Severity::Warning,
             _ => Severity::Error,
         }
     }
