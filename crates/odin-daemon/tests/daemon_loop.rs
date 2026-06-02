@@ -158,6 +158,40 @@ async fn multiple_triggers_run_concurrently_and_add_trigger_registers() {
     assert!(names.contains("alpha") && names.contains("beta"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_of_events_all_run_and_drain_on_shutdown() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (engine, store) = engine_with_store(repo.path());
+
+    // One trigger emits four events at once; each must produce a run, and run() must drain
+    // all in-flight dispatches before returning (the trigger is exhausted after the burst).
+    let burst = (0..4).map(|_| event_for("tick")).collect::<Vec<_>>();
+    let daemon =
+        Daemon::new(engine, [tick_workflow("tick")]).with_trigger(ScriptTrigger::new(burst));
+    daemon.run().await.unwrap();
+
+    let runs = store.recent(20).await.unwrap();
+    assert_eq!(runs.len(), 4, "all four burst events should have run");
+    assert!(runs.iter().all(|r| r.status == RunStatus::Succeeded));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_concurrent_runs_is_clamped_to_at_least_one() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (engine, store) = engine_with_store(repo.path());
+
+    // A limit of 0 must clamp to 1 — `Semaphore::new(0)` would otherwise deadlock and this
+    // test would hang. Two events should still both run (serialized).
+    let daemon = Daemon::new(engine, [tick_workflow("tick")])
+        .with_max_concurrent_runs(0)
+        .with_trigger(ScriptTrigger::new([event_for("tick"), event_for("tick")]));
+    daemon.run().await.unwrap();
+
+    assert_eq!(store.recent(20).await.unwrap().len(), 2);
+}
+
 #[test]
 fn from_workflows_derives_one_trigger_per_cron_decl() {
     // Manual-only → 0 triggers; one cron → 1; two crons → 2. Webhooks are not served yet.

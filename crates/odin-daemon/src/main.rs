@@ -38,6 +38,10 @@ struct Cli {
     /// `github_webhook` trigger).
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:9292")]
     webhook_addr: SocketAddr,
+    /// Maximum runs executing concurrently across the daemon (default 4). A burst of events
+    /// queues for a free slot rather than launching unbounded runs.
+    #[arg(long, value_name = "N")]
+    max_concurrent_runs: Option<usize>,
     /// HMAC secret for verifying GitHub webhook signatures; falls back to
     /// `$ODIN_WEBHOOK_SECRET`. Required if any workflow declares a `github_webhook` trigger,
     /// unless `--webhook-allow-unsigned` is given.
@@ -116,6 +120,9 @@ fn real_main() -> anyhow::Result<()> {
     }
 
     let mut daemon = Daemon::from_workflows(engine, workflows)?;
+    if let Some(n) = cli.max_concurrent_runs {
+        daemon = daemon.with_max_concurrent_runs(n);
+    }
     for trigger in webhook_triggers {
         daemon.add_trigger(Box::new(trigger));
     }
