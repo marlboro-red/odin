@@ -27,9 +27,15 @@
 //! restores the workdir to the last snapshot before re-running — so a step interrupted
 //! mid-edit re-applies from a clean tree rather than double-applying its file changes. The
 //! snapshots are dangling commits anchored by a per-run ref (`refs/odin/run/<id>`) that is
-//! dropped when the run finishes, so they never reach the workflow's branch or its PR. (A
-//! side effect outside the workspace — a pushed branch, an opened PR — is still external and
-//! not covered by the snapshot.)
+//! dropped when the run finishes, so they never reach the workflow's branch or its PR.
+//!
+//! Snapshot/restore covers the *uncommitted* working-tree phase only. Once a step **commits**
+//! (HEAD leaves base), snapshotting disengages for the rest of the run — git's own commits
+//! are the durable record, and rewinding past them would corrupt the run branch — so steps
+//! after the first commit re-run on resume without a snapshot rewind (they may double-apply,
+//! the documented pre-snapshot behavior). Also outside the snapshot's reach: side effects
+//! beyond the workspace (a pushed branch, an opened PR), `.gitignore`d paths, and nested
+//! untracked git repos (which `git clean` leaves in place).
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -66,6 +72,9 @@ pub(crate) struct LocalEngine {
     registry: Registry,
     store: Option<Arc<dyn Store>>,
     repo_root: PathBuf,
+    /// Serializes `git worktree add/remove/prune`: git's worktree metadata is not safe for
+    /// concurrent mutation, and scratch steps provision worktrees in parallel.
+    worktree_lock: tokio::sync::Mutex<()>,
 }
 
 /// What executing a single step produced (richer than the persisted `StepState`).
@@ -129,6 +138,7 @@ impl LocalEngine {
             registry,
             store,
             repo_root,
+            worktree_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -596,14 +606,19 @@ impl LocalEngine {
         let intent_to_add = ["add", "-N", "."].map(str::to_owned);
         let _ = run_process("git", &intent_to_add, &opts, cancel).await;
         // Diff against the run's base commit when known (snapshots may have advanced the
-        // index without moving it), else the working tree's HEAD.
+        // index without moving it), else the working tree's HEAD. `--` disambiguates the
+        // revision from any path.
         let args = match base {
-            Some(base) => vec!["diff".to_owned(), base.to_owned()],
+            Some(base) => vec!["diff".to_owned(), base.to_owned(), "--".to_owned()],
             None => vec!["diff".to_owned()],
         };
+        // Gate on a clean exit: an unresolvable base (e.g. a reaped snapshot) makes
+        // `git diff <base>` exit non-zero with EMPTY stdout, which must NOT be mistaken for a
+        // real empty diff and clobber the carried-forward DIFF — return `None` instead.
         run_process("git", &args, &opts, cancel)
             .await
             .ok()
+            .filter(|o| o.exit_code == 0)
             .map(|o| o.stdout)
     }
 
@@ -944,17 +959,24 @@ impl LocalEngine {
                     // Set `snapshot` UNCONDITIONALLY — a failed or disengaged snapshot must
                     // become `None`, never a stale pointer a later resume would rewind to
                     // (which would discard this completed step's work).
-                    let at_base = !snapshots_disengaged
-                        && base_commit.is_some()
-                        && self.git_head(workdir, cancel).await == base_commit;
+                    let head = if snapshots_disengaged {
+                        None
+                    } else {
+                        self.git_head(workdir, cancel).await
+                    };
+                    let at_base = head.is_some() && head == base_commit;
                     state.snapshot = if let Some(base) = base_commit.as_deref().filter(|_| at_base)
                     {
                         // Best-effort: a returned `None` here is a transient snapshot failure,
                         // not a disengage — the next step retries while still at base.
                         self.snapshot_workdir(workdir, base, run_id, cancel).await
                     } else {
-                        // Not at base (a commit landed) or no base — disengage for good.
-                        snapshots_disengaged = true;
+                        // Disengage for good only on a CONFIRMED commit (HEAD read OK and moved
+                        // off base). A transient HEAD-read failure (head is None) leaves this
+                        // step without a snapshot but lets the next step retry.
+                        if head.is_some() && head != base_commit {
+                            snapshots_disengaged = true;
+                        }
                         None
                     };
                 }
@@ -1021,9 +1043,10 @@ impl LocalEngine {
                 // *or* Failed (a failed candidate's partial work is still worth inspecting by
                 // a downstream judge). A `Skipped` step (e.g. `when: false`) ran nothing.
                 if !matches!(outcome.status, StepStatus::Skipped) {
-                    // The scratch worktree is detached at the shared tree's HEAD, so a plain
-                    // diff (vs its own HEAD) is exactly this candidate's changes.
-                    if let Some(d) = self.capture_diff(&scratch, None, cancel).await {
+                    // The scratch worktree is detached at the shared tree's HEAD, so diffing
+                    // vs `HEAD` captures the candidate's full changes — staged *and* unstaged,
+                    // consistent with the base-relative shared DIFF.
+                    if let Some(d) = self.capture_diff(&scratch, Some("HEAD"), cancel).await {
                         outcome.outputs.insert("diff".to_owned(), Value::String(d));
                     }
                 }
@@ -1057,9 +1080,12 @@ impl LocalEngine {
             ..ProcessOptions::default()
         };
         let args = ["worktree", "add", "--detach", scratch_str, "HEAD"].map(str::to_owned);
-        let out = run_process("git", &args, &opts, cancel)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Serialized: concurrent scratch steps must not race on git's worktree metadata.
+        let out = {
+            let _guard = self.worktree_lock.lock().await;
+            run_process("git", &args, &opts, cancel).await
+        }
+        .map_err(|e| e.to_string())?;
         if out.exit_code == 0 {
             Ok(scratch)
         } else {
@@ -1077,6 +1103,7 @@ impl LocalEngine {
             ..ProcessOptions::default()
         };
         let args = ["worktree", "remove", "--force", scratch_str].map(str::to_owned);
+        let _guard = self.worktree_lock.lock().await;
         let _ = run_process("git", &args, &opts, cancel).await;
     }
 
@@ -1279,12 +1306,10 @@ impl Engine for LocalEngine {
         for mut state in store.load_incomplete().await? {
             let Some(workflow) = by_name.get(state.workflow.as_str()).copied() else {
                 // The run targets a workflow we no longer serve — best-effort reclaim its
-                // snapshot ref (delete is a no-op if none was created) so dangling commits
-                // aren't pinned forever, even if snapshotting had disengaged (snapshot=None).
-                if let Some(handle) = &state.workspace {
-                    self.delete_snapshot_ref(&handle.path, state.run_id, &sweep_cancel)
-                        .await;
-                }
+                // snapshot ref from the shared main repo (a no-op if none was created), so
+                // dangling commits aren't pinned forever even if the worktree is gone.
+                self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
+                    .await;
                 continue;
             };
             let Some(handle) = state.workspace.clone() else {
@@ -1335,7 +1360,13 @@ impl Engine for LocalEngine {
                     Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
                 }
             } else {
-                // The workspace is gone (host moved, manual cleanup); cannot resume.
+                // The workspace is gone (host moved, manual cleanup); cannot resume. The
+                // snapshot ref lives in the shared main repo, so reclaim it there (best
+                // effort) even though the worktree dir is gone.
+                if workflow.durable {
+                    self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
+                        .await;
+                }
                 self.fail_run(workflow, &mut state, "workspace is gone; cannot resume")
                     .await?
             };
@@ -2489,6 +2520,65 @@ steps:
                 .contains("partial"),
             "a failed scratch step should still expose its diff: {:?}",
             bad.outputs.get("diff")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_diff_returns_none_for_an_unresolvable_base() {
+        // A failed `git diff <base>` (bad/ reaped base) must yield None — NOT Some("") — so a
+        // carried-forward DIFF isn't clobbered with empty. A valid base with no changes is a
+        // real empty diff and stays Some("").
+        let repo = init_repo().await;
+        let eng = LocalEngine::new(Registry::with_builtins(), None, repo.path().to_path_buf());
+        let cancel = CancelToken::new();
+        let bogus = "0".repeat(40);
+        assert!(
+            eng.capture_diff(repo.path(), Some(&bogus), &cancel)
+                .await
+                .is_none(),
+            "an unresolvable base must return None"
+        );
+        let head = eng.git_head(repo.path(), &cancel).await.unwrap();
+        assert_eq!(
+            eng.capture_diff(repo.path(), Some(&head), &cancel)
+                .await
+                .as_deref(),
+            Some(""),
+            "a valid base with no changes is an empty diff, not None"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scratch_diff_includes_staged_changes() {
+        // A scratch step that `git add`s its edit must still expose them in outputs.diff
+        // (diff vs HEAD captures staged + unstaged), not silently drop the staged part.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: staged\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 2\nsteps:\n  - { id: cand, run: \"echo s > staged.txt && git add staged.txt\", scratch: true }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        let cand = summary
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == "cand")
+            .unwrap();
+        assert!(
+            cand.outputs["diff"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("staged.txt"),
+            "scratch diff dropped the staged change: {:?}",
+            cand.outputs.get("diff")
         );
     }
 }
