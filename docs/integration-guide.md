@@ -15,6 +15,7 @@ results.
 - [Data in / data out](#data-in--data-out)
 - [The five integration traits](#the-five-integration-traits)
 - [Registering custom plugins](#registering-custom-plugins)
+- [Selecting models](#selecting-models)
 - [Durability & resume](#durability--resume)
 - [Errors](#errors)
 - [Embedding the daemon](#embedding-the-daemon)
@@ -277,6 +278,73 @@ let report = odin_core::validate(&workflow, &registry.known_names());
 
 ---
 
+## Selecting models
+
+The built-in providers are thin wrappers around the `claude` / `codex` / `copilot` CLIs.
+Odin passes **no** credentials and, by default, **no** model — it invokes the CLI with a
+fixed argument vector and lets the CLI use whatever it is logged into and configured for.
+There are two ways to control which model runs.
+
+**Globally, via the CLI's own config (no code).** Because the child process inherits your
+environment, the model the CLI is configured to use is the model that runs. Set it where the
+CLI looks — e.g. `export ANTHROPIC_MODEL=…` for Claude Code, codex's `~/.codex/config.toml`,
+or copilot's config — before launching `odin`/`odind`. This applies to every step that uses
+that CLI.
+
+**Per provider, via the builder (`with_model`).** Each built-in exposes `with_model`, which
+appends `--model <name>` to every invocation. The model is a separate field, so the pin
+survives a later `with_extra_args` — but note `with_extra_args` *replaces* (does not append
+to) the sandbox/permission defaults, so re-supply those in your args if you call it. Set the
+model through `with_model` only — don't *also* put `--model` in `with_extra_args`, or the CLI
+receives two `--model` flags:
+
+```rust
+use odin_core::{ClaudeProvider, CodexProvider};
+
+ClaudeProvider::new().with_model("claude-opus-4-8");   // claude -p … --model claude-opus-4-8
+CodexProvider::new().with_model("gpt-5.2-codex");      // codex exec … --model gpt-5.2-codex <prompt>
+```
+
+**Mixing models in one workflow (`with_id` + `with_model`).** A provider is registered under
+its `id()`. Give each instance a distinct id and register several, then target them from
+steps by name:
+
+```rust
+use std::sync::Arc;
+use odin_core::{EngineBuilder, ClaudeProvider, SqliteStore};
+
+let mut builder = EngineBuilder::new()
+    .repo("/path/to/repo")
+    .store(Arc::new(SqliteStore::open("runs.db")?));
+builder.registry_mut()
+    .register_provider(Arc::new(
+        ClaudeProvider::new().with_id("planner").with_model("claude-opus-4-8"),
+    ))
+    .register_provider(Arc::new(
+        ClaudeProvider::new().with_id("reviewer").with_model("claude-sonnet-4-6"),
+    ));
+let engine = builder.build()?;
+```
+
+```yaml
+steps:
+  - { id: plan,   provider: planner,  prompt: "..." }
+  - { id: review, provider: reviewer, prompt: "...", depends_on: [plan] }
+```
+
+Reusing a built-in id (`"claude"`) **replaces** that built-in (last writer wins), so
+`register_provider(Arc::new(ClaudeProvider::new().with_model("…")))` re-pins the default
+`provider: claude` without adding a new name.
+
+> **Validation caveat.** A custom id like `planner` is known to the engine you build —
+> `Engine::run` validates against the live registry, so the run is fine — but the standalone
+> `odin validate` CLI only knows the three built-in names and will report
+> [ODIN005](workflow-reference.md#odin005) ("unknown provider") for `provider: planner`. To
+> validate such a workflow in your own tooling, pass your registry's names:
+> `odin_core::validate(&workflow, &registry.known_names())`.
+
+---
+
 ## Durability & resume
 
 With a store and `durable: true` workflows, the engine checkpoints `RunState` at every step
@@ -351,7 +419,7 @@ crashes on) a failing run, and drains in-flight runs on shutdown.
 
 | Kind | Built-ins (`odin_core::…`) |
 |------|----------------------------|
-| Providers | `ClaudeProvider`, `CodexProvider`, `CopilotProvider` (each `::new()`) |
+| Providers | `ClaudeProvider`, `CodexProvider`, `CopilotProvider` — each `::new()` plus `.with_id(..)` / `.with_model(..)` / `.with_program(..)` / `.with_extra_args(..)` (see [Selecting models](#selecting-models)) |
 | Actions | `ShellExec` → `shell.exec`, `GitCommit` → `git.commit`, `GitPush` → `git.push`, `OpenPr` → `github.open_pr` |
 | Workspaces | `WorktreeWorkspace::new(repo)`, `SlotPoolWorkspace::new(repo, pool_dir, size, reset)` |
 | Store | `SqliteStore::open(path)`, `SqliteStore::open_in_memory()` |

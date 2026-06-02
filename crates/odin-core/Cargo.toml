@@ -62,3 +62,15 @@ runtime = [
 mock = ["runtime"]
 # Everything.
 full = ["ir", "templating", "runtime"]
+
+# The cross-model review example drives the engine with model-pinned providers, so it needs
+# the runtime + templating stack. Without this, a reduced-feature build (e.g. `--features ir`)
+# would try to compile it and fail.
+[[example]]
+name = "cross_model_review"
+required-features = ["runtime", "templating"]
+
+# Codex-only smoke (no Claude calls) for cheap iteration on the codex integration.
+[[example]]
+name = "codex_smoke"
+required-features = ["runtime", "templating"]

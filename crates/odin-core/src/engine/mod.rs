@@ -89,6 +89,12 @@ impl EngineBuilder {
     /// plugins) is non-breaking.
     pub fn build(self) -> Result<Arc<dyn Engine>> {
         let repo_root = self.repo_root.unwrap_or_else(|| PathBuf::from("."));
+        // Absolutize so providers/workspaces never receive a *relative* working directory.
+        // Tools like `codex --cd`/`-o` resolve their path arguments relative to the child's
+        // own cwd — which the engine has already set to the workdir — so a relative workdir
+        // doubles into a nonexistent path and the CLI fails with "No such file or directory".
+        // `absolute` (unlike `canonicalize`) doesn't resolve symlinks, keeping paths stable.
+        let repo_root = std::path::absolute(&repo_root).unwrap_or(repo_root);
         Ok(Arc::new(local::LocalEngine::new(
             self.registry,
             self.store,

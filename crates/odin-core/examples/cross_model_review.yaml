@@ -1,0 +1,100 @@
+# Cross-model adversarial PR review (dogfoods Odin's own engine).
+#
+# Run by the `cross_model_review` example, which registers two model-pinned providers via
+# the `with_id`/`with_model` builders:
+#   claude-opus  = Claude Code  @ claude-opus-4-8
+#   codex-gpt55  = Codex        @ gpt-5.5  (pinned read-only — a reviewer must not edit)
+# Because those ids are custom, this workflow is driven through an embedded engine, not
+# `odin run` / `odin validate` (whose static validator only knows the three built-in names).
+name: cross-model-review
+durable: false
+workspace: { type: worktree }
+
+params:
+  diff: { type: string, required: true }
+
+steps:
+  # Two independent first-pass reviews — one per model, same brief.
+  - id: review_claude
+    provider: claude-opus
+    prompt: |
+      You are a meticulous, skeptical Rust reviewer. Review ONLY the unified diff below for
+      GENUINE defects: correctness, API design, edge cases, missing tests, and doc/code
+      mismatches. Do NOT modify any files. Output a numbered list of findings; for each give a
+      severity (critical/major/minor/nit), a one-line title, and a concrete reason tied to the
+      diff. If you find nothing real, say so plainly.
+
+      ```diff
+      {{ params.diff }}
+      ```
+
+  - id: review_codex
+    provider: codex-gpt55
+    prompt: |
+      You are a meticulous, skeptical Rust reviewer. Review ONLY the unified diff below for
+      GENUINE defects: correctness, API design, edge cases, missing tests, and doc/code
+      mismatches. Do NOT modify any files. Output a numbered list of findings; for each give a
+      severity (critical/major/minor/nit), a one-line title, and a concrete reason tied to the
+      diff. If you find nothing real, say so plainly.
+
+      ```diff
+      {{ params.diff }}
+      ```
+
+  # Each model adversarially scrutinizes the OTHER model's review.
+  - id: refute_codex_by_claude
+    provider: claude-opus
+    depends_on: [review_codex]
+    prompt: |
+      Another model (GPT-5.5) reviewed this PR. Adversarially scrutinize EACH of its findings:
+      which are real, which are wrong or overstated, and — importantly — what did it MISS?
+      Cite the diff. Do NOT modify files.
+
+      GPT-5.5's review:
+      {{ steps.review_codex.outputs.stdout }}
+
+      The diff under review:
+      ```diff
+      {{ params.diff }}
+      ```
+
+  - id: refute_claude_by_codex
+    provider: codex-gpt55
+    depends_on: [review_claude]
+    prompt: |
+      Another model (Claude Opus 4.8) reviewed this PR. Adversarially scrutinize EACH of its
+      findings: which are real, which are wrong or overstated, and what did it MISS? Cite the
+      diff. Do NOT modify files.
+
+      Claude's review:
+      {{ steps.review_claude.outputs.stdout }}
+
+      The diff under review:
+      ```diff
+      {{ params.diff }}
+      ```
+
+  # Final synthesis: merge the two reviews and their mutual rebuttals.
+  - id: synthesis
+    provider: claude-opus
+    depends_on: [review_claude, review_codex, refute_codex_by_claude, refute_claude_by_codex]
+    prompt: |
+      Produce the FINAL cross-model review by merging the two first-pass reviews and their
+      mutual rebuttals into three sections:
+        (A) CONFIRMED — defects both models (or an unrebutted finding) agree are real, ranked by
+            severity, each with a concrete fix.
+        (B) DISPUTED — claims one model made that the other refuted, and which side is right.
+        (C) GAPS — anything either rebuttal flagged that the first-pass reviews missed.
+      Be concise and concrete.
+
+      Claude (Opus 4.8) first-pass review:
+      {{ steps.review_claude.outputs.stdout }}
+
+      GPT-5.5 first-pass review:
+      {{ steps.review_codex.outputs.stdout }}
+
+      Claude's scrutiny of GPT-5.5's review:
+      {{ steps.refute_codex_by_claude.outputs.stdout }}
+
+      GPT-5.5's scrutiny of Claude's review:
+      {{ steps.refute_claude_by_codex.outputs.stdout }}
