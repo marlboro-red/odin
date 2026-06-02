@@ -53,8 +53,9 @@
 //! - `templating` — render prompts/conditionals and statically check template refs.
 //! - `runtime` — the five integration traits, the registry, and the provider/store/
 //!   workspace/action implementations.
-//! - `mock` — in-memory test doubles ([`mock::EchoProvider`], [`mock::MemStore`], …) for
-//!   downstream tests. Opt-in; *not* included in `full`.
+//! - `mock` — in-memory test doubles (`mock::EchoProvider`, `mock::MemStore`, …) for
+//!   downstream tests. Opt-in; *not* included in `full` — so these are plain code spans, not
+//!   intra-doc links (the `mock` module is absent from a default-feature doc build).
 //! - `full` (default) — `ir` + `templating` + `runtime` (not `mock`).
 //!
 //! The [`Engine`] façade requires **both** `runtime` and `templating` (it renders prompts),
