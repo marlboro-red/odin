@@ -102,6 +102,10 @@ pub enum DiagCode {
     DynamicTemplateRef,
     /// ODIN030 — a param's `default` value does not match its declared `type`.
     ParamDefaultType,
+    /// ODIN031 — an untrusted `trigger.*` value is interpolated into a shell command (a
+    /// `run:` step or a gate); a webhook-supplied payload reaches `sh -c` unescaped, an
+    /// injection risk. Map the fields you trust into typed `params` instead (warning).
+    TriggerIntoShell,
 }
 
 impl DiagCode {
@@ -139,6 +143,7 @@ impl DiagCode {
             DiagCode::ScratchOnAction => "ODIN028",
             DiagCode::DynamicTemplateRef => "ODIN029",
             DiagCode::ParamDefaultType => "ODIN030",
+            DiagCode::TriggerIntoShell => "ODIN031",
         }
     }
 
@@ -154,7 +159,8 @@ impl DiagCode {
             | DiagCode::NewerSchemaMinor
             | DiagCode::WebhookParamUndeclared
             | DiagCode::ScratchOnAction
-            | DiagCode::DynamicTemplateRef => Severity::Warning,
+            | DiagCode::DynamicTemplateRef
+            | DiagCode::TriggerIntoShell => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -336,13 +342,14 @@ mod tests {
             DiagCode::ScratchOnAction,
             DiagCode::DynamicTemplateRef,
             DiagCode::ParamDefaultType,
+            DiagCode::TriggerIntoShell,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 30);
+        assert_eq!(seen.len(), 31);
     }
 
     #[test]

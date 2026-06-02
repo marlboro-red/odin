@@ -59,6 +59,12 @@ impl Registry {
     }
 
     /// Registers a trigger under its [`Trigger::kind`].
+    ///
+    /// **Reserved for custom embedders.** Neither the engine nor the built-in `odind` daemon
+    /// consults registered triggers — the daemon derives cron/webhook triggers structurally
+    /// from each workflow's `triggers:` block (see [`Trigger`] and the daemon docs). This
+    /// pair (`register_trigger` + [`trigger`](Self::trigger)) exists so a *custom* dispatcher
+    /// can resolve triggers by kind; it is not part of the default run/serve paths.
     pub fn register_trigger(&mut self, t: Arc<dyn Trigger>) -> &mut Self {
         self.triggers.insert(t.kind().to_owned(), t);
         self
@@ -82,7 +88,9 @@ impl Registry {
         self.workspaces.get(name)
     }
 
-    /// Looks up a trigger by name.
+    /// Looks up a trigger by kind. Only ever returns triggers added via
+    /// [`register_trigger`](Self::register_trigger) — see that method: the built-in run/serve
+    /// paths don't populate or consult this, so it is empty unless a custom embedder fills it.
     #[must_use]
     pub fn trigger(&self, name: &str) -> Option<&Arc<dyn Trigger>> {
         self.triggers.get(name)

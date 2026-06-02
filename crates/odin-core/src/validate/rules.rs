@@ -501,6 +501,10 @@ const CRON_MONTHS: [&str; 12] = [
 /// Day-of-week names the runtime cron parser accepts.
 const CRON_DAYS: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
+/// Per-field cron rule: `(min, max, names, ?-allowed, wrap-range-allowed,
+/// named-single-with-step-allowed)`.
+type CronFieldSpec = (u8, u8, &'static [&'static str], bool, bool, bool);
+
 /// Best-effort structural **and range** check of a standard 5-field cron expression, kept in
 /// sync with what the daemon's runtime parser (`odin-daemon`'s `parse_5field`/`normalize_dow`)
 /// actually accepts: each field is range-checked, month/day *names* and the Quartz `?`
@@ -513,28 +517,32 @@ fn is_valid_cron(s: &str) -> bool {
     if fields.len() != 5 {
         return false;
     }
-    // (min, max, names, `?` allowed, wrap-range allowed) for minute, hour, day-of-month,
-    // month, day-of-week. Only day-of-week permits a "backwards" range (`6-0` = Sat,Sun): the
-    // daemon normalizes those by expansion, whereas the `cron` crate rejects a backwards range
-    // in every other field — so accepting one here would be a clean-validate-then-silently-
-    // skipped trap. Day-of-week is 0..=7 (POSIX: both 0 and 7 are Sunday).
-    let specs: [(u8, u8, &[&str], bool, bool); 5] = [
-        (0, 59, &[], false, false),
-        (0, 23, &[], false, false),
-        (1, 31, &[], true, false),
-        (1, 12, &CRON_MONTHS, false, false),
-        (0, 7, &CRON_DAYS, true, true),
+    // Specs for minute, hour, day-of-month, month, day-of-week. Only day-of-week permits a
+    // "backwards" range (`6-0` = Sat,Sun): the daemon normalizes those by expansion, whereas
+    // the `cron` crate rejects a backwards range in every other field — so accepting one here
+    // would be a clean-validate-then-silently-skipped trap. The last flag captures a second
+    // divergence: the `cron` crate rejects a single *named* value carrying a step (month
+    // `JAN/2`) while accepting a numeric one (`5/2`), whereas the daemon expands day-of-week
+    // itself and accepts `MON/2` — so only day-of-week sets it. Day-of-week is 0..=7 (POSIX: 0
+    // and 7 are both Sunday).
+    let specs: [CronFieldSpec; 5] = [
+        (0, 59, &[], false, false, false),
+        (0, 23, &[], false, false, false),
+        (1, 31, &[], true, false, false),
+        (1, 12, &CRON_MONTHS, false, false, false),
+        (0, 7, &CRON_DAYS, true, true, true),
     ];
     fields.iter().zip(specs).all(|(field, spec)| {
-        let (min, max, names, allow_q, allow_wrap) = spec;
-        cron_field_ok(field, min, max, names, allow_q, allow_wrap)
+        let (min, max, names, allow_q, allow_wrap, name_step_ok) = spec;
+        cron_field_ok(field, min, max, names, allow_q, allow_wrap, name_step_ok)
     })
 }
 
 /// Validates one cron field against its numeric range / allowed names, supporting `*`, comma
 /// lists, ranges (`a-b`), and `/step`. A range endpoint may be a digit or an allowed name; a
-/// backwards range (`hi < lo`) is rejected unless `allow_wrap` (day-of-week only), matching
-/// what the daemon's runtime parser accepts.
+/// backwards range (`hi < lo`) is rejected unless `allow_wrap` (day-of-week only), and a single
+/// *named* value carrying a `/step` (`JAN/2`) is rejected unless `name_step_ok` (day-of-week
+/// only) — both matching what the daemon's runtime parser accepts.
 fn cron_field_ok(
     field: &str,
     min: u8,
@@ -542,6 +550,7 @@ fn cron_field_ok(
     names: &[&str],
     allow_q: bool,
     allow_wrap: bool,
+    name_step_ok: bool,
 ) -> bool {
     if field.is_empty() {
         return false;
@@ -584,7 +593,10 @@ fn cron_field_ok(
                     (Some(l), Some(h)) => allow_wrap || l <= h,
                     _ => false,
                 },
-                None => value(b).is_some(),
+                // A single value. A *named* single value carrying a step (`JAN/2`) is rejected
+                // by the `cron` crate even though a numeric `5/2` is accepted — honor that.
+                None if value(b).is_none() => false,
+                None => name_step_ok || step.is_none() || b.parse::<u8>().is_ok(),
             },
         }
     })
@@ -662,6 +674,21 @@ mod tests {
         // ...but a backwards *day-of-week* range is a valid POSIX wrap the daemon normalizes.
         assert!(is_valid_cron("0 3 * * 6-0")); // Sat..Sun
         assert!(is_valid_cron("0 3 * * FRI-MON"));
+    }
+
+    #[test]
+    fn cron_named_single_with_step() {
+        // The `cron` crate rejects a single *named* month carrying a step, while accepting a
+        // numeric one and a named *range* with a step — the validator must match, or it would
+        // pass a schedule that aborts the daemon at startup.
+        assert!(!is_valid_cron("0 3 * JAN/2 *")); // named single + step → cron rejects
+        assert!(is_valid_cron("0 3 * 5/2 *")); // numeric single + step → cron accepts
+        assert!(is_valid_cron("0 3 * JAN-DEC/2 *")); // named range + step → cron accepts
+        assert!(is_valid_cron("0 3 * */2 *")); // wildcard + step → cron accepts
+        // Day-of-week is expanded by the daemon itself, which DOES accept a named single +
+        // step, so the validator must keep accepting it (the other divergence direction).
+        assert!(is_valid_cron("0 3 * * MON/2"));
+        assert!(is_valid_cron("0 3 * * 1/2"));
     }
 
     #[test]
