@@ -32,8 +32,9 @@ pub struct RunInput {
     /// Param values, by name. Validated & coerced against the workflow's param schema.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub params: IndexMap<String, Value>,
-    /// Optional caller-supplied idempotency key: re-submitting the same key returns the
-    /// existing run instead of starting a new one.
+    /// Reserved: an optional caller-supplied idempotency key. Declared for
+    /// forward-compatibility but **not yet acted on** by the engine — every run currently gets
+    /// a fresh id, regardless of this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }

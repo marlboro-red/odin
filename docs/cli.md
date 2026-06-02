@@ -16,9 +16,10 @@ Commands:
 ```
 
 Every command takes `--json` for machine-readable output on **stdout**. A command's normal
-report — including `validate`'s diagnostics, errors and all — also goes to stdout; only
-process-level failures (a parse/IO error, a bad UUID, a store error) print an `error: …`
-line to **stderr** before the process exits non-zero.
+report — including `validate`'s diagnostics, errors and all — also goes to stdout. Failures go
+to **stderr**: `validate`/`run` print `✗ <file>: parse error` on a malformed file, while an
+I/O error, a bad UUID, or a store error prints an `error: …` line. Either way the process
+exits non-zero.
 
 ---
 
@@ -170,8 +171,8 @@ Events are `run_started`, `step_started`, `gate_result`, `judge_result`, `step_f
 - **`list --json`** → `[{ "run_id", "workflow", "status", "updated_at" }, …]`.
 - **`logs --json`** → an array of `RunEvent` (each tagged by `kind`).
 
-Statuses serialize snake_case (`succeeded`, `failed`, `passed`, `skipped`, `running`,
-`cancelled`). `cost_micros` is integer micro-dollars (cost is display-only; the engine never
+Statuses serialize snake_case (`pending`, `running`, `succeeded`, `failed`, `cancelled` for a
+run; `pending`, `running`, `passed`, `failed`, `skipped` for a step). `cost_micros` is integer micro-dollars (cost is display-only; the engine never
 loses precision to floats).
 
 ---

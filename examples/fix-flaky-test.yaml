@@ -12,6 +12,10 @@
 # it is an error.)
 #
 #   odin validate examples/fix-flaky-test.yaml
+#
+# NOTE: `prompt_file` is resolved relative to the run's --repo root. This file's prompt lives
+# at examples/prompts/implement.j2, so to *run* this workflow point --repo at examples/:
+#   odin run examples/fix-flaky-test.yaml --repo examples --param issue_number=1
 
 schema_version: "1.0"
 name: fix-flaky-test
@@ -89,7 +93,7 @@ steps:
 
   # run kind: a code hook in any language
   - id: changelog
-    run: "scripts/gen-changelog.sh {{ params.issue_number }} > CHANGELOG.md"
+    run: "{ echo \"# Changelog (issue {{ params.issue_number }})\"; git log --oneline -20; } > CHANGELOG.md"
     depends_on: [implement]
     timeout: "60s"
 

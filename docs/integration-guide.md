@@ -128,11 +128,12 @@ serialize over any transport:
 | Field | Meaning |
 |-------|---------|
 | `run_id` / `workflow` / `status` | run identity and terminal `RunStatus` (`Succeeded`/`Failed`/`Cancelled`/…). |
-| `steps` | `Vec<StepResult>` in topological order — each with `status` (`Passed`/`Failed`/`Skipped`), `attempts`, `exit_code`, `outputs`, `gates`, `judge_score`, `usage`. |
+| `steps` | `Vec<StepResult>` in topological order — each with `status` (`Passed`/`Failed`/`Skipped`), `attempts`, `exit_code`, `outputs`, `gates`, `judge_score`, `usage`, and `error` (the failure reason, if any). |
 | `usage` | aggregate `Usage` (`input_tokens`, `output_tokens`, `cost_micros`). |
 | `side_effects` | structured outward effects for downstream automation. |
 | `diff` | the cumulative git diff captured as the implicit `DIFF` artifact. |
 | `error` | the terminal error, iff `status == Failed`. |
+| `started_at` / `finished_at` | when the run started, and when it finished (`None` while still running). |
 
 `SideEffect` is a tagged enum — `PullRequest { url, number }`, `Commit { sha, branch }`,
 `Push { branch, remote }`, `Comment { url }`, `Artifact { name, path }` — so a caller can,
@@ -310,6 +311,12 @@ Odin passes **no** credentials and, by default, **no** model — it invokes the 
 fixed argument vector and lets the CLI use whatever it is logged into and configured for.
 There are two ways to control which model runs.
 
+> The fixed argument vector also sets each provider's **default autonomy**: `codex` runs
+> `--sandbox workspace-write --skip-git-repo-check`, `copilot` runs `--allow-all` (tools,
+> paths, **and network**), and `claude` adds nothing. `with_extra_args` *replaces* those
+> flags, so use it to tighten (e.g. `codex … --sandbox read-only`) or loosen — see the
+> autonomy table in [architecture.md](architecture.md#security--trust-boundaries).
+
 **Globally, via the CLI's own config (no code).** Because the child process inherits your
 environment, the model the CLI is configured to use is the model that runs. Set it where the
 CLI looks — e.g. `export ANTHROPIC_MODEL=…` for Claude Code, codex's `~/.codex/config.toml`,
@@ -391,7 +398,7 @@ an interrupted step re-applies from a clean tree — see the
 
 `odin_core::Result<T>` is `Result<T, Error>`. `Error` is a `#[non_exhaustive]` enum organized
 by phase — `Parse`, `Io`, `Validation(ValidationReport)`, `SchemaVersion`, `Input`,
-`Unregistered`, `Template` — plus a transparent wrapper per trait
+`Unregistered`, `Template`, `Unimplemented` — plus a transparent wrapper per trait
 (`Provider`/`Workspace`/`Store`/`Action`/`Trigger`Error). Each trait error has an
 `Other(#[from] anyhow::Error)` variant, so a custom impl can wrap arbitrary errors:
 
