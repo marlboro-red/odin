@@ -75,7 +75,7 @@ pub use action::{GitCommit, GitPush, OpenPr, ShellExec};
 #[cfg(all(feature = "runtime", feature = "templating"))]
 pub use engine::{Engine, EngineBuilder};
 #[cfg(feature = "runtime")]
-pub use provider::ClaudeProvider;
+pub use provider::{ClaudeProvider, CodexProvider, CopilotProvider};
 #[cfg(feature = "runtime")]
 pub use registry::Registry;
 #[cfg(feature = "runtime")]
