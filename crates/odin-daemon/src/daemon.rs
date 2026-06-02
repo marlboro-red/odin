@@ -7,6 +7,7 @@ use anyhow::Result;
 use odin_core::ir::TriggerDecl;
 use odin_core::traits::TriggerEvent;
 use odin_core::{Engine, Trigger, Workflow, WorkflowId};
+use tokio_util::sync::CancellationToken;
 
 use crate::trigger::CronTrigger;
 
@@ -21,22 +22,40 @@ pub struct Daemon {
     engine: Arc<dyn Engine>,
     workflows: Arc<HashMap<WorkflowId, Workflow>>,
     triggers: Vec<Box<dyn Trigger>>,
+    shutdown: CancellationToken,
 }
 
 impl Daemon {
     /// A daemon serving `workflows` with no triggers yet — add them with
     /// [`with_trigger`](Daemon::with_trigger) or [`add_trigger`](Daemon::add_trigger).
-    /// A later workflow with a duplicate `name` replaces an earlier one.
+    ///
+    /// Workflows are keyed by `name`. A duplicate name is a configuration error: the later
+    /// definition wins and a warning is logged, so an operator can spot it rather than
+    /// silently serving fewer workflows than were loaded.
     pub fn new(engine: Arc<dyn Engine>, workflows: impl IntoIterator<Item = Workflow>) -> Self {
-        let workflows = workflows
-            .into_iter()
-            .map(|w| (w.name.clone(), w))
-            .collect::<HashMap<_, _>>();
+        let mut map: HashMap<WorkflowId, Workflow> = HashMap::new();
+        for workflow in workflows {
+            if let Some(prev) = map.insert(workflow.name.clone(), workflow) {
+                eprintln!(
+                    "odind: duplicate workflow name {:?}; the later definition replaces the earlier",
+                    prev.name.as_str()
+                );
+            }
+        }
         Self {
             engine,
-            workflows: Arc::new(workflows),
+            workflows: Arc::new(map),
             triggers: Vec::new(),
+            shutdown: CancellationToken::new(),
         }
+    }
+
+    /// A handle that, when [cancelled](CancellationToken::cancel), tells [`run`](Daemon::run)
+    /// to stop fetching new trigger events and drain in-flight runs. The `odind` binary
+    /// wires this to `ctrl-c`; embedders can drive it however they like.
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     /// Builds a daemon whose triggers are derived from each workflow's `triggers:` block:
@@ -97,8 +116,13 @@ impl Daemon {
     }
 
     /// Resumes incomplete runs, then services every trigger until each is exhausted (for
-    /// cron/webhook, that is "forever"). Cancel the returned future — e.g. on `ctrl-c` —
-    /// to shut down; durable in-flight runs resume from their last checkpoint on restart.
+    /// cron, that is "forever") or the [cancellation token](Daemon::cancellation_token)
+    /// fires. On cancellation each trigger stops fetching new events, but a run already in
+    /// flight is awaited to completion — a **graceful drain** — before `run` returns.
+    ///
+    /// Crash recovery applies to **durable** workflows (`durable: true`): their state is
+    /// checkpointed at each step, so a run lost to a hard kill resumes via `resume_all` on
+    /// the next start. A non-durable run interrupted mid-flight is abandoned with no resume.
     ///
     /// # Errors
     /// Currently infallible (resume and run failures are logged, not propagated), but
@@ -123,10 +147,20 @@ impl Daemon {
         for mut trigger in self.triggers {
             let engine = Arc::clone(&self.engine);
             let workflows = Arc::clone(&self.workflows);
+            let shutdown = self.shutdown.clone();
             set.spawn(async move {
                 let kind = trigger.kind().to_owned();
                 loop {
-                    match trigger.next_event().await {
+                    // Wait for the next event, but bail the instant shutdown is requested.
+                    // `next_event` is cancel-safe, so dropping its future here is fine; a
+                    // dispatch already running below is *not* interrupted — it is awaited to
+                    // completion before the next iteration observes the shutdown and breaks.
+                    let event = tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => break,
+                        event = trigger.next_event() => event,
+                    };
+                    match event {
                         Ok(Some(event)) => dispatch(engine.as_ref(), &workflows, event).await,
                         Ok(None) => break,
                         Err(e) => {

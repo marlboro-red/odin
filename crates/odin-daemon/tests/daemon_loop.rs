@@ -113,6 +113,51 @@ async fn events_for_unknown_workflows_are_ignored_but_known_ones_still_run() {
     assert_eq!(runs[0].workflow, WorkflowId::new("tick"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cron_run_of_a_required_param_workflow_fails_without_killing_the_daemon() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (engine, store) = engine_with_store(repo.path());
+
+    // A cron event carries no params, so a workflow with a *required* param must fail
+    // validation at dispatch — and the daemon must log it and keep running, recording no
+    // successful run (this is the failure mode the CronTrigger docstring promises).
+    let src = "name: needs-param\nworkspace: { type: worktree }\ndurable: true\nparams:\n  who: { required: true }\nsteps:\n  - { id: noop, run: \"true\" }\n";
+    let workflow = Workflow::from_yaml_str(src).unwrap();
+    let daemon = Daemon::new(engine, [workflow])
+        .with_trigger(ScriptTrigger::new([event_for("needs-param")]));
+    daemon.run().await.unwrap();
+
+    let runs = store.recent(10).await.unwrap();
+    assert!(
+        runs.iter().all(|r| r.status != RunStatus::Succeeded),
+        "a param-less cron run of a required-param workflow must not succeed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_triggers_run_concurrently_and_add_trigger_registers() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (engine, store) = engine_with_store(repo.path());
+
+    // Two independent triggers (one via the builder, one via add_trigger) drive two
+    // different workflows; both must run.
+    let mut daemon = Daemon::new(engine, [tick_workflow("alpha"), tick_workflow("beta")])
+        .with_trigger(ScriptTrigger::new([event_for("alpha")]));
+    daemon.add_trigger(Box::new(ScriptTrigger::new([event_for("beta")])));
+    assert_eq!(daemon.trigger_count(), 2);
+    daemon.run().await.unwrap();
+
+    let runs = store.recent(10).await.unwrap();
+    let names: std::collections::HashSet<String> = runs
+        .iter()
+        .map(|r| r.workflow.as_str().to_owned())
+        .collect();
+    assert_eq!(runs.len(), 2, "both triggered workflows should have run");
+    assert!(names.contains("alpha") && names.contains("beta"));
+}
+
 #[test]
 fn from_workflows_derives_one_trigger_per_cron_decl() {
     // Manual-only → 0 triggers; one cron → 1; two crons → 2. Webhooks are not served yet.

@@ -32,6 +32,7 @@ tokio = { version = "1.52.3", default-features = false, features = [
     "time",
     "signal",
 ] }
+tokio-util = { version = "0.7.18", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.27.0"

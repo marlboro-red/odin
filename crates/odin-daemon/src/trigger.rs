@@ -17,6 +17,11 @@ use odin_core::{RunInput, WorkflowId};
 /// `trigger = "cron"`. A cron run carries no params, so it suits param-less workflows
 /// (nightly maintenance, scheduled audits); a schedule pointed at a workflow with
 /// required params will surface a validation error at dispatch time.
+///
+/// # Time zone
+/// Schedules are evaluated in **UTC**, not the server's local time — deterministic and
+/// free of daylight-saving gaps/repeats, matching hosted cron (e.g. GitHub Actions). A
+/// `"0 3 * * *"` schedule therefore fires at 03:00 UTC.
 pub struct CronTrigger {
     schedule: Schedule,
     workflow: WorkflowId,

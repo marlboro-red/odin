@@ -60,7 +60,10 @@ fn real_main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| cli.repo.join(".odin").join("state.db"));
     if let Some(parent) = db.parent() {
-        std::fs::create_dir_all(parent).ok();
+        // Propagate (don't swallow): otherwise a failed mkdir surfaces later as a confusing
+        // "opening the run state database" error that blames the wrong thing.
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating state directory {}", parent.display()))?;
     }
     let store = SqliteStore::open(&db).context("opening the run state database")?;
     let engine = EngineBuilder::new()
@@ -69,34 +72,52 @@ fn real_main() -> anyhow::Result<()> {
         .build()?;
 
     let daemon = Daemon::from_workflows(engine, workflows)?;
+    let shutdown = daemon.cancellation_token();
 
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
-        tokio::select! {
-            res = daemon.run() => res,
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("odind: ctrl-c received, shutting down");
-                Ok(())
+        // On ctrl-c, ask the daemon to stop accepting new events and drain in-flight runs
+        // (rather than dropping `run()` mid-flight). `run()` then returns once drained.
+        let signal = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!("odind: ctrl-c received, draining in-flight runs…");
+                shutdown.cancel();
             }
-        }
+        });
+        let result = daemon.run().await;
+        signal.abort();
+        result
     })
 }
 
-/// Loads every `*.yaml` / `*.yml` workflow in `dir` (sorted for determinism). Files that
-/// fail to parse are skipped with a warning rather than aborting startup.
+/// Loads every `*.yaml` / `*.yml` workflow in `dir` (sorted for determinism). A single
+/// unreadable directory entry, unreadable file, or unparseable file is skipped with a
+/// warning rather than aborting startup — one bad file must not take the whole daemon down.
+/// Only failing to read the directory itself is fatal.
 fn load_workflows(dir: &Path) -> anyhow::Result<Vec<Workflow>> {
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("reading workflow dir {}", dir.display()))?;
     let mut paths = entries
-        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry.path()),
+            Err(e) => {
+                eprintln!("odind: skipping unreadable directory entry: {e}");
+                None
+            }
+        })
         .filter(|p| matches!(p.extension().and_then(|s| s.to_str()), Some("yaml" | "yml")))
         .collect::<Vec<_>>();
     paths.sort();
 
     let mut workflows = Vec::new();
     for path in paths {
-        let src = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let src = match std::fs::read_to_string(&path) {
+            Ok(src) => src,
+            Err(e) => {
+                eprintln!("odind: skipping {}: {e}", path.display());
+                continue;
+            }
+        };
         match Workflow::from_yaml_str(&src) {
             Ok(workflow) => {
                 eprintln!("odind:   • {} ({})", workflow.name.as_str(), path.display());

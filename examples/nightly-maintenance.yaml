@@ -16,7 +16,8 @@ workspace:
 
 triggers:
   - type: cron
-    schedule: "0 3 * * *" # every day at 03:00 (day-of-week is POSIX: 0/7=Sun, 1=Mon)
+    # Every day at 03:00 UTC. Day-of-week is POSIX (0/7=Sun, 1=Mon); times are UTC.
+    schedule: "0 3 * * *"
 
 defaults:
   timeout: "20m"
