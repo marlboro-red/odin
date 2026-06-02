@@ -284,6 +284,10 @@ fn subscripted_roots(source: &str) -> Vec<&'static str> {
     let mut rest = source;
     while let Some(start) = rest.find("{{") {
         let after = &rest[start + 2..];
+        // Best-effort body extraction: a `}}` *inside* a string literal (e.g. `{{ '}}' }}`)
+        // truncates `body` early, so a subscript after it can be missed. This only ever
+        // under-reports a best-effort warning (ODIN029); the real parse (`analyze`, which
+        // drives ODIN017/018/031) uses minijinja on the full source and is unaffected.
         let Some(end) = after.find("}}") else { break };
         let body = &after[..end];
         let bytes = body.as_bytes();
