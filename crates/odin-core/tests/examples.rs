@@ -6,6 +6,7 @@ use odin_core::{DiagCode, KnownNames, Workflow, validate_source};
 const ISSUE_TO_PR: &str = include_str!("../../../examples/issue-to-pr.yaml");
 const FIX_FLAKY: &str = include_str!("../../../examples/fix-flaky-test.yaml");
 const NIGHTLY: &str = include_str!("../../../examples/nightly-maintenance.yaml");
+const MULTI_AGENT: &str = include_str!("../../../examples/multi-agent-eval.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -15,6 +16,20 @@ fn issue_to_pr_is_completely_clean() {
         report.is_empty(),
         "expected zero diagnostics, got:\n{report}"
     );
+}
+
+#[test]
+fn multi_agent_eval_is_clean_and_parallel() {
+    let wf = Workflow::from_yaml_str(MULTI_AGENT).expect("parses");
+    let report = validate_source(MULTI_AGENT, &wf, &KnownNames::builtin());
+    assert!(
+        report.is_empty(),
+        "expected zero diagnostics, got:\n{report}"
+    );
+    // The point of this example: concurrent scratch candidates that converge at a judge.
+    assert_eq!(wf.max_parallel.map(std::num::NonZeroUsize::get), Some(3));
+    let scratch = wf.steps.iter().filter(|s| s.scratch).count();
+    assert_eq!(scratch, 3, "three concurrent scratch candidates");
 }
 
 #[test]
@@ -68,7 +83,7 @@ fn fix_flaky_exercises_every_step_kind_and_trigger() {
 
 #[test]
 fn examples_round_trip_through_serde() {
-    for src in [ISSUE_TO_PR, FIX_FLAKY, NIGHTLY] {
+    for src in [ISSUE_TO_PR, FIX_FLAKY, NIGHTLY, MULTI_AGENT] {
         let wf = Workflow::from_yaml_str(src).expect("parses");
         let reserialized = serde_yaml_ng::to_string(&wf).expect("serializes");
         let again = Workflow::from_yaml_str(&reserialized).expect("re-parses");

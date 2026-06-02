@@ -1,0 +1,65 @@
+# Fan the same task out to three agents *in parallel* — each in its own isolated scratch
+# worktree, so their edits never collide — then judge the candidate diffs and (optionally)
+# apply the winner. This is what `max_parallel` + `scratch:` unlock.
+#
+#   odin validate examples/multi-agent-eval.yaml
+#   odin run examples/multi-agent-eval.yaml --repo . --param task="add a CONTRIBUTING.md"
+
+schema_version: "1.0"
+name: multi-agent-eval
+version: "1.0.0"
+description: Implement a task with three agents in parallel, judge the diffs, apply the best.
+durable: true
+
+workspace:
+  type: worktree
+
+# Up to three steps run at once. The candidate steps below are `scratch`, so they execute
+# concurrently in isolated worktrees; non-scratch steps still run one at a time.
+max_parallel: 3
+
+params:
+  task:
+    type: string
+    required: true
+    description: What the agents should implement.
+
+steps:
+  # Three independent candidates (no depends_on between them) → they run concurrently. Each
+  # edits files in its OWN scratch worktree; the engine captures each one's diff as
+  # `steps.<id>.outputs.diff`. Their edits never touch the shared tree or each other.
+  - id: cand_claude
+    provider: claude
+    scratch: true
+    prompt: "Implement this task by editing the working tree:\n{{ params.task }}"
+
+  - id: cand_codex
+    provider: codex
+    scratch: true
+    prompt: "Implement this task by editing the working tree:\n{{ params.task }}"
+
+  - id: cand_copilot
+    provider: copilot
+    scratch: true
+    prompt: "Implement this task by editing the working tree:\n{{ params.task }}"
+
+  # Converge: a judge reads the three candidate diffs and picks the best. Runs only after
+  # all candidates finish (depends_on), in the shared workspace.
+  - id: judge
+    provider: claude
+    depends_on: [cand_claude, cand_codex, cand_copilot]
+    prompt: |
+      Three candidate diffs implement the same task. Reply with ONLY the label of the best
+      one: claude, codex, or copilot.
+
+      Task: {{ params.task }}
+
+      === claude ===
+      {{ steps.cand_claude.outputs.diff }}
+      === codex ===
+      {{ steps.cand_codex.outputs.diff }}
+      === copilot ===
+      {{ steps.cand_copilot.outputs.diff }}
+  # To complete the loop, add a step that applies the winning candidate's diff to the shared
+  # tree (e.g. `run: "printf '%s' '{{ steps.cand_codex.outputs.diff }}' | git apply"` gated
+  # on `when: "steps.judge.outputs.stdout == 'codex'"`), then commit + open a PR.

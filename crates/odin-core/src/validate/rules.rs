@@ -435,6 +435,7 @@ pub(crate) fn root_unknown_fields(src: &str, d: &mut Vec<Diagnostic>) {
         "params",
         "steps",
         "defaults",
+        "max_parallel",
     ];
     let Ok(val) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(src) else {
         return;

@@ -21,13 +21,15 @@
 //! (file edits, a created branch) partially applied before the crash may double-apply.
 //! Per-step commit snapshots are the planned fix.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
 
@@ -584,7 +586,9 @@ impl LocalEngine {
             .map(|o| o.stdout)
     }
 
-    /// Walks the DAG, executing or skipping each step and checkpointing as it goes.
+    /// Walks the DAG as a bounded concurrent ready-set, executing or skipping each step and
+    /// checkpointing as it goes. (A long single function: it *is* the scheduler.)
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         workflow: &Workflow,
@@ -597,8 +601,9 @@ impl LocalEngine {
             .unwrap_or_else(|_| workflow.steps.iter().map(|s| s.id.clone()).collect());
         let by_id: HashMap<&str, &Step> =
             workflow.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+        let max_parallel = workflow.max_parallel.map_or(1, NonZeroUsize::get);
+        let run_id = state.run_id;
 
-        let mut summary = Vec::new();
         let mut side_effects = Vec::new();
         let mut usage = Usage::default();
         // Seed from the persisted DIFF so a resumed run carries it forward (already-passed
@@ -609,60 +614,90 @@ impl LocalEngine {
             .get(&crate::ids::ArtifactName::new(DIFF))
             .cloned();
 
-        for id in &order {
-            let Some(step) = by_id.get(id.as_str()).copied() else {
-                continue;
-            };
-
-            // Already done (resume): keep its state, surface it in the summary.
-            if let Some(existing) = state.steps.get(id) {
-                if matches!(existing.status, StepStatus::Passed | StepStatus::Skipped) {
-                    summary.push(step_result(id, existing));
-                    continue;
-                }
+        // Results, keyed by id; emitted in topological order at the end (completion order
+        // is nondeterministic under concurrency).
+        let mut results: IndexMap<StepId, StepResult> = IndexMap::new();
+        // `settled` = steps in a terminal status (Passed/Failed/Skipped); a step is *ready*
+        // once all its deps are settled. Seeded from a resume with already-finished steps.
+        let mut settled: HashSet<StepId> = HashSet::new();
+        for (id, st) in &state.steps {
+            if matches!(st.status, StepStatus::Passed | StepStatus::Skipped) {
+                settled.insert(id.clone());
+                results.insert(id.clone(), step_result(id, st));
             }
+        }
+        let mut started: HashSet<StepId> = settled.clone();
+        let mut in_flight = FuturesUnordered::new();
+        // A non-`scratch` step mutates the shared workdir, so it runs *exclusively* — never
+        // alongside another step. `scratch` steps run in isolated worktrees, so any number
+        // may run concurrently (bounded by `max_parallel`).
+        let mut exclusive_running = false;
 
-            let timeout = step
-                .timeout
-                .or(workflow.defaults.timeout)
-                .map(crate::ir::HumanDuration::as_duration);
+        loop {
+            // Fill the ready-set up to the concurrency limit, honoring the exclusivity rule.
+            while in_flight.len() < max_parallel && !exclusive_running {
+                let Some(step) = order
+                    .iter()
+                    .filter_map(|id| by_id.get(id.as_str()).copied())
+                    .find(|s| {
+                        !started.contains(&s.id) && s.depends_on.iter().all(|d| settled.contains(d))
+                    })
+                else {
+                    break;
+                };
+                let exclusive = !step.scratch;
+                if exclusive && !in_flight.is_empty() {
+                    break; // an exclusive step must wait until the workdir is idle
+                }
 
-            let deps_passed = step.depends_on.iter().all(|d| {
-                matches!(
-                    state.steps.get(d).map(|s| s.status),
-                    Some(StepStatus::Passed)
-                )
-            });
-            let ctx = build_ctx(
-                params,
-                &state.input.trigger_payload,
-                &state.steps,
-                diff.as_deref(),
-                state,
-                workflow,
-            );
+                let deps_passed = step.depends_on.iter().all(|d| {
+                    matches!(
+                        state.steps.get(d).map(|s| s.status),
+                        Some(StepStatus::Passed)
+                    )
+                });
+                let timeout = step
+                    .timeout
+                    .or(workflow.defaults.timeout)
+                    .map(crate::ir::HumanDuration::as_duration);
+                let ctx = build_ctx(
+                    params,
+                    &state.input.trigger_payload,
+                    &state.steps,
+                    diff.as_deref(),
+                    state,
+                    workflow,
+                );
 
-            // Durability boundary before acting (see `mark_running`).
-            self.mark_running(workflow, state, id).await?;
-
-            let outcome = self
-                .decide_outcome(
-                    state.run_id,
+                // Durability boundary before acting (see `mark_running`).
+                self.mark_running(workflow, state, &step.id).await?;
+                started.insert(step.id.clone());
+                if exclusive {
+                    exclusive_running = true;
+                }
+                in_flight.push(self.run_one(
+                    run_id,
                     step,
-                    &ctx,
+                    ctx,
                     workdir,
                     timeout,
                     deps_passed,
                     cancel,
-                )
-                .await;
+                ));
+                if exclusive {
+                    break; // nothing else starts beside it
+                }
+            }
+
+            let Some((id, outcome)) = in_flight.next().await else {
+                break; // nothing running and nothing ready — done
+            };
+            exclusive_running = false; // an exclusive step ran alone, so this clears it
 
             if let Some(u) = &outcome.usage {
                 usage.add(*u);
             }
             side_effects.extend(outcome.side_effects.iter().cloned());
-
-            // Persist step state, then refresh DIFF for subsequent steps.
             let step_state = StepState {
                 status: outcome.status,
                 attempts: outcome.attempts,
@@ -673,7 +708,16 @@ impl LocalEngine {
                 judge_score: outcome.judge_score,
             };
             state.steps.insert(id.clone(), step_state.clone());
-            if matches!(outcome.status, StepStatus::Passed) {
+            if matches!(
+                outcome.status,
+                StepStatus::Passed | StepStatus::Failed | StepStatus::Skipped
+            ) {
+                settled.insert(id.clone());
+            }
+            // Only a shared-workdir (non-scratch) step refreshes the run's DIFF; a scratch
+            // step's diff is its own `outputs.diff`, captured in `run_one`.
+            let is_scratch = by_id.get(id.as_str()).is_some_and(|s| s.scratch);
+            if matches!(outcome.status, StepStatus::Passed) && !is_scratch {
                 diff = self.capture_diff(workdir, cancel).await;
                 if let Some(d) = &diff {
                     state.artifacts.insert(DIFF.into(), d.clone());
@@ -681,17 +725,111 @@ impl LocalEngine {
             }
             state.updated_at = Utc::now();
             self.checkpoint(workflow.durable, state).await?;
-            self.emit_step_events(state.run_id, id, &outcome).await;
-
-            summary.push(step_result(id, &step_state));
+            self.emit_step_events(run_id, &id, &outcome).await;
+            results.insert(id.clone(), step_result(&id, &step_state));
         }
 
+        // Emit results in topological order regardless of completion order.
+        let summary = order
+            .iter()
+            .filter_map(|id| results.shift_remove(id))
+            .collect();
         Ok(ExecResult {
             steps: summary,
             side_effects,
             usage,
             diff,
         })
+    }
+
+    /// Runs one step, provisioning an isolated scratch worktree first if `step.scratch`. A
+    /// scratch step's file edits stay in its throwaway worktree; its diff is surfaced as
+    /// `outputs.diff` and the worktree is removed. Returns `(id, outcome)` for the driver.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_one(
+        &self,
+        run_id: RunId,
+        step: &Step,
+        ctx: minijinja::Value,
+        base_workdir: &Path,
+        timeout: Option<Duration>,
+        deps_passed: bool,
+        cancel: &CancelToken,
+    ) -> (StepId, StepOutcome) {
+        let id = step.id.clone();
+        if !step.scratch {
+            let outcome = self
+                .decide_outcome(
+                    run_id,
+                    step,
+                    &ctx,
+                    base_workdir,
+                    timeout,
+                    deps_passed,
+                    cancel,
+                )
+                .await;
+            return (id, outcome);
+        }
+        match self.acquire_scratch(base_workdir, &id, cancel).await {
+            Ok(scratch) => {
+                let mut outcome = self
+                    .decide_outcome(run_id, step, &ctx, &scratch, timeout, deps_passed, cancel)
+                    .await;
+                if matches!(outcome.status, StepStatus::Passed) {
+                    if let Some(d) = self.capture_diff(&scratch, cancel).await {
+                        outcome.outputs.insert("diff".to_owned(), Value::String(d));
+                    }
+                }
+                self.release_scratch(base_workdir, &scratch, cancel).await;
+                (id, outcome)
+            }
+            Err(e) => (id, StepOutcome::failed(format!("scratch workspace: {e}"))),
+        }
+    }
+
+    /// Adds a detached git worktree at the run's base commit (`HEAD` of `base_workdir`) as a
+    /// throwaway scratch dir, outside the run workdir so it never pollutes the shared DIFF.
+    async fn acquire_scratch(
+        &self,
+        base_workdir: &Path,
+        step_id: &StepId,
+        cancel: &CancelToken,
+    ) -> std::result::Result<PathBuf, String> {
+        let scratch = std::env::temp_dir().join(format!(
+            "odin-scratch-{}-{}",
+            uuid::Uuid::new_v4(),
+            step_id.as_str()
+        ));
+        let scratch_str = scratch
+            .to_str()
+            .ok_or_else(|| "scratch path is not valid UTF-8".to_owned())?;
+        let opts = ProcessOptions {
+            workdir: Some(base_workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let args = ["worktree", "add", "--detach", scratch_str, "HEAD"].map(str::to_owned);
+        let out = run_process("git", &args, &opts, cancel)
+            .await
+            .map_err(|e| e.to_string())?;
+        if out.exit_code == 0 {
+            Ok(scratch)
+        } else {
+            Err(format!("git worktree add failed: {}", out.stderr.trim()))
+        }
+    }
+
+    /// Removes a scratch worktree (best effort — failure only leaks a temp dir).
+    async fn release_scratch(&self, base_workdir: &Path, scratch: &Path, cancel: &CancelToken) {
+        let Some(scratch_str) = scratch.to_str() else {
+            return;
+        };
+        let opts = ProcessOptions {
+            workdir: Some(base_workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let args = ["worktree", "remove", "--force", scratch_str].map(str::to_owned);
+        let _ = run_process("git", &args, &opts, cancel).await;
     }
 
     fn summarize(
@@ -1628,5 +1766,120 @@ steps:
         let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
         assert_eq!(summary.status, RunStatus::Failed);
         assert_eq!(summary.steps[0].attempts, 2, "1 + max attempts");
+    }
+
+    /// Three `scratch` steps each write the same filename in their OWN isolated worktree;
+    /// each one's `outputs.diff` must contain only its own content (proving isolation), and
+    /// the run's shared DIFF stays empty (scratch edits never touch the shared tree).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scratch_steps_are_isolated_and_emit_their_own_diff() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: fanout\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 3\nsteps:\n  - { id: a, run: \"echo aaa > cand.txt\", scratch: true }\n  - { id: b, run: \"echo bbb > cand.txt\", scratch: true }\n  - { id: c, run: \"echo ccc > cand.txt\", scratch: true }\n  - { id: collect, run: \"true\", depends_on: [a, b, c] }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        assert_eq!(summary.steps.len(), 4);
+
+        for (id, want, others) in [
+            ("a", "aaa", ["bbb", "ccc"]),
+            ("b", "bbb", ["aaa", "ccc"]),
+            ("c", "ccc", ["aaa", "bbb"]),
+        ] {
+            let step = summary.steps.iter().find(|s| s.id.as_str() == id).unwrap();
+            let diff = step.outputs["diff"].as_str().unwrap_or_default();
+            assert!(
+                diff.contains(want),
+                "{id}'s diff should contain {want}: {diff}"
+            );
+            for other in others {
+                assert!(
+                    !diff.contains(other),
+                    "{id} saw {other} — scratch steps are not isolated"
+                );
+            }
+        }
+
+        // The shared tree was never touched by the scratch steps (`collect` is a no-op).
+        assert!(
+            summary
+                .diff
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty(),
+            "shared DIFF should be empty, got: {:?}",
+            summary.diff
+        );
+    }
+
+    /// A downstream step can consume a scratch step's diff via `steps.<id>.outputs.diff`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scratch_diff_flows_to_a_downstream_step() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: chain\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 2\nsteps:\n  - { id: cand, run: \"echo zzz > out.txt\", scratch: true }\n  - id: use\n    provider: echo\n    prompt: \"candidate:\\n{{ steps.cand.outputs.diff }}\"\n    depends_on: [cand]\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        let used = summary
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == "use")
+            .unwrap();
+        // The echo provider echoes its rendered prompt, which embedded the candidate diff.
+        assert!(
+            used.outputs["stdout"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("zzz"),
+            "downstream step should see the scratch diff: {:?}",
+            used.outputs["stdout"]
+        );
+    }
+
+    /// Independent `scratch` steps run concurrently: three ~0.4s sleeps under `max_parallel:
+    /// 3` finish in well under the ~1.2s a sequential walk would take.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn independent_scratch_steps_run_concurrently() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: par\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 3\nsteps:\n  - { id: a, run: \"sleep 0.4\", scratch: true }\n  - { id: b, run: \"sleep 0.4\", scratch: true }\n  - { id: c, run: \"sleep 0.4\", scratch: true }\n",
+        );
+        let start = std::time::Instant::now();
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(1000),
+            "three 0.4s scratch steps took {elapsed:?}; expected concurrency (<1s, not ~1.2s)"
+        );
     }
 }
