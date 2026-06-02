@@ -7,13 +7,20 @@ use anyhow::Result;
 use odin_core::ir::TriggerDecl;
 use odin_core::traits::TriggerEvent;
 use odin_core::{Engine, Trigger, Workflow, WorkflowId};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::trigger::CronTrigger;
 
+/// Default ceiling on runs executing at once across the whole daemon (a webhook burst or a
+/// fast-firing cron won't spawn unbounded concurrent runs).
+const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
+
 /// Owns an [`Engine`] and the workflows it can run, and drives a set of long-lived
 /// [`Trigger`]s. On [`run`](Daemon::run) it first resumes any incomplete runs (crash
-/// recovery), then services every trigger concurrently, dispatching one run per event.
+/// recovery), then services every trigger concurrently, dispatching a run per event —
+/// up to [`with_max_concurrent_runs`](Daemon::with_max_concurrent_runs) runs at once, so a
+/// burst of events (e.g. webhooks) executes in parallel rather than one-at-a-time.
 ///
 /// A failing run never takes the daemon down: the error is logged and the trigger keeps
 /// firing. A trigger that errors or is exhausted (`Ok(None)`) simply stops; the others
@@ -30,6 +37,7 @@ pub struct Daemon {
     workflows: Arc<HashMap<WorkflowId, Workflow>>,
     triggers: Vec<Box<dyn Trigger>>,
     shutdown: CancellationToken,
+    max_concurrent_runs: usize,
 }
 
 impl Daemon {
@@ -54,7 +62,17 @@ impl Daemon {
             workflows: Arc::new(map),
             triggers: Vec::new(),
             shutdown: CancellationToken::new(),
+            max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
         }
+    }
+
+    /// Sets the ceiling on runs executing concurrently across the daemon (default 4). A burst
+    /// of events queues for a free slot rather than launching unbounded runs. Clamped to at
+    /// least 1.
+    #[must_use]
+    pub fn with_max_concurrent_runs(mut self, limit: usize) -> Self {
+        self.max_concurrent_runs = limit.max(1);
+        self
     }
 
     /// A handle that, when [cancelled](CancellationToken::cancel), tells [`run`](Daemon::run)
@@ -139,27 +157,48 @@ impl Daemon {
             eprintln!("odind: no triggers registered; nothing to serve");
             return Ok(());
         }
-        eprintln!("odind: serving {} trigger(s)", self.triggers.len());
+        eprintln!(
+            "odind: serving {} trigger(s), up to {} run(s) at once",
+            self.triggers.len(),
+            self.max_concurrent_runs
+        );
 
+        // Bounds concurrent runs across ALL triggers; a burst queues for a free slot.
+        let permits = Arc::new(Semaphore::new(self.max_concurrent_runs));
         let mut set = tokio::task::JoinSet::new();
         for mut trigger in self.triggers {
             let engine = Arc::clone(&self.engine);
             let workflows = Arc::clone(&self.workflows);
             let shutdown = self.shutdown.clone();
+            let permits = Arc::clone(&permits);
             set.spawn(async move {
                 let kind = trigger.kind().to_owned();
+                // In-flight dispatches for this trigger, so a burst runs concurrently and
+                // shutdown can drain them.
+                let mut dispatches = tokio::task::JoinSet::new();
                 loop {
                     // Wait for the next event, but bail the instant shutdown is requested.
-                    // `next_event` is cancel-safe, so dropping its future here is fine; a
-                    // dispatch already running below is *not* interrupted — it is awaited to
-                    // completion before the next iteration observes the shutdown and breaks.
+                    // `next_event` is cancel-safe, so dropping its future here is fine.
                     let event = tokio::select! {
                         biased;
                         () = shutdown.cancelled() => break,
                         event = trigger.next_event() => event,
                     };
+                    // Reap finished dispatches so the set doesn't grow without bound.
+                    while dispatches.try_join_next().is_some() {}
                     match event {
-                        Ok(Some(event)) => dispatch(engine.as_ref(), &workflows, event).await,
+                        Ok(Some(event)) => {
+                            let engine = Arc::clone(&engine);
+                            let workflows = Arc::clone(&workflows);
+                            let permits = Arc::clone(&permits);
+                            dispatches.spawn(async move {
+                                // Acquire a slot first; the permit is held for the whole run.
+                                let Ok(_permit) = permits.acquire_owned().await else {
+                                    return;
+                                };
+                                dispatch(engine.as_ref(), &workflows, event).await;
+                            });
+                        }
                         Ok(None) => break,
                         Err(e) => {
                             eprintln!("odind: {kind} trigger stopped: {e}");
@@ -167,6 +206,8 @@ impl Daemon {
                         }
                     }
                 }
+                // Drain in-flight dispatches before this trigger task ends (graceful).
+                while dispatches.join_next().await.is_some() {}
             });
         }
         while let Some(joined) = set.join_next().await {
