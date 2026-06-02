@@ -199,6 +199,8 @@ mod tests {
             provider_versions: IndexMap::new(),
             input: RunInput::manual(),
             workspace: None,
+            base_commit: None,
+            snapshot: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

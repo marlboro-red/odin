@@ -22,10 +22,14 @@
 //! Each step is checkpointed `Running` before dispatch and to its terminal status after,
 //! so a step interrupted mid-flight by a crash is distinguishable from one not yet
 //! started. On resume, only `Passed`/`Skipped` steps are skipped; a `Running` (or absent)
-//! step is **re-executed from scratch**. Because all steps share one workdir, that
-//! re-execution is **not guaranteed idempotent** in v1 — a step whose side effects
-//! (file edits, a created branch) partially applied before the crash may double-apply.
-//! Per-step commit snapshots are the planned fix.
+//! step is **re-executed from scratch**. For a **durable** run the executor takes an
+//! off-branch git snapshot of the workspace after each shared-workdir step and, on resume,
+//! restores the workdir to the last snapshot before re-running — so a step interrupted
+//! mid-edit re-applies from a clean tree rather than double-applying its file changes. The
+//! snapshots are dangling commits anchored by a per-run ref (`refs/odin/run/<id>`) that is
+//! dropped when the run finishes, so they never reach the workflow's branch or its PR. (A
+//! side effect outside the workspace — a pushed branch, an opened PR — is still external and
+//! not covered by the snapshot.)
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -579,17 +583,150 @@ impl LocalEngine {
     /// Coding agents most often *create* files, which a plain `git diff` (tracked
     /// changes only) would miss — so we first mark everything intent-to-add
     /// (`git add -N .`), then diff. Best-effort: a non-git workdir yields `None`.
-    async fn capture_diff(&self, workdir: &Path, cancel: &CancelToken) -> Option<String> {
+    async fn capture_diff(
+        &self,
+        workdir: &Path,
+        base: Option<&str>,
+        cancel: &CancelToken,
+    ) -> Option<String> {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             ..ProcessOptions::default()
         };
         let intent_to_add = ["add", "-N", "."].map(str::to_owned);
         let _ = run_process("git", &intent_to_add, &opts, cancel).await;
-        run_process("git", &["diff".to_owned()], &opts, cancel)
+        // Diff against the run's base commit when known (snapshots may have advanced the
+        // index without moving it), else the working tree's HEAD.
+        let args = match base {
+            Some(base) => vec!["diff".to_owned(), base.to_owned()],
+            None => vec!["diff".to_owned()],
+        };
+        run_process("git", &args, &opts, cancel)
             .await
             .ok()
             .map(|o| o.stdout)
+    }
+
+    /// The workspace's current `HEAD` commit, or `None` if it cannot be read (non-git dir).
+    async fn git_head(&self, workdir: &Path, cancel: &CancelToken) -> Option<String> {
+        let opts = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let out = run_process(
+            "git",
+            &["rev-parse".to_owned(), "HEAD".to_owned()],
+            &opts,
+            cancel,
+        )
+        .await
+        .ok()?;
+        let head = out.stdout.trim();
+        (out.exit_code == 0 && !head.is_empty()).then(|| head.to_owned())
+    }
+
+    /// Snapshots the current workspace tree as an off-branch commit parented on `base`,
+    /// kept alive by the per-run ref `refs/odin/run/<run_id>` so [`restore_workdir`] can
+    /// reach it on resume. Returns the commit SHA, or `None` on any git failure (snapshots
+    /// are best-effort — resume idempotency degrades gracefully without one). Does not touch
+    /// the branch, HEAD, or the working index (it stages into a throwaway index file).
+    async fn snapshot_workdir(
+        &self,
+        workdir: &Path,
+        base: &str,
+        run_id: RunId,
+        cancel: &CancelToken,
+    ) -> Option<String> {
+        let index_path =
+            std::env::temp_dir().join(format!("odin-index-{run_id}-{}", uuid::Uuid::new_v4()));
+        let index_str = index_path.to_str()?.to_owned();
+        let staged = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            env: vec![("GIT_INDEX_FILE".to_owned(), index_str)],
+            ..ProcessOptions::default()
+        };
+        let run_git = |args: Vec<String>| {
+            let opts = staged.clone();
+            async move { run_process("git", &args, &opts, cancel).await.ok() }
+        };
+        // Seed a throwaway index from HEAD, stage every change (tracked + untracked), write
+        // the tree, and commit it parented on the run's base — no branch is moved.
+        let read = run_git(vec!["read-tree".to_owned(), "HEAD".to_owned()]).await?;
+        if read.exit_code != 0 {
+            let _ = std::fs::remove_file(&index_path);
+            return None;
+        }
+        let _ = run_git(vec!["add".to_owned(), "-A".to_owned()]).await;
+        let tree_out = run_git(vec!["write-tree".to_owned()]).await?;
+        let tree = tree_out.stdout.trim().to_owned();
+        let commit = if tree_out.exit_code == 0 && !tree.is_empty() {
+            run_git(vec![
+                "commit-tree".to_owned(),
+                tree,
+                "-p".to_owned(),
+                base.to_owned(),
+                "-m".to_owned(),
+                "odin snapshot".to_owned(),
+            ])
+            .await
+        } else {
+            None
+        };
+        let _ = std::fs::remove_file(&index_path);
+        let commit = commit?;
+        let sha = commit.stdout.trim().to_owned();
+        if commit.exit_code != 0 || sha.is_empty() {
+            return None;
+        }
+        // Anchor the dangling commit so it survives until the run completes.
+        let opts = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let _ = run_process(
+            "git",
+            &[
+                "update-ref".to_owned(),
+                format!("refs/odin/run/{run_id}"),
+                sha.clone(),
+            ],
+            &opts,
+            cancel,
+        )
+        .await;
+        Some(sha)
+    }
+
+    /// Resets the workspace (index + worktree) to `target`, dropping any leftover untracked
+    /// files — so a step interrupted mid-edit re-runs from a clean, known state.
+    async fn restore_workdir(&self, workdir: &Path, target: &str, cancel: &CancelToken) {
+        let opts = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let read = ["read-tree", "-u", "--reset", target].map(str::to_owned);
+        let _ = run_process("git", &read, &opts, cancel).await;
+        let _ = run_process(
+            "git",
+            &["clean".to_owned(), "-fd".to_owned()],
+            &opts,
+            cancel,
+        )
+        .await;
+    }
+
+    /// Drops the per-run snapshot ref so its dangling commits become collectable. Best effort.
+    async fn delete_snapshot_ref(&self, workdir: &Path, run_id: RunId, cancel: &CancelToken) {
+        let opts = ProcessOptions {
+            workdir: Some(workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let args = [
+            "update-ref".to_owned(),
+            "-d".to_owned(),
+            format!("refs/odin/run/{run_id}"),
+        ];
+        let _ = run_process("git", &args, &opts, cancel).await;
     }
 
     /// Walks the DAG as a bounded concurrent ready-set, executing or skipping each step and
@@ -613,6 +750,20 @@ impl LocalEngine {
         // Reclaim any scratch worktrees orphaned by a previous (crashed) attempt of this run.
         if workflow.steps.iter().any(|s| s.scratch) {
             self.cleanup_scratch(run_id, workdir, cancel).await;
+        }
+
+        // Per-step snapshots (durable runs only): record the base commit once, and on resume
+        // restore the workdir to the last snapshot so a step interrupted mid-edit re-runs
+        // from a clean state instead of double-applying.
+        let resuming = !state.steps.is_empty();
+        if workflow.durable && state.base_commit.is_none() {
+            state.base_commit = self.git_head(workdir, cancel).await;
+        }
+        let base_commit = state.base_commit.clone();
+        if workflow.durable && resuming {
+            if let Some(target) = state.snapshot.clone().or_else(|| base_commit.clone()) {
+                self.restore_workdir(workdir, &target, cancel).await;
+            }
         }
 
         let mut side_effects = Vec::new();
@@ -725,13 +876,21 @@ impl LocalEngine {
             ) {
                 settled.insert(id.clone());
             }
-            // Only a shared-workdir (non-scratch) step refreshes the run's DIFF; a scratch
-            // step's diff is its own `outputs.diff`, captured in `run_one`.
+            // Only a shared-workdir (non-scratch) step refreshes the run's DIFF and takes a
+            // resume snapshot; a scratch step's diff is its own `outputs.diff` (run_one) and
+            // it never touches the shared tree.
             let is_scratch = by_id.get(id.as_str()).is_some_and(|s| s.scratch);
             if matches!(outcome.status, StepStatus::Passed) && !is_scratch {
-                diff = self.capture_diff(workdir, cancel).await;
+                diff = self
+                    .capture_diff(workdir, base_commit.as_deref(), cancel)
+                    .await;
                 if let Some(d) = &diff {
                     state.artifacts.insert(DIFF.into(), d.clone());
+                }
+                if let Some(base) = &base_commit {
+                    if let Some(snap) = self.snapshot_workdir(workdir, base, run_id, cancel).await {
+                        state.snapshot = Some(snap);
+                    }
                 }
             }
             state.updated_at = Utc::now();
@@ -796,7 +955,9 @@ impl LocalEngine {
                 // *or* Failed (a failed candidate's partial work is still worth inspecting by
                 // a downstream judge). A `Skipped` step (e.g. `when: false`) ran nothing.
                 if !matches!(outcome.status, StepStatus::Skipped) {
-                    if let Some(d) = self.capture_diff(&scratch, cancel).await {
+                    // The scratch worktree is detached at the run's base, so a plain diff
+                    // (vs its HEAD) is exactly the candidate's changes.
+                    if let Some(d) = self.capture_diff(&scratch, None, cancel).await {
                         outcome.outputs.insert("diff".to_owned(), Value::String(d));
                     }
                 }
@@ -980,6 +1141,8 @@ impl Engine for LocalEngine {
             provider_versions: IndexMap::new(),
             input,
             workspace: Some(handle.clone()),
+            base_commit: None,
+            snapshot: None,
             created_at: started_at,
             updated_at: started_at,
         };
@@ -994,6 +1157,10 @@ impl Engine for LocalEngine {
         let exec = self
             .execute(workflow, &mut state, &workdir, &params, &cancel)
             .await;
+        // The run is terminal now — drop the snapshot ref so its commits can be collected.
+        if state.snapshot.is_some() {
+            self.delete_snapshot_ref(&workdir, run_id, &cancel).await;
+        }
         let _ = workspace.release(handle).await;
 
         let (exec, error) = match exec {
@@ -1058,6 +1225,10 @@ impl Engine for LocalEngine {
                         let exec = self
                             .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
                             .await;
+                        if state.snapshot.is_some() {
+                            self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
+                                .await;
+                        }
                         let _ = self
                             .make_workspace(&workflow.workspace)
                             .release(handle)
@@ -1455,6 +1626,8 @@ steps:
             provider_versions: IndexMap::new(),
             input: RunInput::manual().param("who", "resumed"),
             workspace: Some(handle),
+            base_commit: None,
+            snapshot: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1477,6 +1650,87 @@ steps:
             "remaining steps executed on resume"
         );
         assert_eq!(by("review"), StepStatus::Passed);
+    }
+
+    #[tokio::test]
+    async fn resume_restores_workdir_so_an_appending_step_is_not_double_applied() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        // One durable, idempotency-sensitive step: appending twice would be wrong.
+        let wf = parse(
+            "name: idem\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - { id: append, run: \"echo line >> f.txt\" }\n",
+        );
+
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: wf.workspace.clone(),
+            })
+            .await
+            .unwrap();
+        let wpath = handle.path.clone();
+        // Simulate a crash MID-step: a partial append is already on disk and `append` is
+        // still `Running`. base_commit is the clean HEAD the restore should rewind to.
+        std::fs::write(wpath.join("f.txt"), "line\n").unwrap();
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&wpath)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        let mut steps = IndexMap::new();
+        steps.insert(
+            StepId::new("append"),
+            StepState {
+                status: StepStatus::Running,
+                attempts: 1,
+                exit_code: None,
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+            },
+        );
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: Some(handle),
+            base_commit: Some(base),
+            snapshot: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        // The DIFF must show `line` added exactly once: the pre-crash partial edit was
+        // discarded by the resume restore, then `append` re-applied a single time. Without
+        // the restore the file would hold two `line`s.
+        let diff = s.diff.as_deref().unwrap_or_default();
+        assert_eq!(
+            diff.matches("+line").count(),
+            1,
+            "expected one added line (no double-apply), diff:\n{diff}"
+        );
     }
 
     #[tokio::test]
@@ -1529,6 +1783,8 @@ steps:
             provider_versions: IndexMap::new(),
             input: RunInput::manual().param("who", "resumed"),
             workspace: Some(handle),
+            base_commit: None,
+            snapshot: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1601,6 +1857,8 @@ steps:
                 branch: None,
                 token: "x".to_owned(),
             }),
+            base_commit: None,
+            snapshot: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

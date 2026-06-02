@@ -90,6 +90,13 @@ pub struct RunState {
     pub input: RunInput,
     /// Workspace lease in use, to reattach on resume.
     pub workspace: Option<WorkspaceHandle>,
+    /// The commit the run's workspace started at; `DIFF` and snapshots are taken against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// Latest per-step workspace snapshot commit (off-branch). On resume the workdir is
+    /// restored to it so a step interrupted mid-edit re-runs from a clean state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
     /// When the run was created.
     pub created_at: DateTime<Utc>,
     /// When the run state was last updated.
