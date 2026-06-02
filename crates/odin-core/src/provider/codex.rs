@@ -2,11 +2,13 @@
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use serde_json::Value;
 
 use super::process::{ProcessOptions, run_process};
 use crate::error::ProviderError;
 use crate::ids::ProviderRef;
 use crate::traits::{CancelToken, InvocationCtx, InvocationOutcome, Provider};
+use crate::usage::Usage;
 
 /// Invokes the `codex` CLI non-interactively (`codex exec`).
 ///
@@ -71,6 +73,9 @@ impl Provider for CodexProvider {
 
         let mut args = vec![
             "exec".to_owned(),
+            // `--json` streams JSONL events to stdout (we parse token usage from them);
+            // `-o` still captures the clean final message to a file.
+            "--json".to_owned(),
             "--cd".to_owned(),
             workdir,
             "-o".to_owned(),
@@ -87,9 +92,15 @@ impl Provider for CodexProvider {
         };
         let out = run_process(&self.program, &args, &opts, &ctx.cancel).await?;
 
+        // Parse the JSONL event stream for the agent message (fallback) and token usage.
+        let (event_text, usage) = parse_events(&out.stdout);
         // Read the captured final message and remove the temp file on EVERY path (incl.
         // timeout), so it never leaks into the worktree or the auto-captured DIFF.
-        let text = std::fs::read_to_string(&last_message).unwrap_or_else(|_| out.stdout.clone());
+        let text = std::fs::read_to_string(&last_message)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or(event_text)
+            .unwrap_or_else(|| out.stdout.clone());
         let _ = std::fs::remove_file(&last_message);
 
         if out.timed_out {
@@ -101,7 +112,7 @@ impl Provider for CodexProvider {
             stdout: text,
             stderr: out.stderr,
             outputs: IndexMap::new(),
-            usage: None,
+            usage,
             produced: IndexMap::new(),
         })
     }
@@ -138,14 +149,87 @@ impl Provider for CodexProvider {
     }
 }
 
+/// Parses `codex exec --json` JSONL events into the agent's final message (fallback for the
+/// `-o` file) and aggregate token usage. Tolerant of unknown lines/schema drift: unparseable
+/// lines are skipped, and usage is `None` if no `turn.completed` event carried it. Codex does
+/// not report a dollar cost, so `cost_micros` stays 0.
+fn parse_events(stdout: &str) -> (Option<String>, Option<Usage>) {
+    let mut text: Option<String> = None;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut saw_usage = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("item.completed")
+                if v.pointer("/item/type").and_then(Value::as_str) == Some("agent_message") =>
+            {
+                if let Some(t) = v.pointer("/item/text").and_then(Value::as_str) {
+                    text = Some(t.to_owned());
+                }
+            }
+            Some("turn.completed") => {
+                if let Some(u) = v.get("usage") {
+                    input_tokens += u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    output_tokens += u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    saw_usage = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let usage = saw_usage.then_some(Usage {
+        input_tokens,
+        output_tokens,
+        cost_micros: 0,
+    });
+    (text, usage)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CodexProvider;
+    use super::{CodexProvider, parse_events};
     use crate::traits::Provider;
 
     #[test]
     fn id_is_codex() {
         assert_eq!(CodexProvider::new().id().as_str(), "codex");
+    }
+
+    #[test]
+    fn parse_events_extracts_message_and_summed_usage() {
+        // Two turns + an agent message, mirroring real `codex exec --json` output.
+        let jsonl = concat!(
+            r#"{"type":"thread.started","thread_id":"x"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ok"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":5}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#,
+            "\n",
+        );
+        let (text, usage) = parse_events(jsonl);
+        assert_eq!(text.as_deref(), Some("ok"));
+        let usage = usage.expect("usage present");
+        assert_eq!(usage.input_tokens, 110);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.cost_micros, 0);
+    }
+
+    #[test]
+    fn parse_events_tolerates_no_usage_and_junk() {
+        let (text, usage) = parse_events("not json\n{\"type\":\"turn.started\"}\n");
+        assert!(text.is_none());
+        assert!(usage.is_none());
     }
 
     /// Live smoke test against the real `codex` CLI. Double-gated (`#[ignore]` +
@@ -183,6 +267,8 @@ mod tests {
             .expect("invocation should succeed");
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert!(!out.stdout.trim().is_empty(), "expected a non-empty reply");
-        eprintln!("codex replied: {:?}", out.stdout);
+        let usage = out.usage.expect("codex --json should report token usage");
+        assert!(usage.input_tokens > 0, "expected non-zero input tokens");
+        eprintln!("codex replied: {:?}; usage: {usage:?}", out.stdout);
     }
 }

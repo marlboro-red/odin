@@ -2,11 +2,13 @@
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use serde_json::Value;
 
 use super::process::{ProcessOptions, run_process};
 use crate::error::ProviderError;
 use crate::ids::ProviderRef;
 use crate::traits::{CancelToken, InvocationCtx, InvocationOutcome, Provider};
+use crate::usage::Usage;
 
 /// Invokes the standalone GitHub Copilot CLI non-interactively (`copilot -p`).
 ///
@@ -14,9 +16,10 @@ use crate::traits::{CancelToken, InvocationCtx, InvocationOutcome, Provider};
 /// the run executes in an isolated worktree, so that blast radius is contained. The
 /// binary name and flags are configurable.
 ///
-/// Unlike the claude/codex adapters (which isolate the agent's final message), copilot's
-/// captured `stdout` is best-effort: `--no-color`/`--log-level none` strip ANSI and the
-/// log stream, but the CLI may still print session chrome around the result.
+/// Runs with `--output-format json` (JSONL), so the agent's final answer is read cleanly
+/// from `assistant.message` events rather than scraped from chrome-laden text. Copilot
+/// reports per-message *output* tokens (not input), so [`Usage`] carries output tokens with
+/// `input_tokens`/`cost_micros` left 0 (Copilot bills in "premium requests", not dollars).
 pub struct CopilotProvider {
     program: String,
     extra_args: Vec<String>,
@@ -70,6 +73,9 @@ impl Provider for CopilotProvider {
             workdir,
             "--log-level".to_owned(),
             "none".to_owned(),
+            // JSONL events: lets us read a clean final answer + token usage.
+            "--output-format".to_owned(),
+            "json".to_owned(),
         ];
         args.extend(self.extra_args.iter().cloned());
 
@@ -84,12 +90,13 @@ impl Provider for CopilotProvider {
             return Err(ProviderError::Timeout(ctx.timeout.unwrap_or_default()));
         }
 
+        let (event_text, usage) = parse_events(&out.stdout);
         Ok(InvocationOutcome {
             exit_code: out.exit_code,
-            stdout: out.stdout,
+            stdout: event_text.unwrap_or_else(|| out.stdout.clone()),
             stderr: out.stderr,
             outputs: IndexMap::new(),
-            usage: None,
+            usage,
             produced: IndexMap::new(),
         })
     }
@@ -126,14 +133,76 @@ impl Provider for CopilotProvider {
     }
 }
 
+/// Parses `copilot --output-format json` JSONL into the final answer and aggregate token
+/// usage. The answer is the last `assistant.message` content; usage sums per-message
+/// `outputTokens` (Copilot reports no input tokens or dollar cost, so those stay 0). Tolerant
+/// of schema drift — unparseable lines are skipped, and usage is `None` if none was seen.
+fn parse_events(stdout: &str) -> (Option<String>, Option<Usage>) {
+    let mut text: Option<String> = None;
+    let mut output_tokens = 0_u64;
+    let mut saw_tokens = false;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) == Some("assistant.message") {
+            if let Some(content) = v.pointer("/data/content").and_then(Value::as_str) {
+                if !content.is_empty() {
+                    text = Some(content.to_owned());
+                }
+            }
+            if let Some(tokens) = v.pointer("/data/outputTokens").and_then(Value::as_u64) {
+                output_tokens += tokens;
+                saw_tokens = true;
+            }
+        }
+    }
+    let usage = saw_tokens.then_some(Usage {
+        input_tokens: 0,
+        output_tokens,
+        cost_micros: 0,
+    });
+    (text, usage)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::CopilotProvider;
+    use super::{CopilotProvider, parse_events};
     use crate::traits::Provider;
 
     #[test]
     fn id_is_copilot() {
         assert_eq!(CopilotProvider::new().id().as_str(), "copilot");
+    }
+
+    #[test]
+    fn parse_events_extracts_final_answer_and_output_tokens() {
+        // Mirrors real `copilot --output-format json`: session chrome, then the answer.
+        let jsonl = concat!(
+            r#"{"type":"session.mcp_servers_loaded","data":{"servers":[]}}"#,
+            "\n",
+            r#"{"type":"assistant.message","data":{"content":"ok","outputTokens":37,"phase":"final_answer"}}"#,
+            "\n",
+            r#"{"type":"result","data":{},"usage":{"premiumRequests":7.5}}"#,
+            "\n",
+        );
+        let (text, usage) = parse_events(jsonl);
+        assert_eq!(text.as_deref(), Some("ok"));
+        let usage = usage.expect("usage present");
+        assert_eq!(usage.output_tokens, 37);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cost_micros, 0);
+    }
+
+    #[test]
+    fn parse_events_tolerates_chrome_only_output() {
+        let (text, usage) = parse_events("plain text\n{\"type\":\"session.skills_loaded\"}\n");
+        assert!(text.is_none());
+        assert!(usage.is_none());
     }
 
     /// Live smoke test against the real `copilot` CLI. Double-gated (`#[ignore]` +
@@ -171,6 +240,10 @@ mod tests {
             .expect("invocation should succeed");
         assert_eq!(out.exit_code, 0, "stderr: {}", out.stderr);
         assert!(!out.stdout.trim().is_empty(), "expected a non-empty reply");
-        eprintln!("copilot replied: {:?}", out.stdout);
+        let usage = out
+            .usage
+            .expect("copilot --output-format json should report usage");
+        assert!(usage.output_tokens > 0, "expected non-zero output tokens");
+        eprintln!("copilot replied: {:?}; usage: {usage:?}", out.stdout);
     }
 }
