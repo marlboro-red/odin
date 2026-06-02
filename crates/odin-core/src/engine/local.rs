@@ -1,15 +1,21 @@
-//! The built-in linear executor.
+//! The built-in executor.
 //!
-//! [`LocalEngine`] walks a workflow's steps in topological order. For each step it builds
-//! the template context from the run state so far, evaluates `when`, renders the prompt /
+//! [`LocalEngine`] walks a workflow's dependency graph. For each step it builds the
+//! template context from the run state so far, evaluates `when`, renders the prompt /
 //! command / args, dispatches to the pinned provider, a shell `run:` hook, or a
 //! registered action, runs the gates, auto-captures the git `DIFF`, and checkpoints the
 //! [`RunState`] — so a crashed run can be resumed from the last completed step. A step
 //! that declares a `judge:` is scored by that provider and fails below its threshold; a
 //! failed step is retried per its `retry:` policy with backoff.
 //!
-//! v1 is linear (one shared workspace, sequential steps); parallel-DAG execution is an
-//! additive refinement on top of this structure.
+//! ## Concurrency
+//!
+//! By default (`max_parallel` unset or `1`) steps run one at a time. With `max_parallel >
+//! 1` the executor is a bounded ready-set scheduler: a non-`scratch` step mutates the
+//! single shared workspace and so runs **exclusively** (never beside another step), while
+//! `scratch: true` steps run **concurrently** in isolated throwaway worktrees (their edits
+//! never touch the shared tree; each one's diff is exposed as `steps.<id>.outputs.diff`).
+//! This makes multi-agent fan-out safe without merging concurrent agent edits.
 //!
 //! ## Resume semantics
 //!
@@ -604,6 +610,11 @@ impl LocalEngine {
         let max_parallel = workflow.max_parallel.map_or(1, NonZeroUsize::get);
         let run_id = state.run_id;
 
+        // Reclaim any scratch worktrees orphaned by a previous (crashed) attempt of this run.
+        if workflow.steps.iter().any(|s| s.scratch) {
+            self.cleanup_scratch(run_id, workdir, cancel).await;
+        }
+
         let mut side_effects = Vec::new();
         let mut usage = Usage::default();
         // Seed from the persisted DIFF so a resumed run carries it forward (already-passed
@@ -757,7 +768,9 @@ impl LocalEngine {
         cancel: &CancelToken,
     ) -> (StepId, StepOutcome) {
         let id = step.id.clone();
-        if !step.scratch {
+        // A non-scratch step, or one whose deps did not pass (it will be skipped without
+        // touching any workdir), runs against the shared workdir — no worktree needed.
+        if !step.scratch || !deps_passed {
             let outcome = self
                 .decide_outcome(
                     run_id,
@@ -771,12 +784,18 @@ impl LocalEngine {
                 .await;
             return (id, outcome);
         }
-        match self.acquire_scratch(base_workdir, &id, cancel).await {
+        match self
+            .acquire_scratch(run_id, base_workdir, &id, cancel)
+            .await
+        {
             Ok(scratch) => {
                 let mut outcome = self
                     .decide_outcome(run_id, step, &ctx, &scratch, timeout, deps_passed, cancel)
                     .await;
-                if matches!(outcome.status, StepStatus::Passed) {
+                // Capture the candidate's diff for any step that actually executed — Passed
+                // *or* Failed (a failed candidate's partial work is still worth inspecting by
+                // a downstream judge). A `Skipped` step (e.g. `when: false`) ran nothing.
+                if !matches!(outcome.status, StepStatus::Skipped) {
                     if let Some(d) = self.capture_diff(&scratch, cancel).await {
                         outcome.outputs.insert("diff".to_owned(), Value::String(d));
                     }
@@ -790,16 +809,18 @@ impl LocalEngine {
 
     /// Adds a detached git worktree at the run's base commit (`HEAD` of `base_workdir`) as a
     /// throwaway scratch dir, outside the run workdir so it never pollutes the shared DIFF.
+    /// Named by `run_id` so [`cleanup_scratch`](Self::cleanup_scratch) can reclaim leftovers.
     async fn acquire_scratch(
         &self,
+        run_id: RunId,
         base_workdir: &Path,
         step_id: &StepId,
         cancel: &CancelToken,
     ) -> std::result::Result<PathBuf, String> {
         let scratch = std::env::temp_dir().join(format!(
-            "odin-scratch-{}-{}",
-            uuid::Uuid::new_v4(),
-            step_id.as_str()
+            "odin-scratch-{run_id}-{}-{}",
+            step_id.as_str(),
+            uuid::Uuid::new_v4()
         ));
         let scratch_str = scratch
             .to_str()
@@ -830,6 +851,37 @@ impl LocalEngine {
         };
         let args = ["worktree", "remove", "--force", scratch_str].map(str::to_owned);
         let _ = run_process("git", &args, &opts, cancel).await;
+    }
+
+    /// Reclaims scratch worktrees left over from a previous attempt of this run (a crash or
+    /// kill mid-scratch-step leaks the temp dir). Called once at the start of a run that has
+    /// scratch steps, so resumes don't accumulate orphaned worktrees.
+    async fn cleanup_scratch(&self, run_id: RunId, base_workdir: &Path, cancel: &CancelToken) {
+        let opts = ProcessOptions {
+            workdir: Some(base_workdir.to_path_buf()),
+            ..ProcessOptions::default()
+        };
+        let prefix = format!("odin-scratch-{run_id}-");
+        if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
+            for entry in entries.flatten() {
+                if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                    continue;
+                }
+                if let Some(p) = entry.path().to_str() {
+                    let args = ["worktree", "remove", "--force", p].map(str::to_owned);
+                    let _ = run_process("git", &args, &opts, cancel).await;
+                }
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        // Drop any now-dangling worktree registrations from the repo metadata.
+        let _ = run_process(
+            "git",
+            &["worktree".to_owned(), "prune".to_owned()],
+            &opts,
+            cancel,
+        )
+        .await;
     }
 
     fn summarize(
@@ -1881,6 +1933,33 @@ steps:
         assert!(
             elapsed < std::time::Duration::from_millis(1300),
             "three 0.5s scratch steps took {elapsed:?}; expected concurrency (~0.5s, not ~1.5s)"
+        );
+    }
+
+    /// A scratch step that edits files then FAILS still surfaces its diff (a failed
+    /// candidate's partial work is worth inspecting), unlike a skipped one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_scratch_step_still_captures_its_diff() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: failcap\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 2\nsteps:\n  - { id: bad, run: \"echo partial > work.txt; exit 1\", scratch: true }\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Failed);
+        let bad = &summary.steps[0];
+        assert_eq!(bad.status, StepStatus::Failed);
+        assert!(
+            bad.outputs
+                .get("diff")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("partial"),
+            "a failed scratch step should still expose its diff: {:?}",
+            bad.outputs.get("diff")
         );
     }
 }

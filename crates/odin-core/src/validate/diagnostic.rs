@@ -93,6 +93,9 @@ pub enum DiagCode {
     /// ODIN027 — a `github_webhook` trigger maps a param that the workflow does not
     /// declare; the mapping is inert (warning).
     WebhookParamUndeclared,
+    /// ODIN028 — an `action` step sets `scratch: true`; its workspace side effects are
+    /// discarded with the throwaway worktree (warning).
+    ScratchOnAction,
 }
 
 impl DiagCode {
@@ -127,6 +130,7 @@ impl DiagCode {
             DiagCode::UnknownRootField => "ODIN025",
             DiagCode::NewerSchemaMinor => "ODIN026",
             DiagCode::WebhookParamUndeclared => "ODIN027",
+            DiagCode::ScratchOnAction => "ODIN028",
         }
     }
 
@@ -140,7 +144,8 @@ impl DiagCode {
             | DiagCode::UnusedParam
             | DiagCode::UnknownRootField
             | DiagCode::NewerSchemaMinor
-            | DiagCode::WebhookParamUndeclared => Severity::Warning,
+            | DiagCode::WebhookParamUndeclared
+            | DiagCode::ScratchOnAction => Severity::Warning,
             _ => Severity::Error,
         }
     }

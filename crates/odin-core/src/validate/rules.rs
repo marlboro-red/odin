@@ -150,6 +150,18 @@ pub(crate) fn prompts(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 pub(crate) fn actions(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<Diagnostic>) {
     for (i, s) in wf.steps.iter().enumerate() {
         if let StepKind::Action(a) = &s.kind {
+            // ODIN028 — an action's effects are discarded with a scratch worktree.
+            if s.scratch {
+                d.push(Diagnostic::new(
+                    DiagCode::ScratchOnAction,
+                    format!("{}.scratch", step_ptr(i)),
+                    format!(
+                        "step {:?}: `scratch: true` on an action step discards its workspace \
+                         side effects with the throwaway worktree",
+                        s.id.as_str()
+                    ),
+                ));
+            }
             if known.actions.contains(&a.action.as_str()) {
                 continue;
             }
