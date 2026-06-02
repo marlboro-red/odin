@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/odin-core", "crates/odin-cli", "crates/odin-daemon"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["Odin contributors"]
+repository = "https://github.com/marlboro-red/odin"
+description = "A durable, library-first workflow engine that orchestrates autonomous coding-agent CLIs."
+keywords = ["workflow", "orchestration", "agents", "llm", "automation"]
+categories = ["development-tools", "command-line-utilities"]
+
+# Shared dependency versions. Member crates opt in with `dep = { workspace = true }`.
+# Versions are filled in by `cargo add --workspace` during implementation so they
+# always match what is actually published; kept here as the single source of truth.
+[workspace.dependencies]
+odin-core = { path = "crates/odin-core", version = "0.0.1" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Idiomatic-but-noisy pedantic lints we deliberately allow:
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_panics_doc = "allow"
+# We document fallibility in prose, not a uniform `# Errors` section, for now:
+missing_errors_doc = "allow"
+
+# Faster, smaller release binaries for the CLI/daemon.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"

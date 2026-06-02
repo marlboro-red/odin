@@ -1,0 +1,104 @@
+# A "kitchen-sink" workflow that exercises the ENTIRE IR: schema version, metadata,
+# durability, a slot-pool workspace + reset mode, all three trigger kinds, two param
+# types with required/default, all three step kinds (provider/action/run), prompt vs
+# prompt_file, requires/produces + the built-in DIFF, a gates map, a cross-provider
+# judge, retry with an (inert) fallback, timeouts, when-conditionals, and a fan-in DAG.
+#
+# It is intentionally NOT clean: it triggers exactly one warning so you can see the
+# validator's warning path —
+#   ODIN023  (`on_fallback_provider` is parsed but inert in v1)
+# Remove the `on_fallback_provider` line for a diagnostic-free file. (Tip: if you add
+# `DIFF` to a step's `produces`, you'll see ODIN019 — DIFF is auto-captured, so listing
+# it is an error.)
+#
+#   odin validate examples/fix-flaky-test.yaml
+
+schema_version: "1.0"
+name: fix-flaky-test
+version: "0.3.1" # author's workflow version (opaque to the engine)
+description: Diagnose a flaky test from a GitHub issue, fix it, verify it, open a PR.
+durable: true
+
+workspace:
+  type: slot_pool # a pool of pre-cloned slots claimed per run
+  pool: 4 # ODIN016: must be >= 1
+  reset: git_clean # reset --hard + clean -fdx between runs
+
+triggers: # extensible list; only `manual` executes in v1
+  - type: manual
+  - type: github_webhook
+    events: ["issues.labeled"]
+    repo: marlboro-red/odin
+  - type: cron
+    schedule: "0 3 * * 1" # ODIN020: validated as a 5-field cron expression
+
+params:
+  issue_number:
+    type: number
+    required: true
+    description: GitHub issue describing the flake.
+  base_branch:
+    type: string
+    default: "main"
+
+defaults:
+  timeout: "30m"
+  retry:
+    max: 1
+    backoff: exponential
+
+steps:
+  # provider kind: inline prompt, produces an artifact
+  - id: plan
+    provider: claude
+    prompt: |
+      Read issue #{{ params.issue_number }} on branch {{ params.base_branch }}.
+      Produce a one-paragraph root-cause hypothesis and a fix plan in plan.md.
+    artifacts:
+      produces: [PLAN]
+    timeout: "20m"
+
+  # provider kind: prompt_file, requires PLAN, gates, retry with inert fallback
+  - id: implement
+    provider: codex
+    prompt_file: prompts/implement.j2
+    depends_on: [plan]
+    artifacts:
+      requires: [PLAN] # producer `plan` is an upstream dependency (ODIN008/015 ok)
+    gates:
+      typecheck: "cargo check --workspace"
+      unit: "cargo test --workspace --quiet"
+    retry:
+      max: 2
+      backoff: exponential
+      on_fallback_provider: claude # ODIN023: inert in v1
+    timeout: "30m"
+
+  # provider kind: judged by a DIFFERENT provider, with a when-conditional
+  - id: review
+    provider: claude
+    prompt: |
+      Review the change for correctness:
+      {{ artifacts.DIFF }}
+    depends_on: [implement]
+    when: "steps.implement.exit_code == 0"
+    judge:
+      provider: codex # != step provider, so no ODIN021 warning
+      criteria: The diff fixes the flake without weakening assertions.
+      threshold: 0.7
+
+  # run kind: a code hook in any language
+  - id: changelog
+    run: "scripts/gen-changelog.sh {{ params.issue_number }} > CHANGELOG.md"
+    depends_on: [implement]
+    timeout: "60s"
+
+  # action kind: a built-in side-effect, FAN-IN (two parents), conditional
+  - id: open_pr
+    action: github.open_pr
+    with:
+      title: "Fix flaky test (#{{ params.issue_number }})"
+      base: "{{ params.base_branch }}"
+      body: "{{ steps.review.outputs.summary }}"
+    depends_on: [review, changelog] # genuine DAG fan-in
+    when: "steps.review.outputs.passed == true"

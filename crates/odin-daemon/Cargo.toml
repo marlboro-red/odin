@@ -1,0 +1,20 @@
+[package]
+name = "odin-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Long-running daemon that drives Odin workflows from event triggers."
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "odind"
+path = "src/main.rs"
+
+[dependencies]
+odin-core = { workspace = true }
+# tokio/axum and trigger wiring arrive with the daemon milestone (post-MVP).

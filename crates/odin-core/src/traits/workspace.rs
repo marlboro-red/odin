@@ -1,0 +1,61 @@
+//! The [`Workspace`] trait: provision an isolated working directory per run.
+
+use std::path::PathBuf;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::error::WorkspaceError;
+use crate::ids::RunId;
+use crate::ir::WorkspaceConfig;
+
+/// Provides each run an isolated working directory. v1 implementations: a per-run git
+/// worktree, and a fixed-size pool of pre-cloned slots.
+///
+/// Lifecycle: `acquire` → steps run against `handle.path` → `release`.
+#[async_trait]
+pub trait Workspace: Send + Sync {
+    /// Registry key (e.g. `"worktree"` | `"slot_pool"`).
+    fn kind(&self) -> &str;
+
+    /// Claims a workdir for a run. May block/queue if a finite pool is exhausted.
+    ///
+    /// # Errors
+    /// Returns a [`WorkspaceError`] if provisioning fails (git error, pool exhausted).
+    async fn acquire(&self, ctx: AcquireCtx) -> Result<WorkspaceHandle, WorkspaceError>;
+
+    /// Releases/resets a previously acquired workspace. Idempotent.
+    ///
+    /// # Errors
+    /// Returns a [`WorkspaceError`] if cleanup fails.
+    async fn release(&self, handle: WorkspaceHandle) -> Result<(), WorkspaceError>;
+}
+
+/// What the engine knows when acquiring a workspace.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct AcquireCtx {
+    /// The run requesting a workspace.
+    pub run_id: RunId,
+    /// The workflow's declared workspace config.
+    pub config: WorkspaceConfig,
+}
+
+/// A claimed workspace lease.
+///
+/// It is `Clone + Serialize` because [`crate::traits::RunState`] must persist it for
+/// crash-resume; single-ownership of the lease is enforced by the engine's
+/// acquire→release lifecycle, not by the type. The `token` is an impl-private reclaim
+/// handle (slot index, worktree name) opaque to the engine.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct WorkspaceHandle {
+    /// The run this lease belongs to.
+    pub run_id: RunId,
+    /// Absolute path steps execute in.
+    pub path: PathBuf,
+    /// Branch/ref created for this run, if any (folded into the run summary).
+    pub branch: Option<String>,
+    /// Impl-private reclaim token, opaque to the engine.
+    pub token: String,
+}

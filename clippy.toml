@@ -1,0 +1,3 @@
+# Proper nouns that should not trip the `clippy::doc_markdown` lint.
+# `..` preserves clippy's built-in default ident list.
+doc-valid-idents = ["OpenAI", "SQLite", "GitHub", "DAG", "YAML", "JSON", ".."]

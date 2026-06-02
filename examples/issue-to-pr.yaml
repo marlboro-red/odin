@@ -1,0 +1,76 @@
+# The canonical Odin workflow: take a GitHub issue, plan it, implement it, self-review
+# the diff, and open a pull request. This file validates cleanly (zero diagnostics).
+#
+#   odin validate examples/issue-to-pr.yaml
+
+schema_version: "1.0"
+name: issue-to-pr
+version: "1.0.0"
+description: Plan, implement, and self-review a GitHub issue, then open a pull request.
+durable: true # checkpointed & crash-resumable
+
+workspace:
+  type: worktree # one throwaway git worktree per run
+
+triggers:
+  - type: manual
+  - type: github_webhook
+    events: ["issues.labeled"]
+    repo: marlboro-red/odin
+
+params:
+  issue_url:
+    type: string
+    required: true
+    description: URL of the GitHub issue to implement.
+
+defaults:
+  timeout: "30m"
+
+steps:
+  # Provider step: an inline prompt that produces a named artifact.
+  - id: plan
+    provider: claude
+    prompt: |
+      Read the issue at {{ params.issue_url }} and write a concise,
+      step-by-step implementation plan to plan.md.
+    artifacts:
+      produces: [PLAN]
+    timeout: "15m"
+
+  # Provider step that consumes PLAN and is gated on a green build + tests.
+  - id: implement
+    provider: codex
+    prompt: |
+      Implement the plan in PLAN. Keep the change minimal and focused;
+      do not touch unrelated files.
+    depends_on: [plan]
+    artifacts:
+      requires: [PLAN]
+    gates:
+      build: "cargo build --workspace"
+      test: "cargo test --workspace"
+    retry:
+      max: 1
+      backoff: exponential
+
+  # Self-review of the auto-captured DIFF, judged by a *different* provider.
+  - id: review
+    provider: claude
+    prompt: |
+      Review the following diff for correctness and risk:
+      {{ artifacts.DIFF }}
+    depends_on: [implement]
+    judge:
+      provider: codex
+      criteria: The change implements PLAN without regressions or weakened tests.
+      threshold: 0.7
+
+  # Built-in action: open the PR only if the review passed.
+  - id: open_pr
+    action: github.open_pr
+    with:
+      title: "Implement {{ params.issue_url }}"
+      body: "{{ steps.review.outputs.summary }}"
+    depends_on: [review]
+    when: "steps.review.outputs.passed == true"
