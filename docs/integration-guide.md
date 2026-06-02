@@ -149,17 +149,23 @@ event source is **one trait, usually one file**. All five are object-safe (used 
 `Arc<dyn Trait>`), `Send + Sync`, implemented via `#[async_trait]`, and exchange owned,
 mostly-serializable context/outcome structs so impls can live in *your* crate.
 
-> **Two things to know before you start.** (1) Annotate every `impl` with
-> `#[odin_core::async_trait]` — it's re-exported, so you neither add nor version-match the
-> `async-trait` crate (a mismatched version otherwise surfaces as a cryptic `E0195`).
-> `anyhow` and `serde_json` are re-exported the same way (`odin_core::anyhow`,
-> `odin_core::serde_json`) — handy because trait errors wrap `anyhow::Error` and the API
-> exchanges `serde_json::Value`. (2) Import the traits **and** their context/outcome structs
-> from the crate root — `use odin_core::{Provider, InvocationCtx, InvocationOutcome, Action,
-> ActionCtx, ActionOutcome, Workspace, WorkspaceHandle, …};` — they're all re-exported there. Several of these structs are `#[non_exhaustive]`, so build
+> **Three things to know before you start.** (1) Annotate every `impl` with the re-exported
+> `async_trait` macro, so you neither add nor version-match the `async-trait` crate (a
+> mismatched version otherwise surfaces as a cryptic `E0195`). Either fully qualify it,
+> `#[odin_core::async_trait]`, or `use odin_core::async_trait;` once and write `#[async_trait]`
+> — the examples below use the latter. `anyhow` and `serde_json` are re-exported the same way
+> (`odin_core::anyhow`, `odin_core::serde_json`) — handy because trait errors wrap
+> `anyhow::Error` and the API exchanges `serde_json::Value`. (2) Import the traits **and** their
+> context/outcome structs from the crate root — `use odin_core::{Provider, InvocationCtx,
+> InvocationOutcome, Action, ActionCtx, ActionOutcome, Workspace, WorkspaceHandle, …};` — they're
+> all re-exported there. Several of these structs are `#[non_exhaustive]`, so build
 > them with their constructors (`InvocationOutcome::success`, `ActionOutcome::success().with_*`,
 > `SideEffect::pull_request`/`comment`/…, `WorkspaceHandle::new`, `TriggerEvent::new`), not struct
-> literals. A complete, compiled custom-Provider + custom-Action example lives at
+> literals. (3) A trait method returns the plain `Result<T, ThatTraitsError>` shown in its
+> signature (e.g. `Result<InvocationOutcome, ProviderError>`) — i.e. `std::result::Result`,
+> **not** the crate's own `odin_core::Result<T>` alias (which is `Result<T, odin_core::Error>`);
+> writing the latter in an `impl` is an `E0053` type mismatch. A complete, compiled
+> custom-Provider + custom-Action example lives at
 > [`crates/odin-core/examples/custom_plugin.rs`](../crates/odin-core/examples/custom_plugin.rs)
 > (`cargo run -p odin-core --example custom_plugin`).
 

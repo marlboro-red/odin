@@ -12,7 +12,17 @@ Odin is a Rust workspace (edition 2024, MSRV 1.85). Build the two binaries:
 cargo build                       # the `odin` CLI and the `odind` daemon
 ```
 
-This produces `odin` (the CLI) and `odind` (the daemon) under `target/`.
+This produces `odin` (the CLI) and `odind` (the daemon) under `target/debug/`. The snippets
+below use the short `odin` / `odind` names; to make them resolve, either install the binaries
+onto your `PATH` —
+
+```sh
+cargo install --path crates/odin-cli      # `odin`
+cargo install --path crates/odin-daemon   # `odind`
+```
+
+— or, without installing, run them through cargo (e.g. alias `odin='cargo run -p odin-cli --'`
+and `odind='cargo run -p odin-daemon --'`, then `odin validate …`).
 
 ## 1. Validate a workflow
 

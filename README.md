@@ -80,8 +80,9 @@ steps:
     when: "steps.review.status == 'passed'"
 ```
 
-See [`examples/`](examples/) for fully-annotated workflows:
-[`issue-to-pr.yaml`](examples/issue-to-pr.yaml) (the canonical flow),
+The snippet above is **abridged** — the full file adds `git.commit` + `git.push` steps before
+`open_pr`. See [`examples/`](examples/) for the fully-annotated workflows:
+[`issue-to-pr.yaml`](examples/issue-to-pr.yaml) (the canonical flow, six steps),
 [`fix-flaky-test.yaml`](examples/fix-flaky-test.yaml) (a kitchen-sink of step/trigger kinds),
 [`nightly-maintenance.yaml`](examples/nightly-maintenance.yaml) (cron-served), and
 [`multi-agent-eval.yaml`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out).
@@ -116,7 +117,7 @@ A parse-only embedder (a linter or an editor plugin) pays nothing for the async 
 |---------|----------|------------|
 | `ir` | serde only | parse + validate workflows |
 | `templating` | minijinja | render prompts + statically check `{{ refs }}` |
-| `runtime` | tokio, async-trait | the five traits, the registry, provider/store/workspace/action impls |
+| `runtime` | tokio, async-trait, rusqlite, anyhow (+ futures) | the five traits, the registry, provider/store/workspace/action impls |
 | `mock` | (`runtime`) | in-memory test doubles (`EchoProvider`, `MemStore`, …) for downstream tests |
 | `full` *(default)* | `ir` + `templating` + `runtime` | running workflows, the CLI, the daemon |
 
@@ -144,7 +145,7 @@ odin-core = { version = "0.0.1", default-features = false, features = ["ir", "te
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-features --all-targets   # -D warnings in CI
-cargo test  --workspace
+cargo test --workspace --all-features                   # matches CI
 ```
 
 The workspace forbids `unsafe`, denies warnings in CI, and runs clippy at the `pedantic`
