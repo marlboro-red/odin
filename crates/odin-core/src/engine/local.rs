@@ -1479,10 +1479,13 @@ impl Engine for LocalEngine {
                         let exec = self
                             .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
                             .await;
-                        if workflow.durable {
-                            self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
-                                .await;
-                        }
+                        // Reclaim the run's snapshot refs unconditionally (matches run() and the
+                        // unserved-workflow path above): a retrying step snapshots even in a
+                        // non-durable run, and the durable flag may have been flipped since the
+                        // run was persisted — so either kind can leave a per-run or retry ref.
+                        // `delete_snapshot_ref` is a no-op when none was created.
+                        self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
+                            .await;
                         let _ = self
                             .make_workspace(&workflow.workspace)
                             .release(handle)
@@ -1511,12 +1514,11 @@ impl Engine for LocalEngine {
                 }
             } else {
                 // The workspace is gone (host moved, manual cleanup); cannot resume. The
-                // snapshot ref lives in the shared main repo, so reclaim it there (best
-                // effort) even though the worktree dir is gone.
-                if workflow.durable {
-                    self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
-                        .await;
-                }
+                // snapshot refs live in the shared main repo, so reclaim them there (best
+                // effort, no-op when none) even though the worktree dir is gone — unconditional
+                // for the same reason as the path above.
+                self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
+                    .await;
                 self.fail_run(workflow, &mut state, "workspace is gone; cannot resume")
                     .await?
             };
@@ -2115,6 +2117,106 @@ steps:
             "remaining steps executed on resume"
         );
         assert_eq!(by("review"), StepStatus::Passed);
+    }
+
+    #[tokio::test]
+    async fn resume_reclaims_a_leftover_snapshot_ref_when_durable_was_flipped_off() {
+        // A durable run that crashed leaves refs/odin/run/<id> behind plus a persisted state.
+        // Resuming it against a workflow whose `durable` is now false must STILL reclaim that
+        // ref (cleanup is unconditional, matching run()) — the old durable-gated cleanup leaked
+        // it. (Non-durable runs aren't persisted, so a flipped flag is how this state arises.)
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let nondurable = parse(
+            "name: rr\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: first, provider: echo, prompt: hi}\n  - {id: rest, run: \"true\", depends_on: [first]}\n",
+        );
+
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: nondurable.workspace.clone(),
+            })
+            .await
+            .unwrap();
+
+        // Seed the leftover ref a crashed durable run would have left in the shared repo.
+        let snapshot_ref = format!("refs/odin/run/{run_id}");
+        let seeded = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.path().to_str().unwrap(),
+                "update-ref",
+                &snapshot_ref,
+                "HEAD",
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(seeded, "seed the leftover snapshot ref");
+
+        let mut steps = IndexMap::new();
+        steps.insert(
+            StepId::new("first"),
+            StepState {
+                status: StepStatus::Passed,
+                attempts: 1,
+                exit_code: Some(0),
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                error: None,
+            },
+        );
+        let state = RunState {
+            run_id,
+            workflow: nondurable.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: Some(handle),
+            base_commit: None,
+            snapshot: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng
+            .resume_all(std::slice::from_ref(&nondurable))
+            .await
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summaries[0].error
+        );
+
+        let still_there = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.path().to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &snapshot_ref,
+            ])
+            .status()
+            .unwrap()
+            .success();
+        assert!(
+            !still_there,
+            "resume must reclaim the leftover snapshot ref even for a non-durable workflow"
+        );
     }
 
     #[tokio::test]
