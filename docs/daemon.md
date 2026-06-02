@@ -151,6 +151,12 @@ fronting reverse proxy:
   the work valid deliveries can spawn, and unsigned floods are rejected cheaply at the
   signature check; edge rate-limiting is a proxy concern.
 
+The daemon's webhook secret is **not** exposed to the agents it runs: `ODIN_WEBHOOK_SECRET`
+is scrubbed from every subprocess the engine spawns (provider CLIs, `run:`/gate shells,
+actions). Other environment is still inherited, so don't place unrelated secrets in `odind`'s
+environment if the agents it runs are untrusted — see the
+[trust boundaries](architecture.md#security--trust-boundaries).
+
 For a durable webhook-triggered workflow, note that the full event payload is checkpointed
 into the run's persisted state — GitHub events can carry PII, so prefer mapping the few fields
 you need into `params` over relying on whole-event `trigger.*` if you'd rather not persist it.
