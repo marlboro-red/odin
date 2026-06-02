@@ -143,6 +143,19 @@ impl LocalEngine {
     }
 
     fn make_workspace(&self, cfg: &WorkspaceConfig) -> Arc<dyn Workspace> {
+        // The workspace `type` the workflow declares, as a registry key.
+        let kind = match cfg {
+            WorkspaceConfig::Worktree(_) => "worktree",
+            WorkspaceConfig::SlotPool(_) => "slot_pool",
+        };
+        // A custom workspace registered under this kind overrides the built-in (the same
+        // last-writer-wins override `register_provider` gives providers). This is the live
+        // path for `Registry::register_workspace`. NB: the workflow IR's `workspace.type` is
+        // still a closed set (worktree / slot_pool), so an embedder can *replace* a built-in
+        // kind but cannot yet introduce a brand-new `type:` string from YAML.
+        if let Some(workspace) = self.registry.workspace(kind) {
+            return Arc::clone(workspace);
+        }
         match cfg {
             WorkspaceConfig::Worktree(_) => {
                 Arc::new(WorktreeWorkspace::new(self.repo_root.clone()))
@@ -1729,6 +1742,65 @@ steps:
             status("ungated"),
             StepStatus::Skipped,
             "`status == 'failed'` gate must not fire when the upstream step passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_workspace_overrides_the_builtin_kind() {
+        // A custom Workspace registered under a built-in kind ("worktree") must be used by the
+        // engine in place of the built-in — the live path for `Registry::register_workspace`.
+        use crate::error::WorkspaceError;
+        use crate::traits::{AcquireCtx, Workspace, WorkspaceHandle};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RecordingWorkspace {
+            dir: std::path::PathBuf,
+            used: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl Workspace for RecordingWorkspace {
+            #[allow(clippy::unnecessary_literal_bound)]
+            fn kind(&self) -> &str {
+                "worktree"
+            }
+            async fn acquire(
+                &self,
+                ctx: AcquireCtx,
+            ) -> std::result::Result<WorkspaceHandle, WorkspaceError> {
+                self.used.store(true, Ordering::SeqCst);
+                Ok(WorkspaceHandle::new(ctx.run_id, self.dir.clone(), None, ""))
+            }
+            async fn release(&self, _: WorkspaceHandle) -> std::result::Result<(), WorkspaceError> {
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let used = Arc::new(AtomicBool::new(false));
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut builder = EngineBuilder::new().repo(repo.path()).store(store);
+        builder
+            .registry_mut()
+            .register_workspace(Arc::new(RecordingWorkspace {
+                dir: dir.path().to_path_buf(),
+                used: used.clone(),
+            }));
+        let eng = builder.build().unwrap();
+
+        let wf =
+            parse("name: ws\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"true\"}\n");
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        assert!(
+            used.load(Ordering::SeqCst),
+            "the registered workspace must override the built-in worktree kind"
         );
     }
 

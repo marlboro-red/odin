@@ -74,3 +74,8 @@ required-features = ["runtime", "templating"]
 [[example]]
 name = "codex_smoke"
 required-features = ["runtime", "templating"]
+
+# A custom Provider + Action implemented against the public API and run end-to-end.
+[[example]]
+name = "custom_plugin"
+required-features = ["runtime", "templating"]

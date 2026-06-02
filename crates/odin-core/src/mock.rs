@@ -50,12 +50,7 @@ impl Workspace for TmpWorkspace {
     }
 
     async fn acquire(&self, ctx: AcquireCtx) -> Result<WorkspaceHandle, WorkspaceError> {
-        Ok(WorkspaceHandle {
-            run_id: ctx.run_id,
-            path: self.0.clone(),
-            branch: None,
-            token: String::new(),
-        })
+        Ok(WorkspaceHandle::new(ctx.run_id, self.0.clone(), None, ""))
     }
 
     async fn release(&self, _handle: WorkspaceHandle) -> Result<(), WorkspaceError> {

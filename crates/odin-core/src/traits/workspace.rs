@@ -59,3 +59,28 @@ pub struct WorkspaceHandle {
     /// Impl-private reclaim token, opaque to the engine.
     pub token: String,
 }
+
+impl WorkspaceHandle {
+    /// Builds a workspace lease. A [`Workspace`] implementation returns this from `acquire`;
+    /// because the struct is `#[non_exhaustive]`, out-of-crate implementors must use this
+    /// constructor (a struct literal won't compile in another crate).
+    ///
+    /// `path` should be **absolute** — the engine sets each step's working directory to it,
+    /// and tools resolve their own path arguments against it. `branch` is the ref created for
+    /// the run, if any; `token` is an impl-private reclaim handle (slot index, worktree name)
+    /// the engine treats as opaque and hands back to `release`.
+    #[must_use]
+    pub fn new(
+        run_id: RunId,
+        path: PathBuf,
+        branch: Option<String>,
+        token: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id,
+            path,
+            branch,
+            token: token.into(),
+        }
+    }
+}

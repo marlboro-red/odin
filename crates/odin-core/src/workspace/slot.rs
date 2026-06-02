@@ -145,12 +145,12 @@ impl Workspace for SlotPoolWorkspace {
             return Err(e);
         }
 
-        Ok(WorkspaceHandle {
-            run_id: ctx.run_id,
-            path: slot,
-            branch: None,
-            token: index.to_string(),
-        })
+        Ok(WorkspaceHandle::new(
+            ctx.run_id,
+            slot,
+            None,
+            index.to_string(),
+        ))
     }
 
     async fn release(&self, handle: WorkspaceHandle) -> Result<(), WorkspaceError> {

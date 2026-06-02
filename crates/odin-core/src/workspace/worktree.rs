@@ -62,12 +62,7 @@ impl Workspace for WorktreeWorkspace {
         }
         git(&self.repo_root, &args).await?;
 
-        Ok(WorkspaceHandle {
-            run_id: run,
-            path,
-            branch: Some(branch),
-            token: path_str,
-        })
+        Ok(WorkspaceHandle::new(run, path, Some(branch), path_str))
     }
 
     async fn release(&self, handle: WorkspaceHandle) -> Result<(), WorkspaceError> {

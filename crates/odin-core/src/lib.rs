@@ -116,8 +116,23 @@ pub use registry::Registry;
 pub use storage::SqliteStore;
 #[cfg(feature = "runtime")]
 pub use traits::{Action, Provider, Store, Trigger, Workspace};
+// The context/outcome structs a trait implementor exchanges with the engine — re-exported at
+// the crate root so a plugin author imports everything from `odin_core::` (not a mix of
+// `odin_core::` and `odin_core::traits::`).
+#[cfg(feature = "runtime")]
+pub use traits::{
+    AcquireCtx, ActionCtx, ActionOutcome, CancelToken, InvocationCtx, InvocationOutcome, RunEvent,
+    RunState, StepState, TriggerEvent, WorkspaceHandle,
+};
 #[cfg(feature = "runtime")]
 pub use workspace::{SlotPoolWorkspace, WorktreeWorkspace};
+
+/// Re-export of the [`mod@async_trait`] attribute macro. Every integration trait is
+/// `#[async_trait]`, so implementors annotate their `impl` with it — use
+/// `odin_core::async_trait` to get a version guaranteed to match this crate's, instead of
+/// adding (and version-matching) the `async-trait` dependency yourself.
+#[cfg(feature = "runtime")]
+pub use async_trait::async_trait;
 
 /// The version string of `odin-core`, taken from `Cargo.toml` at build time.
 ///

@@ -80,7 +80,11 @@ pub struct InvocationOutcome {
 }
 
 impl InvocationOutcome {
-    /// Convenience constructor for trivial/mock providers: exit 0 with the given stdout.
+    /// A successful (exit 0) outcome carrying `stdout` (and default usage). The struct is
+    /// `#[non_exhaustive]`, so out-of-crate providers build outcomes with this / [`failure`]
+    /// plus the `with_*` builders rather than a struct literal.
+    ///
+    /// [`failure`]: Self::failure
     #[must_use]
     pub fn success(stdout: impl Into<String>) -> Self {
         Self {
@@ -91,6 +95,55 @@ impl InvocationOutcome {
             usage: Some(Usage::default()),
             produced: IndexMap::new(),
         }
+    }
+
+    /// A failed outcome with the given non-zero exit code (no stdout/usage). Pair with
+    /// [`with_stderr`](Self::with_stderr) to surface the CLI's error.
+    #[must_use]
+    pub fn failure(exit_code: i32) -> Self {
+        Self {
+            exit_code,
+            stdout: String::new(),
+            stderr: String::new(),
+            outputs: IndexMap::new(),
+            usage: None,
+            produced: IndexMap::new(),
+        }
+    }
+
+    /// Sets the process exit code (builder style); the engine fails the step on non-zero.
+    #[must_use]
+    pub fn with_exit_code(mut self, exit_code: i32) -> Self {
+        self.exit_code = exit_code;
+        self
+    }
+
+    /// Sets captured stderr (builder style).
+    #[must_use]
+    pub fn with_stderr(mut self, stderr: impl Into<String>) -> Self {
+        self.stderr = stderr.into();
+        self
+    }
+
+    /// Adds a structured output exposed as `steps.<id>.outputs.<key>` (builder style).
+    #[must_use]
+    pub fn with_output(mut self, key: impl Into<String>, value: impl Into<Value>) -> Self {
+        self.outputs.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets token/cost usage (builder style).
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    /// Records an artifact this invocation wrote (name → path; builder style).
+    #[must_use]
+    pub fn with_produced(mut self, name: ArtifactName, path: PathBuf) -> Self {
+        self.produced.insert(name, path);
+        self
     }
 }
 

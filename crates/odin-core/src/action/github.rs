@@ -68,7 +68,7 @@ impl Action for OpenPr {
         Ok(ActionOutcome {
             exit_code: 0,
             outputs,
-            side_effects: vec![SideEffect::PullRequest { url, number }],
+            side_effects: vec![SideEffect::pull_request(url, number)],
         })
     }
 }

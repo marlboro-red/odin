@@ -219,6 +219,52 @@ pub enum SideEffect {
     },
 }
 
+impl SideEffect {
+    /// A pull request was opened. Constructors are provided because every variant is
+    /// `#[non_exhaustive]`; a custom [`crate::Action`] in another crate uses these to record
+    /// an outward effect in its [`crate::traits::ActionOutcome`].
+    #[must_use]
+    pub fn pull_request(url: impl Into<String>, number: u64) -> Self {
+        Self::PullRequest {
+            url: url.into(),
+            number,
+        }
+    }
+
+    /// A comment was posted at `url`.
+    #[must_use]
+    pub fn comment(url: impl Into<String>) -> Self {
+        Self::Comment { url: url.into() }
+    }
+
+    /// A commit `sha` was made, optionally on `branch`.
+    #[must_use]
+    pub fn commit(sha: impl Into<String>, branch: Option<String>) -> Self {
+        Self::Commit {
+            sha: sha.into(),
+            branch,
+        }
+    }
+
+    /// `branch` was pushed to `remote`.
+    #[must_use]
+    pub fn push(branch: impl Into<String>, remote: impl Into<String>) -> Self {
+        Self::Push {
+            branch: branch.into(),
+            remote: remote.into(),
+        }
+    }
+
+    /// An artifact `name` was written at `path`.
+    #[must_use]
+    pub fn artifact(name: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::Artifact {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RunInput, RunStatus, StepStatus};
