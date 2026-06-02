@@ -43,7 +43,7 @@ jobs:
       # dependency can't silently leak into the parse-only paths.
       - name: Clippy each feature subset
         run: |
-          for feats in ir "ir,templating" runtime mock full; do
+          for feats in ir templating "ir,templating" runtime mock full; do
             echo "::group::--features $feats"
             cargo clippy -p odin-core --no-default-features --features "$feats" --all-targets
             echo "::endgroup::"

@@ -87,11 +87,15 @@ run-level terminal error:
 Run a91b… — failed
   ✓ plan
   ✗ implement (exit 1)
-      ↳ gate "tests" failed: cargo test exited 101
+      ↳ exited with code 1
   ⊘ review
 usage: 18992 in / 1043 out tokens, $0.0571
-error: step "implement" failed after 2 attempt(s)
+error: step "implement" failed: exited with code 1
 ```
+
+The `↳` line is the first line of the step's recorded reason — `exited with code N`
+(with a `stderr:` tail when there is one), a failed `gate "<name>" failed`, or a
+sub-threshold judge. The run-level `error:` line is `step "<id>" failed: <that reason>`.
 
 Step glyphs: `✓` passed, `✗` failed, `⊘` skipped, `·` other. `--json` emits the full
 [`RunSummary`](#json-shapes).

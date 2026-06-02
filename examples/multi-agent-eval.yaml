@@ -1,6 +1,7 @@
 # Fan the same task out to three agents *in parallel* — each in its own isolated scratch
-# worktree, so their edits never collide — then judge the candidate diffs and (optionally)
-# apply the winner. This is what `max_parallel` + `scratch:` unlock.
+# worktree, so their edits never collide — then judge the candidate diffs. This is what
+# `max_parallel` + `scratch:` unlock. Applying the winning diff is NOT one of the steps below;
+# the closing comment shows how to add that step safely.
 #
 #   odin validate examples/multi-agent-eval.yaml
 #   odin run examples/multi-agent-eval.yaml --repo . --param task="add a CONTRIBUTING.md"
@@ -8,7 +9,7 @@
 schema_version: "1.0"
 name: multi-agent-eval
 version: "1.0.0"
-description: Implement a task with three agents in parallel, judge the diffs, apply the best.
+description: Fan a task out to three agents in parallel and judge the candidate diffs (applying the winner is a documented next step, see the closing comment).
 durable: true
 
 workspace:
