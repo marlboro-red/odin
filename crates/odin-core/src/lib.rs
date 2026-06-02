@@ -48,6 +48,8 @@ pub mod provider;
 #[cfg(feature = "runtime")]
 pub mod registry;
 #[cfg(feature = "runtime")]
+pub mod storage;
+#[cfg(feature = "runtime")]
 pub mod traits;
 #[cfg(feature = "runtime")]
 pub mod workspace;
@@ -72,6 +74,8 @@ pub use engine::{Engine, EngineBuilder};
 pub use provider::ClaudeProvider;
 #[cfg(feature = "runtime")]
 pub use registry::Registry;
+#[cfg(feature = "runtime")]
+pub use storage::SqliteStore;
 #[cfg(feature = "runtime")]
 pub use traits::{Action, Provider, Store, Trigger, Workspace};
 #[cfg(feature = "runtime")]
