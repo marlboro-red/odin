@@ -8,6 +8,16 @@
 //!
 //! v1 is linear (one shared workspace, single attempt, no judge); these are additive
 //! refinements on top of this structure.
+//!
+//! ## Resume semantics
+//!
+//! Each step is checkpointed `Running` before dispatch and to its terminal status after,
+//! so a step interrupted mid-flight by a crash is distinguishable from one not yet
+//! started. On resume, only `Passed`/`Skipped` steps are skipped; a `Running` (or absent)
+//! step is **re-executed from scratch**. Because all steps share one workdir, that
+//! re-execution is **not guaranteed idempotent** in v1 — a step whose side effects
+//! (file edits, a created branch) partially applied before the crash may double-apply.
+//! Per-step commit snapshots are the planned fix.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -131,6 +141,39 @@ impl LocalEngine {
         }
     }
 
+    /// Records a step `Running` and checkpoints it — the durability boundary written
+    /// before dispatch, so a step interrupted mid-flight is distinguishable from one not
+    /// yet started.
+    async fn mark_running(
+        &self,
+        workflow: &Workflow,
+        state: &mut RunState,
+        id: &StepId,
+    ) -> Result<()> {
+        state.steps.insert(
+            id.clone(),
+            StepState {
+                status: StepStatus::Running,
+                attempts: 1,
+                exit_code: None,
+                outputs: IndexMap::new(),
+                usage: None,
+            },
+        );
+        state.updated_at = Utc::now();
+        self.checkpoint(workflow.durable, state).await?;
+        self.emit(
+            state.run_id,
+            RunEvent::StepStarted {
+                step: id.clone(),
+                attempt: 1,
+                at: Utc::now(),
+            },
+        )
+        .await;
+        Ok(())
+    }
+
     /// Resolves declared params (input value or default), erroring on a missing required
     /// one, and passes through any extra provided params.
     fn resolve_params(workflow: &Workflow, input: &RunInput) -> Result<IndexMap<String, Value>> {
@@ -169,7 +212,21 @@ impl LocalEngine {
         let template = if let Some(p) = &provider.prompt {
             p.clone()
         } else if let Some(file) = &provider.prompt_file {
-            std::fs::read_to_string(self.repo_root.join(file))
+            // Contain prompt_file under the repo root: reject absolute paths and `..`
+            // escapes (the path is author-controlled YAML).
+            let resolved = self
+                .repo_root
+                .join(file)
+                .canonicalize()
+                .map_err(|e| format!("reading prompt_file {file:?}: {e}"))?;
+            let root = self
+                .repo_root
+                .canonicalize()
+                .unwrap_or_else(|_| self.repo_root.clone());
+            if !resolved.starts_with(&root) {
+                return Err(format!("prompt_file {file:?} escapes the repository root"));
+            }
+            std::fs::read_to_string(&resolved)
                 .map_err(|e| format!("reading prompt_file {file:?}: {e}"))?
         } else {
             return Err("provider step has no prompt".to_owned());
@@ -331,14 +388,19 @@ impl LocalEngine {
         Ok((out.exit_code, out.stdout))
     }
 
-    /// Captures `git diff` (tracked working-tree changes) in `workdir`, best-effort.
+    /// Captures the working-tree diff in `workdir`, including agent-created files.
+    ///
+    /// Coding agents most often *create* files, which a plain `git diff` (tracked
+    /// changes only) would miss — so we first mark everything intent-to-add
+    /// (`git add -N .`), then diff. Best-effort: a non-git workdir yields `None`.
     async fn capture_diff(&self, workdir: &Path, cancel: &CancelToken) -> Option<String> {
-        let args = vec!["diff".to_owned()];
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             ..ProcessOptions::default()
         };
-        run_process("git", &args, &opts, cancel)
+        let intent_to_add = ["add", "-N", "."].map(str::to_owned);
+        let _ = run_process("git", &intent_to_add, &opts, cancel).await;
+        run_process("git", &["diff".to_owned()], &opts, cancel)
             .await
             .ok()
             .map(|o| o.stdout)
@@ -361,7 +423,13 @@ impl LocalEngine {
         let mut summary = Vec::new();
         let mut side_effects = Vec::new();
         let mut usage = Usage::default();
-        let mut diff: Option<String> = None;
+        // Seed from the persisted DIFF so a resumed run carries it forward (already-passed
+        // steps cannot re-capture it); otherwise a downstream `{{ artifacts.DIFF }}` would
+        // be undefined after a crash.
+        let mut diff: Option<String> = state
+            .artifacts
+            .get(&crate::ids::ArtifactName::new(DIFF))
+            .cloned();
 
         for id in &order {
             let Some(step) = by_id.get(id.as_str()).copied() else {
@@ -396,6 +464,9 @@ impl LocalEngine {
                 workflow,
             );
 
+            // Durability boundary before acting (see `mark_running`).
+            self.mark_running(workflow, state, id).await?;
+
             let outcome = if deps_passed {
                 match step.when.as_deref() {
                     Some(expr) => match eval_when(expr, &ctx) {
@@ -408,16 +479,6 @@ impl LocalEngine {
             } else {
                 StepOutcome::failed("an upstream dependency did not pass").skipped()
             };
-
-            self.emit(
-                state.run_id,
-                RunEvent::StepStarted {
-                    step: id.clone(),
-                    attempt: 1,
-                    at: Utc::now(),
-                },
-            )
-            .await;
 
             if let Some(u) = &outcome.usage {
                 usage.add(*u);
@@ -493,6 +554,39 @@ impl LocalEngine {
         };
         (status, summary)
     }
+
+    /// Marks a run terminally Failed, checkpoints it, and returns its summary. Used by
+    /// `resume_all` so one un-resumable run does not abort recovery of the others.
+    async fn fail_run(
+        &self,
+        workflow: &Workflow,
+        state: &mut RunState,
+        error: &str,
+    ) -> Result<RunSummary> {
+        state.status = RunStatus::Failed;
+        state.error = Some(error.to_owned());
+        state.updated_at = Utc::now();
+        self.checkpoint(workflow.durable, state).await?;
+        Ok(RunSummary {
+            run_id: state.run_id,
+            workflow: state.workflow.clone(),
+            status: RunStatus::Failed,
+            steps: state
+                .steps
+                .iter()
+                .map(|(id, st)| step_result(id, st, IndexMap::new()))
+                .collect(),
+            usage: Usage::default(),
+            side_effects: Vec::new(),
+            diff: state
+                .artifacts
+                .get(&crate::ids::ArtifactName::new(DIFF))
+                .cloned(),
+            error: Some(error.to_owned()),
+            started_at: state.created_at,
+            finished_at: Some(Utc::now()),
+        })
+    }
 }
 
 #[async_trait]
@@ -520,6 +614,7 @@ impl Engine for LocalEngine {
             workflow: workflow.name.clone(),
             schema_major: workflow.schema_version.major,
             status: RunStatus::Running,
+            error: None,
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
@@ -528,7 +623,10 @@ impl Engine for LocalEngine {
             created_at: started_at,
             updated_at: started_at,
         };
-        self.checkpoint(workflow.durable, &state).await?;
+        if let Err(e) = self.checkpoint(workflow.durable, &state).await {
+            let _ = workspace.release(handle).await;
+            return Err(e);
+        }
         self.emit(run_id, RunEvent::RunStarted { at: started_at })
             .await;
 
@@ -559,6 +657,7 @@ impl Engine for LocalEngine {
 
         let (status, summary) = Self::summarize(run_id, workflow, exec, error, started_at);
         state.status = status;
+        state.error = summary.error.clone();
         state.updated_at = Utc::now();
         self.checkpoint(workflow.durable, &state).await?;
         self.emit(
@@ -588,28 +687,51 @@ impl Engine for LocalEngine {
             let Some(handle) = state.workspace.clone() else {
                 continue;
             };
-            let params = Self::resolve_params(workflow, &state.input)?;
             let started_at = state.created_at;
 
-            let cancel = CancelToken::new();
-            let exec = self
-                .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
-                .await?;
-            let _ = self
-                .make_workspace(&workflow.workspace)
-                .release(handle)
-                .await;
-
-            let error = exec
-                .steps
-                .iter()
-                .find(|s| matches!(s.status, StepStatus::Failed))
-                .map(|s| format!("step {:?} failed", s.id.as_str()));
-            let (status, summary) =
-                Self::summarize(state.run_id, workflow, exec, error, started_at);
-            state.status = status;
-            state.updated_at = Utc::now();
-            self.checkpoint(workflow.durable, &state).await?;
+            // Crash recovery is per-run, never all-or-nothing: one run's failure must not
+            // abort the others or leave it stuck Running forever.
+            let summary = if handle.path.exists() {
+                match Self::resolve_params(workflow, &state.input) {
+                    Ok(params) => {
+                        let cancel = CancelToken::new();
+                        let exec = self
+                            .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
+                            .await;
+                        let _ = self
+                            .make_workspace(&workflow.workspace)
+                            .release(handle)
+                            .await;
+                        match exec {
+                            Ok(result) => {
+                                let error = result
+                                    .steps
+                                    .iter()
+                                    .find(|s| matches!(s.status, StepStatus::Failed))
+                                    .map(|s| format!("step {:?} failed", s.id.as_str()));
+                                let (status, summary) = Self::summarize(
+                                    state.run_id,
+                                    workflow,
+                                    result,
+                                    error,
+                                    started_at,
+                                );
+                                state.status = status;
+                                state.error = summary.error.clone();
+                                state.updated_at = Utc::now();
+                                self.checkpoint(workflow.durable, &state).await?;
+                                summary
+                            }
+                            Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
+                        }
+                    }
+                    Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
+                }
+            } else {
+                // The workspace is gone (host moved, manual cleanup); cannot resume.
+                self.fail_run(workflow, &mut state, "workspace is gone; cannot resume")
+                    .await?
+            };
             summaries.push(summary);
         }
         Ok(summaries)
@@ -627,6 +749,10 @@ impl Engine for LocalEngine {
             .iter()
             .map(|(id, st)| step_result(id, st, IndexMap::new()))
             .collect();
+        let diff = state
+            .artifacts
+            .get(&crate::ids::ArtifactName::new(DIFF))
+            .cloned();
         Ok(Some(RunSummary {
             run_id: state.run_id,
             workflow: state.workflow,
@@ -634,11 +760,8 @@ impl Engine for LocalEngine {
             steps,
             usage: Usage::default(),
             side_effects: Vec::new(),
-            diff: state
-                .artifacts
-                .get(&crate::ids::ArtifactName::new(DIFF))
-                .cloned(),
-            error: None,
+            diff,
+            error: state.error,
             started_at: state.created_at,
             finished_at: Some(state.updated_at),
         }))
@@ -886,6 +1009,7 @@ steps:
             workflow: wf.name.clone(),
             schema_major: 1,
             status: RunStatus::Running,
+            error: None,
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
@@ -913,5 +1037,163 @@ steps:
             "remaining steps executed on resume"
         );
         assert_eq!(by("review"), StepStatus::Passed);
+    }
+
+    #[tokio::test]
+    async fn resume_uses_the_persisted_diff() {
+        // greet+edit pre-completed with a persisted DIFF; only `review` (which templates
+        // {{ artifacts.DIFF }}) remains. The DIFF must come from persisted state, since
+        // already-passed steps cannot re-capture it. (Regression for the resume blocker.)
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(HAPPY);
+
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: wf.workspace.clone(),
+            })
+            .await
+            .unwrap();
+        let mut steps = IndexMap::new();
+        for id in ["greet", "edit"] {
+            steps.insert(
+                StepId::new(id),
+                StepState {
+                    status: StepStatus::Passed,
+                    attempts: 1,
+                    exit_code: Some(0),
+                    outputs: IndexMap::new(),
+                    usage: None,
+                },
+            );
+        }
+        let mut artifacts = IndexMap::new();
+        artifacts.insert(
+            crate::ids::ArtifactName::new(DIFF),
+            "+a tracked change\n".to_owned(),
+        );
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts,
+            provider_versions: IndexMap::new(),
+            input: RunInput::manual().param("who", "resumed"),
+            workspace: Some(handle),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        let review = summaries[0]
+            .steps
+            .iter()
+            .find(|s| s.id.as_str() == "review")
+            .unwrap();
+        assert_eq!(
+            summaries[0].status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summaries[0].error
+        );
+        assert_eq!(review.status, StepStatus::Passed);
+        assert!(
+            review.outputs["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("a tracked change")
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_captures_newly_created_files() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: newfile\nworkspace: { type: worktree }\nsteps:\n  - {id: make, run: \"echo content > brand-new.txt\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Succeeded);
+        assert!(
+            summary
+                .diff
+                .as_deref()
+                .unwrap_or("")
+                .contains("brand-new.txt"),
+            "diff must include the created file, got: {:?}",
+            summary.diff
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_fails_a_run_whose_workspace_is_gone_without_aborting() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(HAPPY);
+        let run_id = RunId::new();
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps: IndexMap::new(),
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            input: RunInput::manual().param("who", "x"),
+            workspace: Some(crate::traits::WorkspaceHandle {
+                run_id,
+                path: repo.path().join(".odin/worktrees/does-not-exist"),
+                branch: None,
+                token: "x".to_owned(),
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].status, RunStatus::Failed);
+        assert!(
+            summaries[0]
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("workspace is gone")
+        );
+        // Marked terminal, so it won't be re-resumed forever.
+        assert!(store.load_incomplete().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reloaded_summary_surfaces_the_failure() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: boom\nworkspace: { type: worktree }\nsteps:\n  - {id: x, run: \"exit 2\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Failed);
+
+        let reloaded = eng.summary(summary.run_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.status, RunStatus::Failed);
+        assert!(
+            reloaded.error.is_some(),
+            "a reloaded failed run must surface its error"
+        );
     }
 }

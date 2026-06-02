@@ -143,8 +143,13 @@ pub async fn run_process(
         }
     };
 
-    let stdout = String::from_utf8_lossy(&out_task.await.unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&err_task.await.unwrap_or_default()).into_owned();
+    // After a kill, bound how long we wait to drain the pipes. A surviving grandchild
+    // (e.g. a backgrounded process in `sh -c`, or an agent's tool subprocess) can keep
+    // the stdout/stderr fd open, and `read_to_end` would otherwise block forever —
+    // defeating the very timeout/cancel that just fired.
+    let killed = timed_out || cancelled;
+    let stdout = collect(out_task, killed).await;
+    let stderr = collect(err_task, killed).await;
     let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
 
     Ok(ProcessOutput {
@@ -162,6 +167,27 @@ async fn sleep_opt(d: Option<Duration>) {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending::<()>().await,
     }
+}
+
+/// How long to keep draining a killed child's pipes before abandoning partial output.
+const KILL_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Joins a reader task. On the normal path it awaits fully; after a kill it bounds the
+/// wait by a grace period and then aborts the task, so a surviving grandchild holding the
+/// pipe open cannot hang the call.
+async fn collect(task: tokio::task::JoinHandle<Vec<u8>>, killed: bool) -> String {
+    let bytes = if killed {
+        let abort = task.abort_handle();
+        if let Ok(Ok(b)) = tokio::time::timeout(KILL_DRAIN_GRACE, task).await {
+            b
+        } else {
+            abort.abort();
+            Vec::new()
+        }
+    } else {
+        task.await.unwrap_or_default()
+    };
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(all(test, unix))]
@@ -234,6 +260,32 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ProviderError::NotFound(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_even_if_a_grandchild_holds_the_pipe() {
+        // The backgrounded `sleep 10` inherits the stdout pipe and outlives its parent
+        // `sh`, which is killed at the timeout. Without bounding the reader drain, this
+        // would block until the grandchild exits (~10s); with the fix it returns promptly.
+        let opts = ProcessOptions {
+            timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let out = run_process(
+            "sh",
+            &args(&["-c", "sleep 10 & echo go; sleep 10"]),
+            &opts,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(out.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "run_process must return promptly after timeout, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,9 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
         let (key, value) = pair
             .split_once('=')
             .with_context(|| format!("--param must be KEY=VALUE, got {pair:?}"))?;
+        if key.trim().is_empty() {
+            anyhow::bail!("--param key must be non-empty, got {pair:?}");
+        }
         input.params.insert(key.to_owned(), parse_value(value));
     }
 

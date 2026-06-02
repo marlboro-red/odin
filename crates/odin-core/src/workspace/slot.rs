@@ -62,7 +62,9 @@ impl SlotPoolWorkspace {
         }
         tokio::fs::create_dir_all(&self.pool_dir).await?;
         let repo = self.repo_root.to_string_lossy().into_owned();
-        let mut free = self.free.lock().await;
+        // Clone every slot first; publish the free indices only once they ALL succeed, so
+        // a failed-then-retried init can never push the same index twice (which would let
+        // two runs claim one slot).
         for i in 0..self.size {
             let slot = self.slot_path(i);
             if !slot.exists() {
@@ -73,8 +75,10 @@ impl SlotPoolWorkspace {
                 )
                 .await?;
             }
-            free.push_back(i);
         }
+        let mut free = self.free.lock().await;
+        free.clear();
+        free.extend(0..self.size);
         *done = true;
         Ok(())
     }

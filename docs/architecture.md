@@ -205,6 +205,27 @@ resumes each non-terminal run. `RunState` carries enough to resume deterministic
 original `RunInput`, per-step progress, the resolved artifact catalogue, the workspace
 lease, and the provider versions actually used.
 
+## Security & trust boundaries
+
+A workflow is **executable code**: `run:` steps and gate commands are rendered (with
+the run's `params` and `trigger_payload` interpolated) and executed via `sh -c`, and
+provider steps drive autonomous coding agents. Treat a workflow file and its inputs with
+the same trust as a shell script you are about to run.
+
+- **`params` and `trigger_payload` are interpolated into shell commands without
+  escaping.** They are surfaced as `params.*` / `trigger.*` and can be referenced from
+  `run:` / gate templates. A workflow *author* controls the template, so this is safe for
+  author-supplied params — but a `trigger_payload` assembled from an **untrusted source**
+  (a webhook) must never be interpolated raw into a `run:`/gate command. The daemon
+  milestone, which turns external events into runs, must enforce this boundary (quote/
+  escape, or restrict untrusted values to provider prompts only).
+- **Run agents in a sandbox.** Provider steps execute real coding-agent CLIs with
+  file/shell access in the run's workspace. Per-run worktrees and the slot pool isolate
+  the working tree, not the host; run the engine where that blast radius is acceptable.
+- **`prompt_file` is contained** under the repository root (absolute paths and `..`
+  escapes are rejected), and git invocations use `--` to prevent argument injection from
+  config values.
+
 ## Forward-compatibility seams
 
 Kept because they are cheap; everything else was cut as speculative.

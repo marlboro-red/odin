@@ -67,6 +67,9 @@ pub struct RunState {
     pub schema_major: u16,
     /// Overall status.
     pub status: RunStatus,
+    /// Terminal error string, if the run failed. `None` while running or on success.
+    #[serde(default)]
+    pub error: Option<String>,
     /// Per-step progress, keyed by step id, in execution order.
     pub steps: IndexMap<StepId, StepState>,
     /// Resolved artifact catalogue: name → path relative to the workdir.

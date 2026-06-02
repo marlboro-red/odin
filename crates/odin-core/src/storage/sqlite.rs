@@ -44,7 +44,7 @@ impl SqliteStore {
     /// # Errors
     /// Returns [`StoreError::Backend`] if the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        Self::from_conn(db(Connection::open(path))?)
+        Self::from_conn(db(Connection::open(path))?, true)
     }
 
     /// Opens an ephemeral in-memory store (for tests).
@@ -52,10 +52,16 @@ impl SqliteStore {
     /// # Errors
     /// Returns [`StoreError::Backend`] if the database cannot be created.
     pub fn open_in_memory() -> Result<Self, StoreError> {
-        Self::from_conn(db(Connection::open_in_memory())?)
+        Self::from_conn(db(Connection::open_in_memory())?, false)
     }
 
-    fn from_conn(conn: Connection) -> Result<Self, StoreError> {
+    fn from_conn(conn: Connection, wal: bool) -> Result<Self, StoreError> {
+        // A shared on-disk DB can be opened by a second `odin run`/reader; make writers
+        // wait rather than fail with SQLITE_BUSY, and use WAL so readers don't block.
+        db(conn.busy_timeout(std::time::Duration::from_secs(5)))?;
+        if wal {
+            let _: String = db(conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0)))?;
+        }
         db(conn.execute_batch(SCHEMA))?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -110,13 +116,23 @@ impl Store for SqliteStore {
     }
 
     async fn load_incomplete(&self) -> Result<Vec<RunState>, StoreError> {
+        // Derive the terminal strings via status_str so the filter can't drift from the
+        // serde representation of RunStatus. (Keep this list in sync with is_terminal.)
+        let terminal = [
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ]
+        .map(status_str);
         let conn = self.conn.lock().await;
         let mut stmt = db(conn.prepare(
-            "SELECT state FROM runs
-             WHERE status NOT IN ('succeeded', 'failed', 'cancelled')
-             ORDER BY updated_at",
+            "SELECT state FROM runs WHERE status NOT IN (?1, ?2, ?3) ORDER BY updated_at",
         ))?;
-        let rows = db(stmt.query_map([], |row| row.get::<_, String>(0)))?;
+        let rows = db(
+            stmt.query_map(params![terminal[0], terminal[1], terminal[2]], |row| {
+                row.get::<_, String>(0)
+            }),
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(serde_json::from_str(&db(row)?)?);
@@ -163,6 +179,7 @@ mod tests {
             workflow: WorkflowId::new("w"),
             schema_major: 1,
             status,
+            error: None,
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),

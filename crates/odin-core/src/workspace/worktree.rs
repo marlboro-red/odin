@@ -47,7 +47,16 @@ impl Workspace for WorktreeWorkspace {
         tokio::fs::create_dir_all(self.worktrees_dir()).await?;
 
         let path_str = path.to_string_lossy().into_owned();
-        let mut args = vec!["worktree", "add", "-b", branch.as_str(), path_str.as_str()];
+        // `--` terminates options so a `base` (or path) beginning with `-` can't be
+        // reinterpreted by git as a flag.
+        let mut args = vec![
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            "--",
+            path_str.as_str(),
+        ];
         if let Some(b) = base.as_deref() {
             args.push(b);
         }

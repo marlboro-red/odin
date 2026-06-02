@@ -183,6 +183,7 @@ mod tests {
             workflow: WorkflowId::new("w"),
             schema_major: 1,
             status,
+            error: None,
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
