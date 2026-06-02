@@ -49,6 +49,8 @@ pub mod provider;
 pub mod registry;
 #[cfg(feature = "runtime")]
 pub mod traits;
+#[cfg(feature = "runtime")]
+pub mod workspace;
 
 pub use api::{RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus};
 pub use error::{
@@ -72,6 +74,8 @@ pub use provider::ClaudeProvider;
 pub use registry::Registry;
 #[cfg(feature = "runtime")]
 pub use traits::{Action, Provider, Store, Trigger, Workspace};
+#[cfg(feature = "runtime")]
+pub use workspace::{SlotPoolWorkspace, WorktreeWorkspace};
 
 /// The version string of `odin-core`, taken from `Cargo.toml` at build time.
 ///
