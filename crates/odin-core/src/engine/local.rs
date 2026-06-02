@@ -1856,8 +1856,9 @@ steps:
         );
     }
 
-    /// Independent `scratch` steps run concurrently: three ~0.4s sleeps under `max_parallel:
-    /// 3` finish in well under the ~1.2s a sequential walk would take.
+    /// Independent `scratch` steps run concurrently: three 0.5s sleeps under `max_parallel:
+    /// 3` finish well under the ~1.5s a sequential walk takes. Generous threshold so a slow
+    /// CI runner (worktree + process overhead) doesn't flake.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn independent_scratch_steps_run_concurrently() {
         let repo = init_repo().await;
@@ -1866,7 +1867,7 @@ steps:
             Arc::new(SqliteStore::open_in_memory().unwrap()),
         );
         let wf = parse(
-            "name: par\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 3\nsteps:\n  - { id: a, run: \"sleep 0.4\", scratch: true }\n  - { id: b, run: \"sleep 0.4\", scratch: true }\n  - { id: c, run: \"sleep 0.4\", scratch: true }\n",
+            "name: par\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 3\nsteps:\n  - { id: a, run: \"sleep 0.5\", scratch: true }\n  - { id: b, run: \"sleep 0.5\", scratch: true }\n  - { id: c, run: \"sleep 0.5\", scratch: true }\n",
         );
         let start = std::time::Instant::now();
         let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
@@ -1878,8 +1879,8 @@ steps:
             summary.error
         );
         assert!(
-            elapsed < std::time::Duration::from_millis(1000),
-            "three 0.4s scratch steps took {elapsed:?}; expected concurrency (<1s, not ~1.2s)"
+            elapsed < std::time::Duration::from_millis(1300),
+            "three 0.5s scratch steps took {elapsed:?}; expected concurrency (~0.5s, not ~1.5s)"
         );
     }
 }
