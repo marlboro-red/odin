@@ -39,7 +39,9 @@ pub struct SlotPoolConfig {
     /// How a slot is reset before reuse.
     #[serde(default)]
     pub reset: ResetMode,
-    /// Base branch/ref slots are cut from. Defaults to repo `HEAD`.
+    /// Base branch/ref. **Not yet honored** by the slot pool — slots are cloned from the
+    /// repo's current checkout; reserved for parity with the worktree workspace (whose `base`
+    /// *is* applied). Defaults to repo `HEAD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
 }

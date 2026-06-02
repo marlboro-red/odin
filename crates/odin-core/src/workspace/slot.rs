@@ -3,8 +3,15 @@
 //! Unlike worktrees (which share one `.git`), each slot is an independent local clone,
 //! so N runs get N genuinely independent checkouts. The pool size caps concurrency:
 //! `acquire` **blocks** when every slot is in use until one is released.
+//!
+//! The pool must be a **single shared instance** for the cap to hold — the engine caches one
+//! per (kind, config) so all concurrent runs share it (see `LocalEngine::make_workspace`).
+//! Lease state is **in-memory**: it is *not* durable across a process restart. So a run that
+//! is resumed after a daemon restart executes against its persisted slot path, but the fresh
+//! pool no longer knows that slot is leased — if you need bounded concurrency *and*
+//! crash-resume across restarts, prefer the `worktree` workspace.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -27,6 +34,10 @@ pub struct SlotPoolWorkspace {
     slots: Semaphore,
     /// Guards one-time lazy cloning of the slots.
     initialized: Mutex<bool>,
+    /// Slot indices this instance has handed out and not yet reclaimed. `release` only frees a
+    /// slot recorded here, so a stray/duplicate release (or a `release` on a fresh instance
+    /// after a restart) can't inject a phantom permit that lets the pool over-hand-out slots.
+    leased: Mutex<HashSet<usize>>,
 }
 
 impl SlotPoolWorkspace {
@@ -47,6 +58,7 @@ impl SlotPoolWorkspace {
             free: Mutex::new(VecDeque::new()),
             slots: Semaphore::new(size),
             initialized: Mutex::new(false),
+            leased: Mutex::new(HashSet::new()),
         }
     }
 
@@ -144,6 +156,7 @@ impl Workspace for SlotPoolWorkspace {
             self.return_slot(index).await;
             return Err(e);
         }
+        self.leased.lock().await.insert(index);
 
         Ok(WorkspaceHandle::new(
             ctx.run_id,
@@ -158,7 +171,12 @@ impl Workspace for SlotPoolWorkspace {
             .token
             .parse()
             .map_err(|_| WorkspaceError::Git(format!("invalid slot token {:?}", handle.token)))?;
-        self.return_slot(index).await;
+        // Only reclaim a slot THIS instance leased. A release of an index we never handed out
+        // — a double-release, or a resume after a restart on a fresh pool — must not push a
+        // phantom permit (which would let the pool hand out more than `size` slots at once).
+        if self.leased.lock().await.remove(&index) {
+            self.return_slot(index).await;
+        }
         Ok(())
     }
 }
@@ -168,7 +186,7 @@ mod tests {
     use super::SlotPoolWorkspace;
     use crate::ids::RunId;
     use crate::ir::{ResetMode, SlotPoolConfig, WorkspaceConfig};
-    use crate::traits::{AcquireCtx, Workspace};
+    use crate::traits::{AcquireCtx, Workspace, WorkspaceHandle};
     use crate::workspace::testutil::init_repo;
     use std::sync::Arc;
     use std::time::Duration;
@@ -234,5 +252,41 @@ mod tests {
         let h2 = pending.await.unwrap().unwrap();
         assert!(h2.path.exists());
         ws.release(h2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_release_does_not_inject_a_phantom_permit() {
+        // A release of a slot this instance didn't lease (a double-release, or a resume after
+        // a restart) must NOT raise the pool's concurrency cap.
+        let repo = init_repo().await;
+        let pool = tempfile::tempdir().unwrap();
+        let ws = Arc::new(SlotPoolWorkspace::new(
+            repo.path(),
+            pool.path(),
+            1,
+            ResetMode::GitClean,
+        ));
+
+        let h1 = ws.acquire(ctx()).await.unwrap();
+        let token = h1.token.clone();
+        ws.release(h1).await.unwrap();
+        // Re-release the same (now-unleased) token — must be a no-op.
+        let stale = WorkspaceHandle::new(RunId::new(), pool.path().join("slot-0"), None, token);
+        ws.release(stale).await.unwrap();
+
+        // Hold the single slot; a second acquire must still BLOCK (cap = 1). If the stale
+        // release had added a phantom permit, this would wrongly succeed immediately.
+        let h2 = ws.acquire(ctx()).await.unwrap();
+        let ws2 = Arc::clone(&ws);
+        let pending = tokio::spawn(async move { ws2.acquire(ctx()).await });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !pending.is_finished(),
+            "a stale release must not raise the pool cap"
+        );
+
+        ws.release(h2).await.unwrap();
+        let h3 = pending.await.unwrap().unwrap();
+        ws.release(h3).await.unwrap();
     }
 }
