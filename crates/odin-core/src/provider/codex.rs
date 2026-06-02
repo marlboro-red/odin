@@ -97,16 +97,6 @@ impl CodexProvider {
         args.push(prompt);
         args
     }
-
-    /// Formats this provider's version string, folding in the pinned model when set. Surfaced
-    /// via `Provider::version`; once provider-version capture is wired into run state, it makes
-    /// two runs that differ only by model distinguishable for reproducibility.
-    fn version_string(&self, cli_version: &str) -> String {
-        match &self.model {
-            Some(model) => format!("{cli_version} (model={model})"),
-            None => cli_version.to_owned(),
-        }
-    }
 }
 
 impl Default for CodexProvider {
@@ -176,7 +166,7 @@ impl Provider for CodexProvider {
         .await
         .ok()?;
         let v = out.stdout.trim();
-        (!v.is_empty()).then(|| self.version_string(v))
+        (!v.is_empty()).then(|| v.to_owned())
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -260,17 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn version_string_folds_in_the_pinned_model() {
-        assert_eq!(CodexProvider::new().version_string("0.136.0"), "0.136.0");
-        assert_eq!(
-            CodexProvider::new()
-                .with_model("gpt-5.5")
-                .version_string("0.136.0"),
-            "0.136.0 (model=gpt-5.5)"
-        );
-    }
-
-    #[test]
     fn with_model_inserts_model_before_the_trailing_prompt() {
         let args = CodexProvider::new().with_model("gpt-5.2-codex").build_args(
             "do it".to_owned(),
@@ -287,8 +266,13 @@ mod tests {
             pos + 1 < args.len() - 1,
             "model must come before the prompt"
         );
-        // The sandbox defaults still survive alongside the model.
-        assert!(args.iter().any(|a| a == "--skip-git-repo-check"));
+        // The sandbox defaults still survive, and `--model` is appended *after* them (the
+        // documented compose contract: a later `with_model` pin wins over extra args).
+        let sandbox = args
+            .iter()
+            .position(|a| a == "--skip-git-repo-check")
+            .unwrap();
+        assert!(pos > sandbox, "--model must follow extra_args: {args:?}");
     }
 
     #[test]

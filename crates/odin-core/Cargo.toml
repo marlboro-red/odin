@@ -69,3 +69,8 @@ full = ["ir", "templating", "runtime"]
 [[example]]
 name = "cross_model_review"
 required-features = ["runtime", "templating"]
+
+# Codex-only smoke (no Claude calls) for cheap iteration on the codex integration.
+[[example]]
+name = "codex_smoke"
+required-features = ["runtime", "templating"]

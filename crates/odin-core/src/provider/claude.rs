@@ -98,16 +98,6 @@ impl ClaudeProvider {
         }
         args
     }
-
-    /// Formats this provider's version string, folding in the pinned model when set. Surfaced
-    /// via `Provider::version`; once provider-version capture is wired into run state, it makes
-    /// two runs that differ only by model distinguishable for reproducibility.
-    fn version_string(&self, cli_version: &str) -> String {
-        match &self.model {
-            Some(model) => format!("{cli_version} (model={model})"),
-            None => cli_version.to_owned(),
-        }
-    }
 }
 
 impl Default for ClaudeProvider {
@@ -158,7 +148,7 @@ impl Provider for ClaudeProvider {
         .await
         .ok()?;
         let v = out.stdout.trim();
-        (!v.is_empty()).then(|| self.version_string(v))
+        (!v.is_empty()).then(|| v.to_owned())
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -235,17 +225,6 @@ mod tests {
     }
 
     #[test]
-    fn version_string_folds_in_the_pinned_model() {
-        assert_eq!(ClaudeProvider::new().version_string("2.1.160"), "2.1.160");
-        assert_eq!(
-            ClaudeProvider::new()
-                .with_model("claude-opus-4-8")
-                .version_string("2.1.160"),
-            "2.1.160 (model=claude-opus-4-8)"
-        );
-    }
-
-    #[test]
     fn with_model_appends_a_model_flag() {
         let args = ClaudeProvider::new()
             .with_model("claude-opus-4-8")
@@ -259,6 +238,19 @@ mod tests {
                 .iter()
                 .any(|a| a == "--model")
         );
+    }
+
+    #[test]
+    fn pinned_model_is_appended_after_extra_args() {
+        // The documented compose contract: `--model` lands AFTER `with_extra_args`, so a
+        // later `with_model` pin wins (last-position) over anything in the extra args.
+        let args = ClaudeProvider::new()
+            .with_extra_args(vec!["--permission-mode".to_owned(), "plan".to_owned()])
+            .with_model("claude-opus-4-8")
+            .build_args("hi".to_owned());
+        let extra = args.iter().position(|a| a == "--permission-mode").unwrap();
+        let model = args.iter().position(|a| a == "--model").unwrap();
+        assert!(model > extra, "--model must follow extra_args: {args:?}");
     }
 
     #[test]

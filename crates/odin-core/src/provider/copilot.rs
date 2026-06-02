@@ -97,16 +97,6 @@ impl CopilotProvider {
         }
         args
     }
-
-    /// Formats this provider's version string, folding in the pinned model when set. Surfaced
-    /// via `Provider::version`; once provider-version capture is wired into run state, it makes
-    /// two runs that differ only by model distinguishable for reproducibility.
-    fn version_string(&self, cli_version: &str) -> String {
-        match &self.model {
-            Some(model) => format!("{cli_version} (model={model})"),
-            None => cli_version.to_owned(),
-        }
-    }
 }
 
 impl Default for CopilotProvider {
@@ -159,7 +149,7 @@ impl Provider for CopilotProvider {
         .await
         .ok()?;
         let v = out.stdout.trim();
-        (!v.is_empty()).then(|| self.version_string(v))
+        (!v.is_empty()).then(|| v.to_owned())
     }
 
     async fn health_check(&self) -> Result<(), ProviderError> {
@@ -236,25 +226,16 @@ mod tests {
     }
 
     #[test]
-    fn version_string_folds_in_the_pinned_model() {
-        assert_eq!(CopilotProvider::new().version_string("1.0.57"), "1.0.57");
-        assert_eq!(
-            CopilotProvider::new()
-                .with_model("gpt-5.2")
-                .version_string("1.0.57"),
-            "1.0.57 (model=gpt-5.2)"
-        );
-    }
-
-    #[test]
     fn with_model_appends_a_model_flag() {
         let args = CopilotProvider::new()
             .with_model("gpt-5.2")
             .build_args("hi".to_owned(), "/wd".to_owned());
         let pos = args.iter().position(|a| a == "--model").expect("--model");
         assert_eq!(args[pos + 1], "gpt-5.2");
-        // The permission defaults still survive alongside the model.
-        assert!(args.iter().any(|a| a == "--allow-all"));
+        // The permission defaults still survive, and `--model` is appended *after* them
+        // (the documented compose contract: a later `with_model` pin wins over extra args).
+        let allow = args.iter().position(|a| a == "--allow-all").unwrap();
+        assert!(pos > allow, "--model must follow extra_args: {args:?}");
     }
 
     #[test]
