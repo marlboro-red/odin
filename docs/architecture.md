@@ -208,11 +208,13 @@ do not.
 | ODIN026 | warning | the schema minor is newer than this engine |
 | ODIN027 | warning | a `github_webhook` trigger maps a param not declared in `params` (inert) |
 | ODIN028 | warning | an `action` step sets `scratch: true` (its side effects are discarded) |
+| ODIN029 | warning | a template accesses a checked root with subscript syntax (`steps["a"]`), escaping the static ref checks |
+| ODIN030 | error | a param's `default` matches its declared `type` |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
 nested fields, invalid durations, and a step with zero or more than one kind. The full
 per-field catalogue with exact trigger conditions is in the
-[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin028).
+[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin030).
 
 ## Concurrency
 

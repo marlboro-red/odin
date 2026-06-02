@@ -418,26 +418,51 @@ there are *error*-severity diagnostics (warnings alone pass).
 
 The `odin-daemon` crate turns events into runs. Compose a [`Daemon`] (the supervisor loop +
 concurrency + graceful drain) with cron triggers (derived from workflows) and a
-[`WebhookServer`], all sharing one shutdown token:
+[`WebhookServer`], all sharing one shutdown token. Embedding it adds two dependencies
+beyond `odin-core`:
+
+```toml
+[dependencies]
+odin-daemon = "0.0.1"
+tokio = { version = "1", features = ["full"] }   # for the runtime + tokio::join!
+```
 
 ```rust
+use std::sync::Arc;
+use odin_core::ir::TriggerDecl;
 use odin_daemon::{Daemon, WebhookServer};
 
-// Cron triggers are derived from each workflow's `triggers:`; tune concurrency.
-let mut daemon = Daemon::from_workflows(engine, workflows)?
-    .with_max_concurrent_runs(8);
+// `engine: Arc<dyn Engine>` and `workflows: Vec<Workflow>` from the steps above;
+// `secret: String` is your GitHub webhook HMAC secret. (This body is inside an
+// `async fn` returning `anyhow::Result<()>`.)
 
-// Wire any GitHub webhook triggers into a shared HTTP server.
+// 1. Subscribe every `github_webhook` trigger to a shared HTTP server — BEFORE the
+//    workflows move into the daemon. `subscribe` returns the pull-side `Trigger` to register.
 let mut server = WebhookServer::new("127.0.0.1:9292".parse()?, Some(secret));
-for wf in &workflow_list {
-    for decl in webhook_decls(wf) {
-        daemon.add_trigger(Box::new(server.subscribe(decl, wf.name.clone())));
+let mut webhook_triggers = Vec::new();
+for workflow in &workflows {
+    for decl in &workflow.triggers {
+        if let TriggerDecl::GithubWebhook(github) = decl {
+            webhook_triggers.push(server.subscribe(github, workflow.name.clone()));
+        }
     }
 }
 
-let shutdown = daemon.cancellation_token();   // cancel this (e.g. on ctrl-c) to drain & stop
+// 2. Build the daemon (this moves `workflows`). Cron triggers are derived from each
+//    workflow's `triggers:`; tune concurrency, then register the webhook triggers.
+let mut daemon = Daemon::from_workflows(engine, workflows)?.with_max_concurrent_runs(8);
+for trigger in webhook_triggers {
+    daemon.add_trigger(Box::new(trigger));
+}
+
+// 3. Cancel this token (e.g. on ctrl-c) to stop accepting events and drain in-flight runs.
+let shutdown = daemon.cancellation_token();
+
+// 4. Drive the supervisor loop and the HTTP server together; both end on shutdown.
+//    `tokio::join!` yields one `Result` per task — propagate them, don't drop them.
 let bound = server.bind().await?;
-tokio::join!(daemon.run(), bound.serve(shutdown));
+let (daemon_res, server_res) = tokio::join!(daemon.run(), bound.serve(shutdown));
+daemon_res.and(server_res)?;
 ```
 
 To add an *entirely new* event source (a message queue, a poller), implement
@@ -455,7 +480,7 @@ crashes on) a failing run, and drains in-flight runs on shutdown.
 | Actions | `ShellExec` → `shell.exec`, `GitCommit` → `git.commit`, `GitPush` → `git.push`, `OpenPr` → `github.open_pr` |
 | Workspaces | `WorktreeWorkspace::new(repo)`, `SlotPoolWorkspace::new(repo, pool_dir, size, reset)` |
 | Store | `SqliteStore::open(path)`, `SqliteStore::open_in_memory()` |
-| Mocks (`mock` feature) | `EchoProvider`, `TmpWorkspace`, `MemStore`, `NoopAction`, `ScriptedTrigger` |
+| Mocks (`mock` feature) | under `odin_core::mock::` — `EchoProvider`, `TmpWorkspace`, `MemStore`, `NoopAction`, `ScriptedTrigger` |
 
 For the full type-level API, run `cargo doc --open -p odin-core --all-features`.
 

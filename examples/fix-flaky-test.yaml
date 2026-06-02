@@ -13,9 +13,11 @@
 #
 #   odin validate examples/fix-flaky-test.yaml
 #
-# NOTE: `prompt_file` is resolved relative to the run's --repo root. This file's prompt lives
-# at examples/prompts/implement.j2, so to *run* this workflow point --repo at examples/:
-#   odin run examples/fix-flaky-test.yaml --repo examples --param issue_number=1
+# This is a VALIDATION showcase, not runnable as-is: the `slot_pool` workspace `git clone`s
+# the --repo root (so --repo must be a git repository — `examples/` is not one), it targets a
+# private repo + a real GitHub issue, and its `provider:` steps need the real claude/codex
+# CLIs. (`prompt_file` is resolved relative to the run's --repo root at run time; this one
+# references prompts/implement.j2.) For a smaller end-to-end run, start from the README quickstart.
 
 schema_version: "1.0"
 name: fix-flaky-test
