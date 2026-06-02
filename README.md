@@ -13,10 +13,11 @@ every step checkpointed so a crashed run resumes where it left off.
 > traits, the durable SQLite store, the worktree + slot-pool workspaces, all three provider
 > adapters (Claude / Codex / Copilot), the built-in actions (`shell.exec`, `git.commit`,
 > `git.push`, `github.open_pr`), LLM-as-judge + retry, the concurrent executor
-> (`max_parallel` + isolated `scratch:` steps for multi-agent fan-out), the `odin` CLI
-> (`validate` / `run` / `list` / `show` / `logs`), and the `odind` daemon — cron schedules
-> *and* signed GitHub webhooks, with concurrent run dispatch — are all implemented, tested,
-> and documented. Refinements still open: per-step commit snapshots, codex/copilot cost.
+> (`max_parallel` + isolated `scratch:` steps for multi-agent fan-out), durable crash-resume
+> with per-step git snapshots, the `odin` CLI (`validate` / `run` / `list` / `show` / `logs`),
+> and the `odind` daemon — cron schedules *and* signed GitHub webhooks, with concurrent run
+> dispatch — are all implemented, tested, and documented. Refinements still open: codex/copilot
+> dollar-cost reporting (token usage is parsed) and provider routing/fallback.
 
 ## Quickstart
 
@@ -76,11 +77,14 @@ steps:
     action: github.open_pr
     with: { title: "Implement {{ params.issue_url }}" }
     depends_on: [review]
-    when: "steps.review.outputs.passed == true"
+    when: "steps.review.status == 'passed'"
 ```
 
-See [`examples/`](examples/) for fully-annotated workflows, including
-[`fix-flaky-test.yaml`](examples/fix-flaky-test.yaml), which exercises every IR feature.
+See [`examples/`](examples/) for fully-annotated workflows:
+[`issue-to-pr.yaml`](examples/issue-to-pr.yaml) (the canonical flow),
+[`fix-flaky-test.yaml`](examples/fix-flaky-test.yaml) (a kitchen-sink of step/trigger kinds),
+[`nightly-maintenance.yaml`](examples/nightly-maintenance.yaml) (cron-served), and
+[`multi-agent-eval.yaml`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out).
 
 ## Why "library-first"?
 
@@ -112,9 +116,12 @@ A parse-only embedder (a linter or an editor plugin) pays nothing for the async 
 |---------|----------|------------|
 | `ir` | serde only | parse + validate workflows |
 | `templating` | minijinja | render prompts + statically check `{{ refs }}` |
-| `runtime` | tokio, async-trait | the five traits, the registry, the engine |
-| `mock` | (runtime) | Noop trait impls for downstream tests |
-| `full` *(default)* | all of the above | |
+| `runtime` | tokio, async-trait | the five traits, the registry, provider/store/workspace/action impls |
+| `mock` | (`runtime`) | in-memory test doubles (`EchoProvider`, `MemStore`, …) for downstream tests |
+| `full` *(default)* | `ir` + `templating` + `runtime` | running workflows, the CLI, the daemon |
+
+The `Engine` façade needs **both** `runtime` and `templating` (it renders prompts), so `full`
+bundles both. `mock` is opt-in and is *not* part of `full`.
 
 ```toml
 # A linter that only parses and validates:
@@ -123,10 +130,13 @@ odin-core = { version = "0.0.1", default-features = false, features = ["ir", "te
 
 ## Documentation
 
-- [`docs/architecture.md`](docs/architecture.md) — the layered design, the integration
-  surface, the data-flow contracts, and the full `ODIN###` diagnostic catalogue.
-- [`docs/design/foundation-blueprint.md`](docs/design/foundation-blueprint.md) — the
-  detailed implementation blueprint the foundation was built from.
+- [Getting started](docs/getting-started.md) — build → validate → run → serve.
+- [Workflow reference](docs/workflow-reference.md) — every YAML field and all 28 `ODIN###`
+  diagnostics.
+- [Integration guide](docs/integration-guide.md) — embed `odin-core`: the five traits,
+  `EngineBuilder`, custom plugins, data in/out, the daemon.
+- [`odin` CLI](docs/cli.md) and [`odind` daemon](docs/daemon.md) references.
+- [Architecture](docs/architecture.md) — the layered design and data-flow contracts.
 - `cargo doc --open -p odin-core --all-features` — the API reference.
 
 ## Development

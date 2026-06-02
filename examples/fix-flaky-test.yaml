@@ -99,6 +99,6 @@ steps:
     with:
       title: "Fix flaky test (#{{ params.issue_number }})"
       base: "{{ params.base_branch }}"
-      body: "{{ steps.review.outputs.summary }}"
+      body: "{{ steps.review.outputs.stdout }}"
     depends_on: [review, changelog] # genuine DAG fan-in
-    when: "steps.review.outputs.passed == true"
+    when: "steps.review.status == 'passed'"

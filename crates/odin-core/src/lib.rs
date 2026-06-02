@@ -14,17 +14,51 @@
 //! ```text
 //! Foundation : Workflow IR · Diagnostics · Templating · Errors
 //! Pluggable  : Provider · Workspace · Store · Action · Trigger   (integration surface)
-//! Execution  : Step exec · Gates · Judge                          (later milestone)
-//! Engine     : Run lifecycle · Scheduler                          (later milestone)
+//! Execution  : Step exec · Gates · Judge · Retry · Concurrency
+//! Engine     : Run lifecycle · Scheduler · Durable resume
+//! ```
+//!
+//! ## Embedding Odin
+//!
+//! Build an engine over a git repo, register any custom plugins, and drive workflows. The
+//! returned [`api::RunSummary`] is plain, serializable data — no engine internals. (This
+//! example is a compiled doctest, so it stays in sync with the API; see
+//! `docs/integration-guide.md` for the full guide.)
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use odin_core::{EngineBuilder, RunInput, RunStatus, SqliteStore, Workflow};
+//!
+//! # async fn embed() -> odin_core::Result<()> {
+//! // An engine over a git repo, checkpointing to SQLite for crash-resume.
+//! let engine = EngineBuilder::new()
+//!     .repo("/path/to/repo")
+//!     .store(Arc::new(SqliteStore::open("runs.db")?))
+//!     .build()?;
+//!
+//! // Load and run a workflow; pass typed inputs via `RunInput`.
+//! let workflow = Workflow::from_yaml_str("name: demo\nsteps: [{ id: greet, run: \"echo hi\" }]\n")?;
+//! let summary = engine.run(&workflow, RunInput::manual().param("who", "world")).await?;
+//!
+//! if summary.status == RunStatus::Succeeded {
+//!     println!("{} step(s), ${:.4}", summary.steps.len(), summary.usage.cost_usd());
+//! }
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! ## Feature flags
 //!
 //! - `ir` — parse + validate workflows. No async runtime, no templating engine.
 //! - `templating` — render prompts/conditionals and statically check template refs.
-//! - `runtime` — the five integration traits, the registry, and the engine façade.
-//! - `mock` — ships Noop/Mock trait impls for downstream tests.
-//! - `full` (default) — all of the above.
+//! - `runtime` — the five integration traits, the registry, and the provider/store/
+//!   workspace/action implementations.
+//! - `mock` — in-memory test doubles ([`mock::EchoProvider`], [`mock::MemStore`], …) for
+//!   downstream tests. Opt-in; *not* included in `full`.
+//! - `full` (default) — `ir` + `templating` + `runtime` (not `mock`).
+//!
+//! The [`Engine`] façade requires **both** `runtime` and `templating` (it renders prompts),
+//! so it is available under `full`.
 //!
 //! A parse-only embedder (a linter or LSP) can depend on `odin-core` with
 //! `default-features = false, features = ["ir"]` and pull in none of `tokio`.

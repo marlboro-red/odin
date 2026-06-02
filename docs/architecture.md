@@ -22,7 +22,7 @@ exhaustive, code-level blueprint the foundation was built from, see
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Runners     odin (CLI, today)          odind (daemon, later) │
+│  Runners     odin (CLI)                 odind (daemon)        │
 ├──────────────────────────────────────────────────────────────┤
 │  Engine      Engine trait · EngineBuilder · run lifecycle     │   runtime
 ├──────────────────────────────────────────────────────────────┤
@@ -53,17 +53,23 @@ crates/
 │       ├── context/               # templating: shape, ref-checking, render  (templating)
 │       ├── traits/                # the five integration traits             (runtime)
 │       ├── registry.rs            # name → plugin resolution                (runtime)
-│       ├── engine.rs              # Engine trait + builder (frozen API)     (runtime)
+│       ├── provider/              # claude / codex / copilot adapters       (runtime)
+│       ├── action/                # shell.exec / git.commit / git.push / github.open_pr (runtime)
+│       ├── workspace/             # worktree + slot-pool workspaces         (runtime)
+│       ├── storage/               # SqliteStore                             (runtime)
+│       ├── engine/                # Engine trait + builder + local executor (runtime+templating)
 │       └── mock.rs                # Noop trait impls for tests              (mock)
-├── odin-cli/                      # `odin` binary (validate implemented)
-└── odin-daemon/                   # `odind` binary (stub)
+├── odin-cli/                      # `odin` binary: validate / run / list / show / logs
+└── odin-daemon/                   # `odin_daemon` lib + `odind` binary: cron + webhooks
 ```
 
 ## The integration surface
 
-Five object-safe (`Arc<dyn _>`, via `async-trait`) traits. Each has one required method
-plus defaulted optionals, and exchanges owned, serializable context/outcome structs so
-implementations can live in other crates — or, later, other processes.
+Five object-safe (`Arc<dyn _>`, via `async-trait`) traits. Each pairs a cheap identity
+accessor (`id`/`kind`/`name`) with one or more required core methods — and, for `Provider`
+and `Store`, a couple of defaulted optionals — and exchanges owned, serializable
+context/outcome structs so implementations can live in other crates — or, later, other
+processes.
 
 ```rust
 trait Provider {                                   // a coding-agent CLI
@@ -83,6 +89,7 @@ trait Store {                                      // durable, crash-resumable s
     async fn checkpoint(&self, state: &RunState) -> Result<(), StoreError>;
     async fn append_event(&self, run: RunId, event: &RunEvent) -> Result<(), StoreError>;
     async fn load_incomplete(&self) -> Result<Vec<RunState>, StoreError>;
+    async fn recent(&self, limit: usize) -> Result<Vec<RunState>, StoreError> { Ok(vec![]) }
     async fn load_run(&self, run: RunId) -> Result<Option<RunState>, StoreError>;
     async fn events(&self, run: RunId) -> Result<Vec<RunEvent>, StoreError> { Ok(vec![]) }
 }
@@ -99,8 +106,10 @@ trait Trigger {                                    // a source of run-starting e
 ```
 
 Each trait returns its **own** small error enum (so an implementor reads a focused 3–4
-variant type, not a crate-wide god-error), and each enum ends in a `#[non_exhaustive]`
-`Other(anyhow::Error)` escape hatch.
+variant type, not a crate-wide god-error). Each enum is `#[non_exhaustive]` (so adding a
+variant is non-breaking) and, under the `runtime` feature, carries an
+`Other(anyhow::Error)` escape hatch — a parse-only `ir` build has the enum without that
+variant.
 
 The **`Store` contract is snapshot-primary**: `checkpoint` persists the whole
 `Serialize`-able `RunState`, so a backend (SQLite blob, Postgres `jsonb`, files) can
@@ -122,8 +131,10 @@ Three contracts move data through a run:
 ```
 
 **2. Step boundary** — the shared worktree is the primary channel (steps edit files);
-named **artifacts** layer explicit handoffs on top. The engine auto-captures the git
-diff after each step as the reserved artifact `DIFF`.
+named **artifacts** layer explicit handoffs on top. After each **passing, non-`scratch`**
+step the engine auto-captures the cumulative git diff (vs the run's base commit) as the
+reserved artifact `DIFF`; a `scratch` step's diff stays local to it, exposed as that step's
+`outputs.diff`.
 
 ```
 INPUTS                          STEP                       OUTPUTS
@@ -181,7 +192,7 @@ do not.
 | ODIN012 | error | `depends_on` targets exist |
 | ODIN013 | error | no step depends on itself |
 | ODIN014 | error | the dependency graph is acyclic |
-| ODIN015 | error | a required artifact's producer is an upstream dependency |
+| ODIN015 | error | a required artifact's producer must be an upstream dependency of the requiring step |
 | ODIN016 | error | a slot pool has `pool >= 1` |
 | ODIN017 | error | template references resolve against the context shape |
 | ODIN018 | error | templates are syntactically valid |
@@ -193,9 +204,27 @@ do not.
 | ODIN024 | warning | a declared param is referenced somewhere |
 | ODIN025 | warning | unknown field at the workflow root (forward-compat tolerance) |
 | ODIN026 | warning | the schema minor is newer than this engine |
+| ODIN027 | warning | a `github_webhook` trigger maps a param not declared in `params` (inert) |
+| ODIN028 | warning | an `action` step sets `scratch: true` (its side effects are discarded) |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
-nested fields, invalid durations, and a step with zero or more than one kind.
+nested fields, invalid durations, and a step with zero or more than one kind. The full
+per-field catalogue with exact trigger conditions is in the
+[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin028).
+
+## Concurrency
+
+By default the executor runs one step at a time in dependency order. With `max_parallel: N`
+it becomes a bounded ready-set scheduler. The safety rule, given that all steps share one
+working directory: a step that mutates the shared tree (any non-`scratch` step) runs
+**exclusively** — never beside another step — while `scratch: true` steps run **concurrently**
+in their own throwaway worktrees (cut from the run's base). A scratch step's edits never reach
+the shared tree; its diff is surfaced as `steps.<id>.outputs.diff` for a downstream step to
+consume. This makes multi-agent fan-out safe without merging concurrent agent edits, and a
+non-scratch step never races another writer.
+
+The daemon parallelizes a *different* axis: it dispatches independent **runs** concurrently
+(bounded by `--max-concurrent-runs`), each in its own isolated workspace.
 
 ## Durability
 
@@ -203,7 +232,17 @@ A durable run is checkpointed to the `Store` at every step boundary; `checkpoint
 atomic (old-or-new, never partial). On startup the engine calls `load_incomplete` and
 resumes each non-terminal run. `RunState` carries enough to resume deterministically: the
 original `RunInput`, per-step progress, the resolved artifact catalogue, the workspace
-lease, and the provider versions actually used.
+lease, the base commit, and the latest snapshot pointer.
+
+To make resume **idempotent**, a durable run takes an *off-branch* git snapshot of the
+workspace after each shared-workdir step (a dangling commit anchored by a per-run ref that's
+deleted on completion — it never reaches the workflow's branch or its PR). On resume the
+workdir is restored to the last snapshot before re-running, so a step interrupted mid-edit
+re-applies from a clean tree instead of double-applying its file changes. This covers the
+uncommitted working-tree phase only: once a step `git commit`s, git's own commits are the
+durable record and snapshotting disengages (rewinding past a commit would corrupt the run
+branch). Side effects *outside* the workspace — a pushed branch, an opened PR — are external
+and not covered; design idempotent or `when:`-guarded steps for those.
 
 ## Security & trust boundaries
 
@@ -216,15 +255,20 @@ the same trust as a shell script you are about to run.
   escaping.** They are surfaced as `params.*` / `trigger.*` and can be referenced from
   `run:` / gate templates. A workflow *author* controls the template, so this is safe for
   author-supplied params — but a `trigger_payload` assembled from an **untrusted source**
-  (a webhook) must never be interpolated raw into a `run:`/gate command. The daemon
-  milestone, which turns external events into runs, must enforce this boundary (quote/
-  escape, or restrict untrusted values to provider prompts only).
+  (a webhook) must never be interpolated raw into a `run:`/gate command; restrict untrusted
+  values to provider prompts, or map only the specific fields you trust into typed params.
+  The daemon authenticates webhook deliveries (HMAC-SHA256 over the raw body) and is
+  **fail-closed** — it refuses to start a webhook listener without a secret unless
+  `--webhook-allow-unsigned` is given — but signature verification proves *origin*, not that
+  the payload's contents are safe to interpolate.
 - **Run agents in a sandbox.** Provider steps execute real coding-agent CLIs with
   file/shell access in the run's workspace. Per-run worktrees and the slot pool isolate
   the working tree, not the host; run the engine where that blast radius is acceptable.
 - **`prompt_file` is contained** under the repository root (absolute paths and `..`
-  escapes are rejected), and git invocations use `--` to prevent argument injection from
-  config values.
+  escapes are rejected). Git is always invoked with a fixed argument vector (never via a
+  shell), and config-derived arguments are guarded: `git.push` rejects a remote or branch
+  beginning with `-` so it can't be misread as a flag, and diff capture appends a trailing
+  `--` to separate revisions from pathspecs.
 
 ## Forward-compatibility seams
 
@@ -240,15 +284,23 @@ Kept because they are cheap; everything else was cut as speculative.
 - Providers are string-keyed through the registry rather than a closed enum, so a
   third-party provider needs zero core changes.
 
-## Milestone status
+## Status
 
-**Done:** workspace scaffold, IR, validator + 28 diagnostics, templating/context model,
-the five traits + registry + engine façade + mocks, `odin validate`, examples, full test
-suite (clippy-pedantic clean, docs clean).
+**Implemented & tested:** the workflow IR; the validator (28 diagnostics); the
+templating/context model; the five integration traits + registry; the SQLite `Store`; the
+worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
+(subprocess management, version/health checks, token-usage parsing); the built-in `Action`s
+(`shell.exec`, `git.commit`, `git.push`, `github.open_pr`); the executor (dependency order,
+gates, LLM-as-judge + retry/backoff, `when:` conditionals, auto-captured `DIFF`); concurrent
+step execution (`max_parallel` + isolated `scratch:` steps); durable crash-resume with
+per-step off-branch snapshots; the `odin` CLI (`validate` / `run` / `list` / `show` / `logs`);
+and the `odind` daemon (cron + signed GitHub webhooks, concurrent run dispatch, graceful
+drain). The whole workspace is clippy-pedantic clean with `-D warnings` and `unsafe` forbidden.
 
-**Next:** the SQLite `Store`, the worktree and slot-pool `Workspace`s, the `Provider`
-adapters (claude/codex/copilot) with robust subprocess management, the step executor
-(gates + judge), built-in `Action`s, and the daemon's triggers.
+**Open refinements:** dollar-cost reporting for codex/copilot (token usage is already parsed;
+neither CLI reports a dollar figure); provider routing/fallback (`retry.on_fallback_provider`
+parses today but is inert); and engine-level idempotency keys (`RunInput.idempotency_key` is
+declared but not yet acted on).
 
 [`RunInput`]: https://docs.rs/odin-core/latest/odin_core/api/struct.RunInput.html
 [`RunSummary`]: https://docs.rs/odin-core/latest/odin_core/api/struct.RunSummary.html

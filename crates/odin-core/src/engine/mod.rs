@@ -22,11 +22,13 @@ use crate::traits::Store;
 pub trait Engine: Send + Sync {
     /// Runs a workflow to completion, returning the structured summary.
     ///
-    /// Validates the input against the workflow's params first, and checkpoints to the
-    /// [`Store`] if the workflow is durable.
+    /// Validates the workflow first (returning [`crate::error::Error::Validation`] on
+    /// errors), then resolves the run's params ([`crate::error::Error::Input`] if a required
+    /// one is missing), and checkpoints to the [`Store`] if the workflow is durable.
     ///
     /// # Errors
-    /// Returns an [`crate::error::Error`] if validation, a plugin, or persistence fails.
+    /// Returns an [`crate::error::Error`] if validation, param resolution, a plugin, or
+    /// persistence fails.
     async fn run(&self, workflow: &Workflow, input: RunInput) -> Result<RunSummary>;
 
     /// Resumes any incomplete runs found in the [`Store`] (crash recovery).

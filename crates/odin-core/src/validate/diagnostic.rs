@@ -323,13 +323,15 @@ mod tests {
             DiagCode::UnusedParam,
             DiagCode::UnknownRootField,
             DiagCode::NewerSchemaMinor,
+            DiagCode::WebhookParamUndeclared,
+            DiagCode::ScratchOnAction,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 26);
+        assert_eq!(seen.len(), 28);
     }
 
     #[test]

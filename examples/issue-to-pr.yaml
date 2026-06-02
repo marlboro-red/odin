@@ -77,17 +77,17 @@ steps:
     with:
       message: "Implement {{ params.issue_url }}"
     depends_on: [review]
-    when: "steps.review.outputs.passed == true"
+    when: "steps.review.status == 'passed'"
 
   - id: push
     action: git.push
     depends_on: [commit]
-    when: "steps.review.outputs.passed == true"
+    when: "steps.review.status == 'passed'"
 
   - id: open_pr
     action: github.open_pr
     with:
       title: "Implement {{ params.issue_url }}"
-      body: "{{ steps.review.outputs.summary }}"
+      body: "{{ steps.review.outputs.stdout }}"
     depends_on: [push]
-    when: "steps.review.outputs.passed == true"
+    when: "steps.review.status == 'passed'"

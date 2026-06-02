@@ -1693,6 +1693,46 @@ steps:
     }
 
     #[tokio::test]
+    async fn when_gate_reads_upstream_step_status() {
+        // Regression: a `when:` guard must see an upstream step's status as the
+        // snake_case string the docs and examples promise — `steps.<id>.status == 'passed'`.
+        // (The previously-shipped `steps.<id>.outputs.passed == true` referenced an output
+        // the engine never sets, so the gate silently evaluated false and skipped the step.)
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: gate\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"true\"}\n  - {id: gated, run: \"true\", depends_on: [a], when: \"steps.a.status == 'passed'\"}\n  - {id: ungated, run: \"true\", depends_on: [a], when: \"steps.a.status == 'failed'\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        let status = |id: &str| {
+            summary
+                .steps
+                .iter()
+                .find(|s| s.id.as_str() == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(
+            status("gated"),
+            StepStatus::Passed,
+            "`status == 'passed'` gate must fire after the upstream step passed"
+        );
+        assert_eq!(
+            status("ungated"),
+            StepStatus::Skipped,
+            "`status == 'failed'` gate must not fire when the upstream step passed"
+        );
+    }
+
+    #[tokio::test]
     async fn resume_continues_an_incomplete_run() {
         let repo = init_repo().await;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
