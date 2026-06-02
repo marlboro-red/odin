@@ -66,6 +66,19 @@ pub(crate) fn check(
                     }
                 }
             }
+            // ODIN029 — subscript access (`steps["a"]`) exposes only the bare root to the
+            // analysis above, bypassing the unknown-ref / upstream checks; surface it.
+            for root in subscripted_roots(&source) {
+                d.push(Diagnostic::new(
+                    DiagCode::DynamicTemplateRef,
+                    tpl.pointer.clone(),
+                    format!(
+                        "{root:?} is accessed with subscript syntax (`{root}[…]`); only dot \
+                         notation (`{root}.name`) is statically checked, so an unknown or \
+                         forward reference here will not be caught"
+                    ),
+                ));
+            }
         }
     }
 
@@ -208,6 +221,56 @@ fn check_var(
             );
         }
     }
+}
+
+/// Statically-checked roots whose subscript access (`root[…]`) bypasses [`check_var`].
+const CHECKED_ROOTS: &[&str] = &["params", "steps", "artifacts"];
+
+/// Returns the statically-checked roots that are accessed with subscript syntax (`root[…]`)
+/// inside any `{{ … }}` expression of `source`. Only the bodies are scanned, so a literal
+/// `arr[steps]` in surrounding shell text is not mistaken for a template subscript.
+fn subscripted_roots(source: &str) -> Vec<&'static str> {
+    let mut found = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let body = &after[..end];
+        let bytes = body.as_bytes();
+        for &root in CHECKED_ROOTS {
+            if found.contains(&root) {
+                continue;
+            }
+            let mut from = 0;
+            while let Some(pos) = body[from..].find(root) {
+                let idx = from + pos;
+                // The match is the path *root* only if the preceding non-space byte is neither
+                // an identifier byte (`mysteps`) nor `.` (a nested attribute like
+                // `trigger.steps` or `out.params`) — otherwise it's a deeper key, not a root.
+                let mut b = idx;
+                while b > 0 && bytes[b - 1].is_ascii_whitespace() {
+                    b -= 1;
+                }
+                let at_root = b == 0 || (bytes[b - 1] != b'.' && !is_ident_byte(bytes[b - 1]));
+                // ...and it's subscripted iff the next non-space byte after the name is `[`.
+                let mut j = idx + root.len();
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if at_root && bytes.get(j) == Some(&b'[') {
+                    found.push(root);
+                    break;
+                }
+                from = idx + root.len();
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    found
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn unknown_ref(pointer: &str, what: &str) -> Diagnostic {

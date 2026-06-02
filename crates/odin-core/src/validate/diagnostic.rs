@@ -96,6 +96,12 @@ pub enum DiagCode {
     /// ODIN028 — an `action` step sets `scratch: true`; its workspace side effects are
     /// discarded with the throwaway worktree (warning).
     ScratchOnAction,
+    /// ODIN029 — a template accesses a statically-checked root (`params`/`steps`/`artifacts`)
+    /// with subscript syntax (`steps["a"]`); only dot notation is validated, so the
+    /// reference escapes the unknown-ref / upstream-dependency checks (warning).
+    DynamicTemplateRef,
+    /// ODIN030 — a param's `default` value does not match its declared `type`.
+    ParamDefaultType,
 }
 
 impl DiagCode {
@@ -131,6 +137,8 @@ impl DiagCode {
             DiagCode::NewerSchemaMinor => "ODIN026",
             DiagCode::WebhookParamUndeclared => "ODIN027",
             DiagCode::ScratchOnAction => "ODIN028",
+            DiagCode::DynamicTemplateRef => "ODIN029",
+            DiagCode::ParamDefaultType => "ODIN030",
         }
     }
 
@@ -145,7 +153,8 @@ impl DiagCode {
             | DiagCode::UnknownRootField
             | DiagCode::NewerSchemaMinor
             | DiagCode::WebhookParamUndeclared
-            | DiagCode::ScratchOnAction => Severity::Warning,
+            | DiagCode::ScratchOnAction
+            | DiagCode::DynamicTemplateRef => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -325,13 +334,15 @@ mod tests {
             DiagCode::NewerSchemaMinor,
             DiagCode::WebhookParamUndeclared,
             DiagCode::ScratchOnAction,
+            DiagCode::DynamicTemplateRef,
+            DiagCode::ParamDefaultType,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 28);
+        assert_eq!(seen.len(), 30);
     }
 
     #[test]

@@ -123,12 +123,15 @@ fn check_provider(
 pub(crate) fn prompts(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     for (i, s) in wf.steps.iter().enumerate() {
         if let StepKind::Provider(p) = &s.kind {
-            match (&p.prompt, &p.prompt_file) {
+            // A present-but-blank prompt/prompt_file is as good as missing.
+            let prompt = p.prompt.as_ref().filter(|t| !t.trim().is_empty());
+            let prompt_file = p.prompt_file.as_ref().filter(|t| !t.trim().is_empty());
+            match (prompt, prompt_file) {
                 (None, None) => d.push(Diagnostic::new(
                     DiagCode::MissingPrompt,
                     step_ptr(i),
                     format!(
-                        "provider step {:?} has no prompt; set prompt: or prompt_file:",
+                        "provider step {:?} has no prompt; set a non-empty prompt: or prompt_file:",
                         s.id.as_str()
                     ),
                 )),
@@ -386,6 +389,7 @@ pub(crate) fn triggers(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 }
 
 /// ODIN022 — a param should not be both `required` and have a `default`.
+/// ODIN030 — a param's `default` must match its declared `type`.
 pub(crate) fn params(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     for (name, spec) in &wf.params {
         if spec.required && spec.default.is_some() {
@@ -397,6 +401,19 @@ pub(crate) fn params(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                     name.as_str()
                 ),
             ));
+        }
+        if let Some(default) = &spec.default {
+            if !spec.ty.matches(default) {
+                d.push(Diagnostic::new(
+                    DiagCode::ParamDefaultType,
+                    format!("params.{name}.default"),
+                    format!(
+                        "param {:?} default {default} does not match its declared type {:?}",
+                        name.as_str(),
+                        spec.ty.name()
+                    ),
+                ));
+            }
         }
     }
 }

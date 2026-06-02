@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN028`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN030`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -265,6 +265,59 @@ fn odin026_newer_schema_minor() {
     assert_fires(
         "schema_version: \"1.9\"\nname: x\nsteps:\n  - {id: a, run: ./x}\n",
         DiagCode::NewerSchemaMinor,
+    );
+}
+
+#[test]
+fn odin029_subscript_template_ref() {
+    // `steps['a']` exposes only the bare `steps` root to the checker, bypassing the
+    // unknown-ref / upstream-dependency checks → ODIN029 surfaces it (warning).
+    assert_fires(
+        "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: \"echo {{ steps['a'].outputs.x }}\", depends_on: [a]}\n",
+        DiagCode::DynamicTemplateRef,
+    );
+}
+
+#[test]
+fn odin029_does_not_fire_for_dot_notation() {
+    let r = report(
+        "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: \"echo {{ steps.a.outputs.x }}\", depends_on: [a]}\n",
+    );
+    assert!(!r.contains(DiagCode::DynamicTemplateRef), "got:\n{r}");
+}
+
+#[test]
+fn odin029_does_not_fire_for_a_nested_key_named_like_a_root() {
+    // `trigger.steps[0]` subscripts a *nested* key named `steps`, not the checked root — and
+    // `trigger` is an open root, so it must stay clean (no ODIN029, no ODIN017).
+    let r = report("name: x\nsteps:\n  - {id: a, run: \"echo {{ trigger.steps[0] }}\"}\n");
+    assert!(!r.contains(DiagCode::DynamicTemplateRef), "got:\n{r}");
+    assert!(!r.has_errors(), "got:\n{r}");
+}
+
+#[test]
+fn odin030_param_default_type_mismatch() {
+    // `type: number` with a string default is a real authoring bug → ODIN030.
+    assert_fires(
+        "name: x\nparams:\n  n: {type: number, default: \"not-a-number\"}\nsteps:\n  - {id: a, run: \"echo {{ params.n }}\"}\n",
+        DiagCode::ParamDefaultType,
+    );
+}
+
+#[test]
+fn odin030_does_not_fire_for_a_matching_default() {
+    let r = report(
+        "name: x\nparams:\n  n: {type: number, default: 3}\nsteps:\n  - {id: a, run: \"echo {{ params.n }}\"}\n",
+    );
+    assert!(!r.contains(DiagCode::ParamDefaultType), "got:\n{r}");
+}
+
+#[test]
+fn odin006_empty_prompt_is_flagged() {
+    // A present-but-blank prompt is as good as missing.
+    assert_fires(
+        "name: x\nsteps:\n  - {id: a, provider: claude, prompt: \"   \"}\n",
+        DiagCode::MissingPrompt,
     );
 }
 

@@ -286,7 +286,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Status
 
-**Implemented & tested:** the workflow IR; the validator (28 diagnostics); the
+**Implemented & tested:** the workflow IR; the validator (30 diagnostics); the
 templating/context model; the five integration traits + registry; the SQLite `Store`; the
 worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
 (subprocess management, version/health checks, token-usage parsing); the built-in `Action`s

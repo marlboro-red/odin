@@ -266,6 +266,13 @@ impl LocalEngine {
                 .or_else(|| spec.default.clone());
             match value {
                 Some(v) => {
+                    if !spec.ty.matches(&v) {
+                        return Err(Error::Input(format!(
+                            "param {:?} expects type {} but got {v}",
+                            name.as_str(),
+                            spec.ty.name()
+                        )));
+                    }
                     params.insert(name.as_str().to_owned(), v);
                 }
                 None if spec.required => {
@@ -1842,6 +1849,37 @@ steps:
             status("ungated"),
             StepStatus::Skipped,
             "`status == 'failed'` gate must not fire when the upstream step passed"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_rejects_a_param_whose_value_mismatches_its_type() {
+        // A declared `type: number` param given a string is a typed-input error at run start.
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: t\nworkspace: { type: worktree }\nparams:\n  n: {type: number}\nsteps:\n  - {id: a, run: \"true\"}\n",
+        );
+        let err = eng
+            .run(&wf, RunInput::manual().param("n", "not-a-number"))
+            .await
+            .expect_err("a mistyped param must be rejected");
+        assert!(
+            matches!(err, Error::Input(_)),
+            "expected Error::Input, got: {err:?}"
+        );
+
+        // The same workflow with a correctly-typed value runs fine.
+        let summary = eng
+            .run(&wf, RunInput::manual().param("n", 42))
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
         );
     }
 
