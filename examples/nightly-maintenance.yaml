@@ -1,0 +1,62 @@
+# A daemon-served workflow: every night, refresh dependencies, verify the build & tests,
+# and — if everything still passes — open a pull request with a generated summary. It is
+# param-less by design, because a cron trigger supplies no inputs.
+#
+#   odin validate examples/nightly-maintenance.yaml
+#   odind --workflows examples --repo .
+
+schema_version: "1.0"
+name: nightly-maintenance
+version: "1.0.0"
+description: Nightly dependency refresh — update, verify, summarize, and open a PR.
+durable: true # checkpointed & crash-resumable
+
+workspace:
+  type: worktree # a throwaway git worktree per run
+
+triggers:
+  - type: cron
+    # Every day at 03:00 UTC. Day-of-week is POSIX (0/7=Sun, 1=Mon); times are UTC.
+    schedule: "0 3 * * *"
+
+defaults:
+  timeout: "20m"
+
+steps:
+  # Refresh the lockfile to the latest compatible dependency versions.
+  - id: update
+    run: "cargo update"
+
+  # Only proceed if the refreshed tree still builds and its tests pass.
+  - id: verify
+    run: "cargo test --workspace"
+    depends_on: [update]
+    gates:
+      build: "cargo build --workspace"
+
+  # Summarize the auto-captured DIFF into a human-readable PR body.
+  - id: summarize
+    provider: claude
+    prompt: |
+      Summarize the following dependency-update diff as a concise PR description,
+      calling out any notable version jumps:
+      {{ artifacts.DIFF }}
+    depends_on: [verify]
+
+  # Commit the lockfile change, push the run's branch, and open the PR.
+  - id: commit
+    action: git.commit
+    with:
+      message: "chore: nightly dependency refresh"
+    depends_on: [summarize]
+
+  - id: push
+    action: git.push
+    depends_on: [commit]
+
+  - id: open_pr
+    action: github.open_pr
+    with:
+      title: "chore: nightly dependency refresh"
+      body: "{{ steps.summarize.outputs.stdout }}"
+    depends_on: [push]

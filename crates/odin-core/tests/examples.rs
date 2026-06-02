@@ -5,6 +5,7 @@ use odin_core::{DiagCode, KnownNames, Workflow, validate_source};
 
 const ISSUE_TO_PR: &str = include_str!("../../../examples/issue-to-pr.yaml");
 const FIX_FLAKY: &str = include_str!("../../../examples/fix-flaky-test.yaml");
+const NIGHTLY: &str = include_str!("../../../examples/nightly-maintenance.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -14,6 +15,22 @@ fn issue_to_pr_is_completely_clean() {
         report.is_empty(),
         "expected zero diagnostics, got:\n{report}"
     );
+}
+
+#[test]
+fn nightly_maintenance_is_clean_and_cron_triggered() {
+    let wf = Workflow::from_yaml_str(NIGHTLY).expect("parses");
+    let report = validate_source(NIGHTLY, &wf, &KnownNames::builtin());
+    assert!(
+        report.is_empty(),
+        "expected zero diagnostics, got:\n{report}"
+    );
+    // The daemon's reason to exist: this example is served by a cron trigger, not manually.
+    assert_eq!(wf.triggers.len(), 1);
+    assert!(matches!(
+        wf.triggers[0],
+        odin_core::ir::TriggerDecl::Cron(_)
+    ));
 }
 
 #[test]
@@ -51,7 +68,7 @@ fn fix_flaky_exercises_every_step_kind_and_trigger() {
 
 #[test]
 fn examples_round_trip_through_serde() {
-    for src in [ISSUE_TO_PR, FIX_FLAKY] {
+    for src in [ISSUE_TO_PR, FIX_FLAKY, NIGHTLY] {
         let wf = Workflow::from_yaml_str(src).expect("parses");
         let reserialized = serde_yaml_ng::to_string(&wf).expect("serializes");
         let again = Workflow::from_yaml_str(&reserialized).expect("re-parses");
