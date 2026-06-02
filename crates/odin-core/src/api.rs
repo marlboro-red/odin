@@ -60,11 +60,13 @@ impl RunInput {
         self
     }
 
-    /// Fluent setter for the free-form trigger payload.
+    /// Fluent setter for the free-form trigger payload. `payload` is anything that converts
+    /// into a JSON [`Value`] — a `serde_json::json!(…)` object, a `String`/`&str`, a number,
+    /// etc. (mirroring [`param`](Self::param)).
     #[must_use]
-    pub fn with_trigger(mut self, name: impl Into<String>, payload: Value) -> Self {
+    pub fn with_trigger(mut self, name: impl Into<String>, payload: impl Into<Value>) -> Self {
         self.trigger = name.into();
-        self.trigger_payload = payload;
+        self.trigger_payload = payload.into();
         self
     }
 }

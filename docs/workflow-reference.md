@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN030`).
+(`ODIN001`–`ODIN031`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -347,7 +347,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN030`)
+## Diagnostics catalogue (`ODIN001`–`ODIN031`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -384,8 +384,9 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin028"></a>ODIN028 | **warning** | An *action* step sets `scratch: true` (its side effects are discarded). |
 | <a id="odin029"></a>ODIN029 | **warning** | A template accesses a checked root (`params`/`steps`/`artifacts`) with **subscript** syntax (`steps["a"]`); only dot notation is statically checked, so the reference escapes the unknown-ref / upstream checks. |
 | <a id="odin030"></a>ODIN030 | error | A param's `default` value does not match its declared `type`. |
+| <a id="odin031"></a>ODIN031 | **warning** | An untrusted `trigger.*` value is interpolated into a shell command — a `run:` step, a gate, or `shell.exec`'s `command` — so a webhook payload reaches `sh -c` unescaped (injection risk). Map the fields you trust into typed `params`.¹ |
 
-¹ ODIN017, ODIN018, ODIN024, and ODIN029 require the `templating` feature (on by default).
+¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 
 A workflow validates **cleanly** when it has zero diagnostics; it's still **runnable** with
 warnings (only errors block a run). See [`examples/fix-flaky-test.yaml`](../examples/fix-flaky-test.yaml)

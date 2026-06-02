@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN030`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN031`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -310,6 +310,24 @@ fn odin030_does_not_fire_for_a_matching_default() {
         "name: x\nparams:\n  n: {type: number, default: 3}\nsteps:\n  - {id: a, run: \"echo {{ params.n }}\"}\n",
     );
     assert!(!r.contains(DiagCode::ParamDefaultType), "got:\n{r}");
+}
+
+#[test]
+fn odin031_trigger_payload_into_a_shell_command() {
+    // An untrusted `trigger.*` value reaching `sh -c` in a `run:` step → injection risk.
+    assert_fires(
+        "name: x\nsteps:\n  - {id: a, run: \"echo {{ trigger.issue.title }}\"}\n",
+        DiagCode::TriggerIntoShell,
+    );
+}
+
+#[test]
+fn odin031_does_not_fire_for_trigger_in_a_prompt() {
+    // A prompt is handed to the agent, not a shell — no injection, no ODIN031.
+    let r = report(
+        "name: x\nsteps:\n  - {id: a, provider: claude, prompt: \"{{ trigger.issue.title }}\"}\n",
+    );
+    assert!(!r.contains(DiagCode::TriggerIntoShell), "got:\n{r}");
 }
 
 #[test]

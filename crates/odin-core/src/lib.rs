@@ -134,6 +134,17 @@ pub use workspace::{SlotPoolWorkspace, WorktreeWorkspace};
 #[cfg(feature = "runtime")]
 pub use async_trait::async_trait;
 
+/// Re-export of [`mod@serde_json`]. The public API exchanges `serde_json::Value` (param values,
+/// the trigger payload, step outputs, action `with:` args), so embedders can build those —
+/// `odin_core::serde_json::json!(…)` — without depending on a possibly-mismatched `serde_json`.
+pub use serde_json;
+
+/// Re-export of [`mod@anyhow`]. Every integration trait's error type has an
+/// `Other(#[from] anyhow::Error)` variant, so a custom `Provider`/`Action`/… impl wraps its
+/// own errors through `anyhow` — use `odin_core::anyhow` to match this crate's version.
+#[cfg(feature = "runtime")]
+pub use anyhow;
+
 /// The version string of `odin-core`, taken from `Cargo.toml` at build time.
 ///
 /// Useful for stamping run records so a durable run can be correlated with the

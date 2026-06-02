@@ -210,11 +210,12 @@ do not.
 | ODIN028 | warning | an `action` step sets `scratch: true` (its side effects are discarded) |
 | ODIN029 | warning | a template accesses a checked root with subscript syntax (`steps["a"]`), escaping the static ref checks |
 | ODIN030 | error | a param's `default` matches its declared `type` |
+| ODIN031 | warning | an untrusted `trigger.*` value is interpolated into a shell command (`run:`/gate/`shell.exec`) — injection risk |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
 nested fields, invalid durations, and a step with zero or more than one kind. The full
 per-field catalogue with exact trigger conditions is in the
-[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin030).
+[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin031).
 
 ## Concurrency
 
@@ -309,7 +310,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Status
 
-**Implemented & tested:** the workflow IR; the validator (30 diagnostics); the
+**Implemented & tested:** the workflow IR; the validator (31 diagnostics); the
 templating/context model; the five integration traits + registry; the SQLite `Store`; the
 worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
 (subprocess management, version/health checks, token-usage parsing); the built-in `Action`s
