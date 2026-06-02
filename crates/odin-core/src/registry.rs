@@ -31,6 +31,11 @@ impl Registry {
         let mut registry = Self::default();
         registry.register_provider(Arc::new(crate::provider::ClaudeProvider::new()));
         registry
+            .register_action(Arc::new(crate::action::ShellExec))
+            .register_action(Arc::new(crate::action::GitCommit))
+            .register_action(Arc::new(crate::action::GitPush))
+            .register_action(Arc::new(crate::action::OpenPr));
+        registry
     }
 
     /// Registers a provider under its [`Provider::id`].
@@ -102,12 +107,16 @@ mod tests {
     use super::Registry;
 
     #[test]
-    fn builtins_register_claude() {
+    fn builtins_register_claude_and_actions() {
         let r = Registry::with_builtins();
         assert!(r.provider("claude").is_some());
         assert!(r.known_names().providers.contains(&"claude"));
         // Not yet implemented providers are absent.
         assert!(r.provider("codex").is_none());
+        // Built-in actions are registered.
+        for name in ["shell.exec", "git.commit", "git.push", "github.open_pr"] {
+            assert!(r.action(name).is_some(), "{name} should be registered");
+        }
     }
 
     #[test]

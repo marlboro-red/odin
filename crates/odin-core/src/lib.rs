@@ -30,6 +30,8 @@
 //! `default-features = false, features = ["ir"]` and pull in none of `tokio`.
 #![doc(html_root_url = "https://docs.rs/odin-core/0.0.1")]
 
+#[cfg(feature = "runtime")]
+pub mod action;
 pub mod api;
 #[cfg(feature = "templating")]
 pub mod context;
@@ -68,6 +70,8 @@ pub use validate::{
     DiagCode, Diagnostic, KnownNames, Severity, ValidationReport, validate, validate_source,
 };
 
+#[cfg(feature = "runtime")]
+pub use action::{GitCommit, GitPush, OpenPr, ShellExec};
 #[cfg(all(feature = "runtime", feature = "templating"))]
 pub use engine::{Engine, EngineBuilder};
 #[cfg(feature = "runtime")]

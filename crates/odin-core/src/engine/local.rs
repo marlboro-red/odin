@@ -1196,4 +1196,31 @@ steps:
             "a reloaded failed run must surface its error"
         );
     }
+
+    #[tokio::test]
+    async fn action_step_commits_and_records_a_side_effect() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: act\nworkspace: { type: worktree }\nsteps:\n  - {id: edit, run: \"echo more >> README.md\"}\n  - id: save\n    action: git.commit\n    with: { message: \"automated change\" }\n    depends_on: [edit]\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+        assert!(
+            summary
+                .side_effects
+                .iter()
+                .any(|s| matches!(s, SideEffect::Commit { .. })),
+            "expected a Commit side-effect, got {:?}",
+            summary.side_effects
+        );
+    }
 }

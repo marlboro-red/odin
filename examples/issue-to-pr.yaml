@@ -66,11 +66,24 @@ steps:
       criteria: The change implements PLAN without regressions or weakened tests.
       threshold: 0.7
 
-  # Built-in action: open the PR only if the review passed.
+  # Built-in actions: commit the change, push the run's branch, and open a PR —
+  # but only if the review passed.
+  - id: commit
+    action: git.commit
+    with:
+      message: "Implement {{ params.issue_url }}"
+    depends_on: [review]
+    when: "steps.review.outputs.passed == true"
+
+  - id: push
+    action: git.push
+    depends_on: [commit]
+    when: "steps.review.outputs.passed == true"
+
   - id: open_pr
     action: github.open_pr
     with:
       title: "Implement {{ params.issue_url }}"
       body: "{{ steps.review.outputs.summary }}"
-    depends_on: [review]
+    depends_on: [push]
     when: "steps.review.outputs.passed == true"
