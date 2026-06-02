@@ -44,6 +44,8 @@ pub mod engine;
 #[cfg(all(feature = "runtime", any(test, feature = "mock")))]
 pub mod mock;
 #[cfg(feature = "runtime")]
+pub mod provider;
+#[cfg(feature = "runtime")]
 pub mod registry;
 #[cfg(feature = "runtime")]
 pub mod traits;
@@ -64,6 +66,8 @@ pub use validate::{
 
 #[cfg(feature = "runtime")]
 pub use engine::{Engine, EngineBuilder};
+#[cfg(feature = "runtime")]
+pub use provider::ClaudeProvider;
 #[cfg(feature = "runtime")]
 pub use registry::Registry;
 #[cfg(feature = "runtime")]

@@ -22,12 +22,15 @@ pub struct Registry {
 impl Registry {
     /// A registry with all built-in providers/workspaces/actions/triggers registered.
     ///
-    /// Currently empty: the built-in implementations (claude/codex/copilot providers,
-    /// the worktree/slot-pool workspaces, the github/git/shell actions) arrive in later
-    /// milestones. Until then, parse-only validation uses [`KnownNames::builtin`].
+    /// Currently registers the [`ClaudeProvider`](crate::provider::ClaudeProvider); the
+    /// codex/copilot providers, the worktree/slot-pool workspaces, and the
+    /// github/git/shell actions arrive in later milestones. Parse-only validation (the
+    /// `ir` feature) instead uses [`KnownNames::builtin`].
     #[must_use]
     pub fn with_builtins() -> Self {
-        Self::default()
+        let mut registry = Self::default();
+        registry.register_provider(Arc::new(crate::provider::ClaudeProvider::new()));
+        registry
     }
 
     /// Registers a provider under its [`Provider::id`].
@@ -99,10 +102,18 @@ mod tests {
     use super::Registry;
 
     #[test]
-    fn empty_registry_has_no_names() {
+    fn builtins_register_claude() {
         let r = Registry::with_builtins();
-        let names = r.known_names();
-        assert!(names.providers.is_empty());
+        assert!(r.provider("claude").is_some());
+        assert!(r.known_names().providers.contains(&"claude"));
+        // Not yet implemented providers are absent.
+        assert!(r.provider("codex").is_none());
+    }
+
+    #[test]
+    fn empty_registry_has_no_names() {
+        let r = Registry::default();
+        assert!(r.known_names().providers.is_empty());
         assert!(r.provider("claude").is_none());
     }
 }
