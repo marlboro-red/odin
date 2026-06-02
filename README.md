@@ -8,11 +8,12 @@ You describe a workflow in YAML (with code-hook escape hatches), pin a provider 
 step, and Odin runs it: planning, implementing, self-reviewing, and opening a PR — with
 every step checkpointed so a crashed run resumes where it left off.
 
-> **Status: early foundation.** The workflow IR, the full validator (26 diagnostics),
-> the templating/context model, and the five integration traits are implemented, tested,
-> and documented. The executor, the SQLite store, the workspace providers, and the
-> provider adapters land in subsequent milestones. `odin validate` works today; `odin
-> run` is scaffolded.
+> **Status: runs end-to-end.** The workflow IR, the full validator (26 diagnostics),
+> the templating/context model, the five integration traits, the durable SQLite store,
+> the worktree + slot-pool workspaces, the Claude provider adapter, and the executor are
+> all implemented, tested, and documented. `odin validate` and `odin run` both work.
+> Still to come: the Codex/Copilot provider adapters, built-in actions (`github.open_pr`),
+> LLM-as-judge, and the daemon's event triggers.
 
 ## Quickstart
 
@@ -26,6 +27,10 @@ cargo run -p odin-cli -- validate examples/issue-to-pr.yaml
 
 # Machine-readable diagnostics:
 cargo run -p odin-cli -- validate --json examples/fix-flaky-test.yaml
+
+# Run a workflow against a git repo (provisions a worktree, checkpoints to SQLite).
+# Steps using `run:` execute for free; `provider:` steps invoke the real agent CLI.
+cargo run -p odin-cli -- run path/to/workflow.yaml --repo . --param issue_url=https://...
 ```
 
 ## A workflow at a glance

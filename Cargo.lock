@@ -485,6 +485,8 @@ dependencies = [
  "clap",
  "odin-core",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

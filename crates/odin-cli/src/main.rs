@@ -28,10 +28,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run a workflow (arrives with the execution milestone).
+    /// Run a workflow to completion.
     Run {
         /// Path to the workflow YAML file.
         file: PathBuf,
+        /// A typed input parameter as `KEY=VALUE` (repeatable). Values parse as JSON if
+        /// possible (so `42` / `true` are typed), otherwise as a string.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        param: Vec<String>,
+        /// The trigger name to record for this run.
+        #[arg(long)]
+        trigger: Option<String>,
+        /// The git repository to provision workspaces from. Defaults to the current dir.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Path to the run-state SQLite database. Defaults to `<repo>/.odin/state.db`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Do not persist run state (no durability / resume).
+        #[arg(long)]
+        no_store: bool,
+        /// Emit the run summary as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List runs (arrives with the durable-store milestone).
     List,
@@ -57,7 +76,33 @@ fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
-        Command::Run { .. } | Command::List | Command::Show { .. } | Command::Logs { .. } => {
+        Command::Run {
+            file,
+            param,
+            trigger,
+            repo,
+            db,
+            no_store,
+            json,
+        } => {
+            let args = cmd::run::RunArgs {
+                file,
+                params: param,
+                trigger,
+                repo,
+                db,
+                no_store,
+                json,
+            };
+            match cmd::run::run(args) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    ExitCode::from(2)
+                }
+            }
+        }
+        Command::List | Command::Show { .. } | Command::Logs { .. } => {
             eprintln!(
                 "error: this subcommand is not implemented yet (tracked for a later milestone)"
             );
