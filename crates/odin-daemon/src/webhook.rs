@@ -26,21 +26,22 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
-use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
 use odin_core::ir::GithubWebhookDecl;
 use odin_core::traits::{Trigger, TriggerEvent};
-use odin_core::{RunInput, TriggerError, WorkflowId};
+use odin_core::{Decision, Engine, Error, RunId, RunInput, TriggerError, Workflow, WorkflowId};
 use sha2::Sha256;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -182,6 +183,16 @@ pub struct WebhookServer {
     addr: SocketAddr,
     secret: Option<String>,
     subscriptions: Vec<Subscription>,
+    approvals: Option<ApprovalCtx>,
+}
+
+/// What the `POST /approve` handler needs to record a decision and resume the run: a shared
+/// engine handle and the daemon's loaded workflow set (the paused run's own workflow must be
+/// among them — see [`Engine::submit_approval`]).
+#[derive(Clone)]
+struct ApprovalCtx {
+    engine: Arc<dyn Engine>,
+    workflows: Arc<[Workflow]>,
 }
 
 impl WebhookServer {
@@ -194,7 +205,23 @@ impl WebhookServer {
             addr,
             secret,
             subscriptions: Vec::new(),
+            approvals: None,
         }
+    }
+
+    /// Enables the `POST /approve` endpoint, wiring it to `engine` and the daemon's `workflows`
+    /// (the run's own workflow must be present to resume it). Like a webhook, the endpoint is
+    /// signature-verified with the same secret; the caller is responsible for refusing to serve
+    /// it unsigned (see the fail-closed check in `main`).
+    pub fn enable_approvals(&mut self, engine: Arc<dyn Engine>, workflows: Arc<[Workflow]>) {
+        self.approvals = Some(ApprovalCtx { engine, workflows });
+    }
+
+    /// Whether the server has anything to serve: a webhook subscription or the approval
+    /// endpoint. The daemon skips starting the HTTP server entirely when neither is present.
+    #[must_use]
+    pub fn serves(&self) -> bool {
+        !self.subscriptions.is_empty() || self.approvals.is_some()
     }
 
     /// Registers one declared webhook trigger and returns the [`GithubWebhookTrigger`] to
@@ -250,6 +277,7 @@ impl WebhookServer {
             state: Arc::new(AppState {
                 secret: self.secret,
                 subscriptions: self.subscriptions,
+                approvals: self.approvals,
                 dedup: Mutex::new(DeliveryDedup::new()),
             }),
         })
@@ -277,14 +305,17 @@ impl BoundWebhookServer {
     /// Returns an error if the server task fails (not from individual bad requests, which
     /// are answered with a 4xx and logged).
     pub async fn serve(self, shutdown: CancellationToken) -> anyhow::Result<()> {
-        if self.state.secret.is_none() && !self.state.subscriptions.is_empty() {
+        if self.state.secret.is_none()
+            && (!self.state.subscriptions.is_empty() || self.state.approvals.is_some())
+        {
             tracing::warn!(
-                "no webhook secret set (ODIN_WEBHOOK_SECRET / --webhook-secret); accepting \
-                 UNSIGNED webhook requests — dev mode only"
+                "no secret set (ODIN_WEBHOOK_SECRET / --webhook-secret); accepting UNSIGNED \
+                 webhook/approve requests — dev mode only"
             );
         }
         let app = Router::new()
             .route("/webhook", post(handle_webhook))
+            .route("/approve", post(handle_approve))
             .route("/health", get(handle_health))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(self.state);
@@ -300,6 +331,8 @@ impl BoundWebhookServer {
 struct AppState {
     secret: Option<String>,
     subscriptions: Vec<Subscription>,
+    /// Present when `POST /approve` is enabled (some workflow has an approval gate).
+    approvals: Option<ApprovalCtx>,
     /// Recent delivery ids, to drop GitHub's retries of an already-handled delivery.
     dedup: Mutex<DeliveryDedup>,
 }
@@ -307,6 +340,101 @@ struct AppState {
 #[allow(clippy::unused_async)] // axum route handlers must be async.
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// The body of a `POST /approve`: which run, the decision, who decided, and a note. `decision`
+/// is the `snake_case` [`Decision`] (`"approved"` / `"rejected"`); `note` is **required** on a
+/// reject (it's the feedback). `run_id` is the UUID string.
+#[derive(serde::Deserialize)]
+struct ApproveRequest {
+    run_id: String,
+    decision: Decision,
+    #[serde(default)]
+    approver: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Records a human decision on a paused run's approval gate and resumes it — the daemon-side
+/// equivalent of `odin approve` / `odin reject`. Signature-verified with the same secret as
+/// `/webhook`. Returns the resumed [`RunSummary`] as JSON (`200`), so the caller sees whether
+/// the run completed, failed (a reject), or paused again at a later gate.
+///
+/// Unlike `/webhook` (which only enqueues), this resumes the run **inline** via
+/// [`Engine::submit_approval`]; the engine's own locks keep that safe alongside the supervisor
+/// loop. The resumed run is not counted against the daemon's `max_concurrent_runs` — an
+/// approval is an operator action, expected to be rare.
+async fn handle_approve(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(rejection) = verify_signature(state.secret.as_deref(), &headers, &body) {
+        return rejection;
+    }
+    let Some(ctx) = state.approvals.as_ref() else {
+        // No workflow has an approval gate, so the endpoint is wired but inert.
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "approvals are not enabled on this daemon (no workflow declares an approval gate)",
+        )
+            .into_response();
+    };
+    let req = match serde_json::from_slice::<ApproveRequest>(&body) {
+        Ok(req) => req,
+        Err(e) => {
+            tracing::warn!(error = %e, "approve: rejecting invalid JSON body");
+            return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response();
+        }
+    };
+    let Ok(run_id) = RunId::from_str(&req.run_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("invalid run id {:?}", req.run_id),
+        )
+            .into_response();
+    };
+    // Mirror the CLI: a reject must carry the feedback to act on.
+    if matches!(req.decision, Decision::Rejected)
+        && req.note.as_deref().unwrap_or("").trim().is_empty()
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a reject requires a non-empty `note` (the feedback to act on)",
+        )
+            .into_response();
+    }
+    let approver = req
+        .approver
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http".to_owned());
+
+    match ctx
+        .engine
+        .submit_approval(run_id, req.decision, approver, req.note, &ctx.workflows)
+        .await
+    {
+        Ok(Some(summary)) => {
+            tracing::info!(run = %run_id, status = ?summary.status, "approve: decision applied");
+            (StatusCode::OK, Json(summary)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            format!("no run {run_id} in the store"),
+        )
+            .into_response(),
+        Err(e) => {
+            // A bad request (not awaiting / unknown workflow) is the caller's fault → 409;
+            // a store/resume failure is ours → 500.
+            tracing::warn!(run = %run_id, error = %e, "approve: submit_approval failed");
+            let code = if matches!(e, Error::Input(_)) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (code, format!("{e}")).into_response()
+        }
+    }
 }
 
 /// Verifies the signature, parses the event, and routes it to every matching subscription.

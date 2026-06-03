@@ -83,6 +83,24 @@ pub(crate) struct LocalEngine {
     /// concurrent runs (its lease state is in-memory and per-instance); a fresh instance per
     /// run would each get a full set of permits and hand out the same slot to everyone.
     workspaces: std::sync::Mutex<HashMap<String, Arc<dyn Workspace>>>,
+    /// Run ids currently executing. A resume (crash-recovery sweep or an approval decision)
+    /// claims its run id here first; a second concurrent attempt to execute the SAME run is
+    /// refused, so an approval racing another approval — or a sweep — can't double-run a run's
+    /// side effects.
+    running: std::sync::Mutex<HashSet<RunId>>,
+}
+
+/// An execution claim on a run id, released when dropped. Held across a whole resume so the run
+/// executes once even under concurrent decisions. See [`LocalEngine::claim_run`].
+struct RunClaim<'a> {
+    engine: &'a LocalEngine,
+    run_id: RunId,
+}
+
+impl Drop for RunClaim<'_> {
+    fn drop(&mut self) {
+        self.engine.running.lock().unwrap().remove(&self.run_id);
+    }
 }
 
 /// What executing a single step produced (richer than the persisted `StepState`).
@@ -167,6 +185,21 @@ impl LocalEngine {
             repo_root,
             worktree_lock: tokio::sync::Mutex::new(()),
             workspaces: std::sync::Mutex::new(HashMap::new()),
+            running: std::sync::Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Claims `run_id` for execution, returning a guard that releases it on drop. Returns
+    /// `None` if the run is already executing — the caller must then NOT execute it (running a
+    /// run concurrently with itself would duplicate its side effects).
+    fn claim_run(&self, run_id: RunId) -> Option<RunClaim<'_>> {
+        if self.running.lock().unwrap().insert(run_id) {
+            Some(RunClaim {
+                engine: self,
+                run_id,
+            })
+        } else {
+            None
         }
     }
 
@@ -1656,7 +1689,7 @@ impl Engine for LocalEngine {
 
         let mut summaries = Vec::new();
         let sweep_cancel = CancelToken::new();
-        for mut state in store.load_incomplete().await? {
+        for state in store.load_incomplete().await? {
             let Some(workflow) = by_name.get(state.workflow.as_str()).copied() else {
                 // The run targets a workflow we no longer serve — best-effort reclaim its
                 // snapshot ref from the shared main repo (a no-op if none was created), so
@@ -1665,92 +1698,14 @@ impl Engine for LocalEngine {
                     .await;
                 continue;
             };
-            let Some(handle) = state.workspace.clone() else {
+            // Skip a run already being resumed (e.g. by a concurrent approval decision); never
+            // execute the same run twice. The claim is held for this run's whole resume.
+            let Some(_claim) = self.claim_run(state.run_id) else {
                 continue;
             };
-            let started_at = state.created_at;
-
-            // Crash recovery is per-run, never all-or-nothing: one run's failure must not
-            // abort the others or leave it stuck Running forever.
-            let summary = if handle.path.exists() {
-                match Self::resolve_params(workflow, &state.input) {
-                    Ok(params) => {
-                        let cancel = CancelToken::new();
-                        let run_span = tracing::info_span!(
-                            "run",
-                            run_id = %state.run_id,
-                            workflow = %workflow.name,
-                            durable = workflow.durable,
-                            resumed = true,
-                        );
-                        tracing::info!(parent: &run_span, "resuming run");
-                        let exec = self
-                            .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
-                            .instrument(run_span)
-                            .await;
-                        match exec {
-                            // Paused again at an approval gate — keep the workspace + ref; the
-                            // run stays AwaitingApproval until the next decision.
-                            Ok(r) if r.suspended.is_some() => {
-                                let gate = r.suspended.clone();
-                                state.status = RunStatus::AwaitingApproval;
-                                state.updated_at = Utc::now();
-                                self.checkpoint(workflow.durable, &state).await?;
-                                tracing::info!(run_id = %state.run_id, gate = ?gate, "resumed run paused for approval");
-                                Self::suspended_summary(
-                                    state.run_id,
-                                    workflow,
-                                    &r,
-                                    started_at,
-                                    &state.steps,
-                                )
-                            }
-                            terminal => {
-                                // Reclaim the run's snapshot refs unconditionally (matches run()
-                                // and the unserved-workflow path): a retrying step snapshots even
-                                // in a non-durable run, and the durable flag may have flipped, so
-                                // either can leave a ref. `delete_snapshot_ref` no-ops if none.
-                                self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
-                                    .await;
-                                let workspace = self.make_workspace(&workflow.workspace);
-                                self.release_workspace(&workspace, handle).await;
-                                match terminal {
-                                    Ok(result) => {
-                                        // `summarize` derives the run-level error from the first
-                                        // failed step's recorded reason (single source of truth).
-                                        let (status, summary) = Self::summarize(
-                                            state.run_id,
-                                            workflow,
-                                            result,
-                                            None,
-                                            started_at,
-                                        );
-                                        state.status = status;
-                                        state.error = summary.error.clone();
-                                        state.updated_at = Utc::now();
-                                        self.checkpoint(workflow.durable, &state).await?;
-                                        summary
-                                    }
-                                    Err(e) => {
-                                        self.fail_run(workflow, &mut state, &e.to_string()).await?
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
-                }
-            } else {
-                // The workspace is gone (host moved, manual cleanup); cannot resume. The
-                // snapshot refs live in the shared main repo, so reclaim them there (best
-                // effort, no-op when none) even though the worktree dir is gone — unconditional
-                // for the same reason as the path above.
-                self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
-                    .await;
-                self.fail_run(workflow, &mut state, "workspace is gone; cannot resume")
-                    .await?
-            };
-            summaries.push(summary);
+            if let Some(summary) = self.resume_state(workflow, state).await? {
+                summaries.push(summary);
+            }
         }
         Ok(summaries)
     }
@@ -1799,20 +1754,28 @@ impl Engine for LocalEngine {
                 "approvals require a durable store; none is configured".to_owned(),
             ));
         };
+        // Claim the run for the whole decision-then-resume so two concurrent decisions (e.g. a
+        // double-submitted HTTP approve) can't both pass the status check below and each resume
+        // it — which would run the downstream side effects twice. The loser is refused here; a
+        // decision arriving after the winner finished is refused by the status check.
+        let Some(_claim) = self.claim_run(run_id) else {
+            return Err(Error::Input(format!(
+                "run {run_id} already has a decision being applied"
+            )));
+        };
         let Some(mut state) = store.load_run(run_id).await? else {
             return Ok(None);
         };
-        // The run's own workflow must be among those provided, or `resume_all` couldn't
-        // continue it. Check BEFORE mutating any state: recording the decision + flipping to
-        // Running first would leave the run stuck (un-resumable, no longer awaiting) and drop
-        // its snapshot ref via the unserved-workflow cleanup path.
-        if !workflows.iter().any(|w| w.name == state.workflow) {
+        // The run's own workflow must be among those provided, or it couldn't be resumed. Check
+        // BEFORE mutating any state: recording the decision + flipping to Running first would
+        // leave the run stuck (un-resumable, no longer awaiting).
+        let Some(workflow) = workflows.iter().find(|w| w.name == state.workflow) else {
             return Err(Error::Input(format!(
                 "run {run_id} targets workflow {:?}, which was not provided — pass its file via \
                  --workflow",
                 state.workflow.as_str()
             )));
-        }
+        };
         if state.status != RunStatus::AwaitingApproval {
             return Err(Error::Input(format!(
                 "run {run_id} is not awaiting approval (status is {:?})",
@@ -1840,12 +1803,119 @@ impl Engine for LocalEngine {
                 note,
             },
         );
-        // Flip to Running so `resume_all` picks it up, then resume.
+        // Flip to Running, then resume THIS run (not the all-runs sweep): resuming only the
+        // decided run keeps the claim meaningful and avoids disturbing other in-flight runs.
         state.status = RunStatus::Running;
         state.updated_at = Utc::now();
         store.checkpoint(&state).await?;
-        let summaries = self.resume_all(workflows).await?;
-        Ok(summaries.into_iter().find(|s| s.run_id == run_id))
+        match self.resume_state(workflow, state).await? {
+            Some(summary) => Ok(Some(summary)),
+            // A paused run always kept its workspace, so this is unreachable in practice; treat
+            // a missing workspace as a resume failure rather than a silent success.
+            None => Err(Error::Input(format!(
+                "run {run_id} has no workspace handle; cannot resume"
+            ))),
+        }
+    }
+}
+
+impl LocalEngine {
+    /// Resumes a single already-loaded run to its next stopping point (terminal, or paused
+    /// again at a gate). The caller MUST hold the run's [`claim_run`] guard for the duration —
+    /// two concurrent resumes of one run would double-run its side effects. Returns `Ok(None)`
+    /// if the run can't be resumed because its workspace handle is absent.
+    async fn resume_state(
+        &self,
+        workflow: &Workflow,
+        mut state: RunState,
+    ) -> Result<Option<RunSummary>> {
+        let sweep_cancel = CancelToken::new();
+        let Some(handle) = state.workspace.clone() else {
+            return Ok(None);
+        };
+        let started_at = state.created_at;
+
+        // Crash recovery is per-run, never all-or-nothing: one run's failure must not
+        // abort the others or leave it stuck Running forever.
+        let summary = if handle.path.exists() {
+            match Self::resolve_params(workflow, &state.input) {
+                Ok(params) => {
+                    let cancel = CancelToken::new();
+                    let run_span = tracing::info_span!(
+                        "run",
+                        run_id = %state.run_id,
+                        workflow = %workflow.name,
+                        durable = workflow.durable,
+                        resumed = true,
+                    );
+                    tracing::info!(parent: &run_span, "resuming run");
+                    let exec = self
+                        .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
+                        .instrument(run_span)
+                        .await;
+                    match exec {
+                        // Paused again at an approval gate — keep the workspace + ref; the
+                        // run stays AwaitingApproval until the next decision.
+                        Ok(r) if r.suspended.is_some() => {
+                            let gate = r.suspended.clone();
+                            state.status = RunStatus::AwaitingApproval;
+                            state.updated_at = Utc::now();
+                            self.checkpoint(workflow.durable, &state).await?;
+                            tracing::info!(run_id = %state.run_id, gate = ?gate, "resumed run paused for approval");
+                            Self::suspended_summary(
+                                state.run_id,
+                                workflow,
+                                &r,
+                                started_at,
+                                &state.steps,
+                            )
+                        }
+                        terminal => {
+                            // Reclaim the run's snapshot refs unconditionally (matches run()
+                            // and the unserved-workflow path): a retrying step snapshots even
+                            // in a non-durable run, and the durable flag may have flipped, so
+                            // either can leave a ref. `delete_snapshot_ref` no-ops if none.
+                            self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
+                                .await;
+                            let workspace = self.make_workspace(&workflow.workspace);
+                            self.release_workspace(&workspace, handle).await;
+                            match terminal {
+                                Ok(result) => {
+                                    // `summarize` derives the run-level error from the first
+                                    // failed step's recorded reason (single source of truth).
+                                    let (status, summary) = Self::summarize(
+                                        state.run_id,
+                                        workflow,
+                                        result,
+                                        None,
+                                        started_at,
+                                    );
+                                    state.status = status;
+                                    state.error = summary.error.clone();
+                                    state.updated_at = Utc::now();
+                                    self.checkpoint(workflow.durable, &state).await?;
+                                    summary
+                                }
+                                Err(e) => {
+                                    self.fail_run(workflow, &mut state, &e.to_string()).await?
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
+            }
+        } else {
+            // The workspace is gone (host moved, manual cleanup); cannot resume. The
+            // snapshot refs live in the shared main repo, so reclaim them there (best
+            // effort, no-op when none) even though the worktree dir is gone — unconditional
+            // for the same reason as the path above.
+            self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
+                .await;
+            self.fail_run(workflow, &mut state, "workspace is gone; cannot resume")
+                .await?
+        };
+        Ok(Some(summary))
     }
 }
 
@@ -3307,6 +3377,43 @@ steps:
             .unwrap()
             .unwrap();
         assert_eq!(s2.status, RunStatus::Succeeded, "error: {:?}", s2.error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_approvals_resume_the_run_exactly_once() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+        let run_id = s1.run_id;
+
+        // Two decisions land at once (e.g. a double-submitted HTTP approve). Without the per-run
+        // claim, both would pass the status check and each resume the run — running `ship` twice.
+        let (e1, e2, w1, w2) = (eng.clone(), eng.clone(), wf.clone(), wf.clone());
+        let t1 = tokio::spawn(async move {
+            e1.submit_approval(run_id, Decision::Approved, "a".to_owned(), None, &[w1])
+                .await
+        });
+        let t2 = tokio::spawn(async move {
+            e2.submit_approval(run_id, Decision::Approved, "b".to_owned(), None, &[w2])
+                .await
+        });
+        let (r1, r2) = tokio::join!(t1, t2);
+        let (r1, r2) = (r1.unwrap(), r2.unwrap());
+
+        let ok = |r: &Result<Option<RunSummary>>| matches!(r, Ok(Some(_)));
+        assert_eq!(
+            usize::from(ok(&r1)) + usize::from(ok(&r2)),
+            1,
+            "exactly one approval should resume the run; got r1={r1:?} r2={r2:?}"
+        );
+        // And the run reached its terminal state exactly once.
+        let final_summary = eng.summary(run_id).await.unwrap().unwrap();
+        assert_eq!(final_summary.status, RunStatus::Succeeded);
     }
 
     /// A provider that always replies with a fixed string (a stand-in judge/agent).

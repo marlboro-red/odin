@@ -197,6 +197,10 @@ odin reject  <RUN_ID> --workflow <FILE> --by bob   --note "fix the failing test"
 The resumed run summary is printed. **Exit:** `0` succeeded or paused again; `1` failed
 (incl. a reject); `2` unknown run / not awaiting / store error.
 
+A long-running [`odind`](daemon.md) can also be decided over HTTP — a signed
+[`POST /approve`](daemon.md#approving-a-paused-run-over-http) is the daemon-side equivalent of
+these commands.
+
 ---
 
 ## JSON shapes

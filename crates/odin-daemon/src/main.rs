@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
-use odin_core::ir::TriggerDecl;
+use odin_core::ir::{StepKind, TriggerDecl};
 use odin_core::telemetry::{self, Options};
 use odin_core::{EngineBuilder, SqliteStore, Workflow};
 use odin_daemon::{Daemon, WebhookServer};
@@ -40,8 +40,8 @@ struct Cli {
     /// SQLite state database. Defaults to `<repo>/.odin/state.db`.
     #[arg(long, value_name = "FILE")]
     db: Option<PathBuf>,
-    /// Address the webhook HTTP server binds to (only started if a workflow declares a
-    /// `github_webhook` trigger).
+    /// Address the HTTP server binds to (started if a workflow declares a `github_webhook`
+    /// trigger or an `approval` gate — serving `/webhook` and/or `/approve`).
     #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:9292")]
     webhook_addr: SocketAddr,
     /// Maximum runs executing concurrently across the daemon (default 4). A burst of events
@@ -138,13 +138,26 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Fail closed: a network-facing webhook trigger without a verification secret would
-    // accept requests from anyone. Only an explicit opt-in permits running unsigned.
-    if !webhook_server.is_empty() && !has_secret && !cli.webhook_allow_unsigned {
+    // Expose `POST /approve` when any workflow has an approval gate, so paused runs can be
+    // decided over HTTP (the daemon-side equivalent of `odin approve`/`reject`). The handler
+    // resumes inline, so it needs a shared engine handle and the loaded workflow set.
+    let has_approvals = workflows.iter().any(|w| {
+        w.steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Approval(_)))
+    });
+    if has_approvals {
+        webhook_server.enable_approvals(engine.clone(), Arc::from(workflows.clone()));
+    }
+
+    // Fail closed: a network-facing endpoint without a verification secret would accept
+    // requests from anyone — and `/approve` mutates run state. Only an explicit opt-in permits
+    // running unsigned.
+    if webhook_server.serves() && !has_secret && !cli.webhook_allow_unsigned {
         anyhow::bail!(
-            "a github_webhook trigger is declared but no secret is configured; set \
-             --webhook-secret or $ODIN_WEBHOOK_SECRET (or pass --webhook-allow-unsigned for \
-             local testing without signature verification)"
+            "a github_webhook trigger or an approval gate exposes a network endpoint, but no \
+             secret is configured; set --webhook-secret or $ODIN_WEBHOOK_SECRET (or pass \
+             --webhook-allow-unsigned for local testing without signature verification)"
         );
     }
 
@@ -167,13 +180,12 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
-    let result = if webhook_server.is_empty() {
-        daemon.run().await
-    } else {
+    let result = if webhook_server.serves() {
         tracing::info!(
             subscriptions = webhook_server.subscription_count(),
+            approvals = has_approvals,
             body_cap_mib = 25,
-            "webhook server configured"
+            "http server configured"
         );
         let bound = webhook_server.bind().await?;
         // No built-in TLS: a non-loopback bind over plain HTTP must sit behind a
@@ -185,10 +197,13 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
                  reverse proxy in front of it"
             );
         }
-        tracing::info!(url = %format_args!("http://{}/webhook", bound.local_addr()), "webhook server listening");
+        tracing::info!(addr = %bound.local_addr(), "http server listening (/webhook, /approve, /health)");
         // Drive the supervisor loop and the HTTP server together; both end on shutdown.
         let (daemon_res, server_res) = tokio::join!(daemon.run(), bound.serve(shutdown));
         daemon_res.and(server_res)
+    } else {
+        // No webhook trigger and no approval gate: run the supervisor loop alone.
+        daemon.run().await
     };
     signal.abort();
     result

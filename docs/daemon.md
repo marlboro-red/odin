@@ -134,6 +134,42 @@ Point a GitHub webhook (content type `application/json`, secret = your `--webhoo
 This unlocks the marquee flow — label an issue, and `issues.labeled → issue-to-pr` runs. See
 [`examples/issue-to-pr.yaml`](../examples/issue-to-pr.yaml).
 
+### Approving a paused run over HTTP
+
+When any loaded workflow has an [`approval` gate](workflow-reference.md#approval-step), the same
+HTTP server also exposes `POST /approve` — the daemon-side equivalent of
+[`odin approve`/`reject`](cli.md#approving-a-paused-run). (The presence of an approval gate, like
+a webhook trigger, is enough to start the server even with no webhooks declared.)
+
+It is **signature-verified with the same secret** as `/webhook` (`X-Hub-Signature-256`,
+HMAC-SHA256 over the raw body) and subject to the same [fail-closed rule](#security): the daemon
+refuses to start if a gate is present but no secret is configured (unless
+`--webhook-allow-unsigned`). The JSON body is:
+
+```jsonc
+{
+  "run_id": "…",           // the paused run's id (UUID)
+  "decision": "approved",  // or "rejected"
+  "approver": "alice",     // optional (default "http"); recorded for the audit trail
+  "note": "lgtm"           // required on a reject (the feedback)
+}
+```
+
+Unlike `/webhook` (which only enqueues), `/approve` records the decision and **resumes the run
+inline**, then answers with the resulting [`RunSummary`](cli.md#json-shapes) as JSON — so the
+caller sees whether the run completed, **failed** (a reject), or paused again at a later gate.
+Responses: `200` applied; `400` malformed body / bad run id / a reject with no note; `401`/`400`
+bad/missing signature; `404` unknown run; `409` the run isn't awaiting approval (e.g. already
+decided) or its workflow isn't loaded by this daemon; `503` no workflow has an approval gate.
+A resumed run is **not** counted against `--max-concurrent-runs` — an approval is a rare operator
+action, not trigger-driven load.
+
+```sh
+curl -sS http://127.0.0.1:9292/approve \
+  -H "X-Hub-Signature-256: sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')" \
+  -d "$BODY"   # BODY='{"run_id":"…","decision":"approved","approver":"alice"}'
+```
+
 ### Limits
 
 - Request bodies are capped at **25 MiB** (GitHub's payload cap).
@@ -146,11 +182,12 @@ This unlocks the marquee flow — label an issue, and `issues.labeled → issue-
 
 ## Security
 
-`odind` is **fail-closed**: if a workflow declares a `github_webhook` trigger and **no secret**
-is configured (neither `--webhook-secret` nor a non-empty `$ODIN_WEBHOOK_SECRET`), the daemon
-**refuses to start** — unless you explicitly pass `--webhook-allow-unsigned` for local
-testing. A network-facing endpoint without signature verification would accept requests from
-anyone.
+`odind` is **fail-closed**: if a workflow declares a `github_webhook` trigger **or an
+[`approval` gate](#approving-a-paused-run-over-http)** and **no secret** is configured (neither
+`--webhook-secret` nor a non-empty `$ODIN_WEBHOOK_SECRET`), the daemon **refuses to start** —
+unless you explicitly pass `--webhook-allow-unsigned` for local testing. A network-facing
+endpoint without signature verification would accept requests from anyone — and `/approve`
+mutates run state.
 
 There is **no built-in TLS** and **no HTTP-edge rate limiting** by design — both belong at a
 fronting reverse proxy:
