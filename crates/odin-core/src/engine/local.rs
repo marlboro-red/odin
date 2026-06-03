@@ -59,7 +59,7 @@ use crate::provider::process::{ProcessOptions, run_process};
 use crate::registry::Registry;
 use crate::traits::{
     AcquireCtx, ActionCtx, CancelToken, InvocationCtx, RunEvent, RunState, StepState, Store,
-    Workspace,
+    Workspace, WorkspaceHandle,
 };
 use crate::usage::Usage;
 use crate::workspace::{SlotPoolWorkspace, WorktreeWorkspace};
@@ -190,6 +190,35 @@ impl LocalEngine {
             .unwrap()
             .insert(key, Arc::clone(&workspace));
         workspace
+    }
+
+    /// Acquires a workspace, serializing `worktree` acquisition under the same lock as scratch
+    /// worktrees. `git worktree add`/`remove` mutate the repo's shared `.git/worktrees/`
+    /// metadata, which is NOT safe for concurrent runs to touch at once — a concurrent add and
+    /// remove corrupt it (`fatal: failed to read .../commondir`), failing a run. `slot_pool`
+    /// (and custom kinds) acquire without the lock; they don't touch worktree metadata.
+    async fn acquire_workspace(
+        &self,
+        workspace: &Arc<dyn Workspace>,
+        ctx: AcquireCtx,
+    ) -> std::result::Result<WorkspaceHandle, crate::error::WorkspaceError> {
+        if workspace.kind() == "worktree" {
+            let _guard = self.worktree_lock.lock().await;
+            workspace.acquire(ctx).await
+        } else {
+            workspace.acquire(ctx).await
+        }
+    }
+
+    /// Releases a workspace (best effort), serialized for `worktree` kinds — see
+    /// [`acquire_workspace`](Self::acquire_workspace).
+    async fn release_workspace(&self, workspace: &Arc<dyn Workspace>, handle: WorkspaceHandle) {
+        if workspace.kind() == "worktree" {
+            let _guard = self.worktree_lock.lock().await;
+            let _ = workspace.release(handle).await;
+        } else {
+            let _ = workspace.release(handle).await;
+        }
     }
 
     async fn checkpoint(&self, durable: bool, state: &RunState) -> Result<()> {
@@ -1382,11 +1411,14 @@ impl Engine for LocalEngine {
         let run_id = RunId::new();
         let started_at = Utc::now();
         let workspace = self.make_workspace(&workflow.workspace);
-        let handle = workspace
-            .acquire(AcquireCtx {
-                run_id,
-                config: workflow.workspace.clone(),
-            })
+        let handle = self
+            .acquire_workspace(
+                &workspace,
+                AcquireCtx {
+                    run_id,
+                    config: workflow.workspace.clone(),
+                },
+            )
             .await?;
         let workdir = handle.path.clone();
 
@@ -1407,7 +1439,7 @@ impl Engine for LocalEngine {
             updated_at: started_at,
         };
         if let Err(e) = self.checkpoint(workflow.durable, &state).await {
-            let _ = workspace.release(handle).await;
+            self.release_workspace(&workspace, handle).await;
             return Err(e);
         }
         self.emit(run_id, RunEvent::RunStarted { at: started_at })
@@ -1422,7 +1454,7 @@ impl Engine for LocalEngine {
         // even in a NON-durable run (for per-retry workdir restore), so either kind can leave
         // the ref behind. `delete_snapshot_ref` is a no-op when no ref was created.
         self.delete_snapshot_ref(&workdir, run_id, &cancel).await;
-        let _ = workspace.release(handle).await;
+        self.release_workspace(&workspace, handle).await;
 
         let (exec, error) = match exec {
             Ok(r) => (r, None),
@@ -1496,10 +1528,8 @@ impl Engine for LocalEngine {
                         // `delete_snapshot_ref` is a no-op when none was created.
                         self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
                             .await;
-                        let _ = self
-                            .make_workspace(&workflow.workspace)
-                            .release(handle)
-                            .await;
+                        let workspace = self.make_workspace(&workflow.workspace);
+                        self.release_workspace(&workspace, handle).await;
                         match exec {
                             Ok(result) => {
                                 // `summarize` derives the run-level error from the first failed
@@ -3174,6 +3204,38 @@ steps:
             elapsed < std::time::Duration::from_millis(1300),
             "three 0.5s scratch steps took {elapsed:?}; expected concurrency (~0.5s, not ~1.5s)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_runs_on_one_worktree_repo_do_not_race() {
+        // Regression (CI-caught): N concurrent runs each `git worktree add`/`remove` on the
+        // SAME repo. git's `.git/worktrees/` metadata is global and not safe for concurrent
+        // mutation — an unserialized add racing a remove fails with "failed to read
+        // .../commondir", failing a run. With acquire/release serialized, all N must succeed.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf =
+            parse("name: c\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n");
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let eng = Arc::clone(&eng);
+            let wf = wf.clone();
+            tasks.push(tokio::spawn(async move {
+                eng.run(&wf, RunInput::manual()).await
+            }));
+        }
+        for t in tasks {
+            let summary = t.await.unwrap().unwrap();
+            assert_eq!(
+                summary.status,
+                RunStatus::Succeeded,
+                "a concurrent run failed (worktree metadata race): {:?}",
+                summary.error
+            );
+        }
     }
 
     /// A scratch step that edits files then FAILS still surfaces its diff (a failed
