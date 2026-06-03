@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::WorkspaceHandle;
-use crate::api::{RunInput, RunStatus, StepStatus};
+use crate::api::{RunInput, RunStatus, SideEffect, StepStatus};
 use crate::error::StoreError;
 use crate::ids::{ArtifactName, RunId, StepId, WorkflowId};
 use crate::usage::Usage;
@@ -124,6 +124,12 @@ pub struct StepState {
     /// LLM-as-judge score, if a judge ran.
     #[serde(default)]
     pub judge_score: Option<f32>,
+    /// Outward effects the step recorded (a PR opened, a branch pushed, a commit, a comment, an
+    /// artifact). Persisted so a resumed run can reconstruct the full set without re-running the
+    /// already-finished steps that produced them — otherwise a crash would silently drop every
+    /// side effect from before it. Empty for steps that produced none.
+    #[serde(default)]
+    pub side_effects: Vec<SideEffect>,
     /// Why the step failed (exit code + stderr tail, a failed gate, a sub-threshold judge, a
     /// provider/action error) — or, for a `Skipped` step, why it was skipped (an upstream
     /// dependency failed). Persisted so a failed run is debuggable. `None` for a passed step.

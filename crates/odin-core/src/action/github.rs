@@ -8,12 +8,51 @@ use crate::api::SideEffect;
 use crate::error::ActionError;
 use crate::traits::{Action, ActionCtx, ActionOutcome};
 
-/// `github.open_pr` — runs `gh pr create` in the workspace.
+/// `github.open_pr` — opens a pull request with the `gh` CLI.
 ///
 /// Args: `title` (required), `body` (default empty), `base`/`head` (optional; default to
 /// the repo default branch / current branch). Requires `gh` on `PATH`, an authenticated
 /// session, a GitHub remote, and the branch already pushed (use `git.push` first).
+///
+/// **Idempotent:** before creating, it checks for an existing open PR on the head branch and
+/// returns that one if found. So a crash-resumed run (or any re-invocation) that already opened
+/// the PR reattaches to it instead of failing with "a pull request already exists" or opening a
+/// duplicate — preserving the durability contract across the action's non-atomic boundary.
 pub struct OpenPr;
+
+/// Parses `gh pr list --json number,url` output, returning the first PR's `(number, url)`.
+fn first_pr(stdout: &str) -> Option<(u64, String)> {
+    let value: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let first = value.as_array()?.first()?;
+    let number = first.get("number")?.as_u64()?;
+    let url = first.get("url")?.as_str()?.to_owned();
+    Some((number, url))
+}
+
+/// The current branch name in `workdir`, or `None` if detached/unresolvable.
+async fn current_branch(workdir: &std::path::Path) -> Option<String> {
+    let out = super::exec("git", &["rev-parse", "--abbrev-ref", "HEAD"], workdir)
+        .await
+        .ok()?;
+    if out.exit_code != 0 {
+        return None;
+    }
+    let branch = out.stdout.trim();
+    // "HEAD" means a detached checkout — there is no branch to key a PR on.
+    (!branch.is_empty() && branch != "HEAD").then(|| branch.to_owned())
+}
+
+/// Builds the action outcome for a PR `(number, url)` — same shape for a found or created PR.
+fn pr_outcome(number: u64, url: String) -> ActionOutcome {
+    let mut outputs = IndexMap::new();
+    outputs.insert("url".to_owned(), Value::String(url.clone()));
+    outputs.insert("number".to_owned(), Value::Number(number.into()));
+    ActionOutcome {
+        exit_code: 0,
+        outputs,
+        side_effects: vec![SideEffect::pull_request(url, number)],
+    }
+}
 
 #[async_trait]
 impl Action for OpenPr {
@@ -38,6 +77,35 @@ impl Action for OpenPr {
                     return Err(ActionError::Other(anyhow::anyhow!(
                         "github.open_pr {name} {v:?} is not a valid branch (must not start with '-')"
                     )));
+                }
+            }
+        }
+
+        // Idempotency: if an open PR already exists on the head branch (e.g. a prior attempt of
+        // this run opened it, then crashed before checkpointing), reattach to it rather than
+        // re-creating. Best-effort — a failed/empty query just falls through to create.
+        let head_branch = match head {
+            Some(h) => Some(h.to_owned()),
+            None => current_branch(&ctx.workdir).await,
+        };
+        if let Some(branch) = &head_branch {
+            let list = [
+                "pr",
+                "list",
+                "--head",
+                branch,
+                "--state",
+                "open",
+                "--json",
+                "number,url",
+                "--limit",
+                "1",
+            ];
+            if let Ok(out) = super::exec("gh", &list, &ctx.workdir).await {
+                if out.exit_code == 0 {
+                    if let Some((number, url)) = first_pr(&out.stdout) {
+                        return Ok(pr_outcome(number, url));
+                    }
                 }
             }
         }
@@ -77,20 +145,13 @@ impl Action for OpenPr {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
-        let mut outputs = IndexMap::new();
-        outputs.insert("url".to_owned(), Value::String(url.clone()));
-        outputs.insert("number".to_owned(), Value::Number(number.into()));
-        Ok(ActionOutcome {
-            exit_code: 0,
-            outputs,
-            side_effects: vec![SideEffect::pull_request(url, number)],
-        })
+        Ok(pr_outcome(number, url))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::OpenPr;
+    use super::{OpenPr, first_pr};
     use crate::ids::StepId;
     use crate::traits::{Action, ActionCtx};
     use indexmap::IndexMap;
@@ -127,6 +188,32 @@ mod tests {
         assert!(
             err.to_string().contains("head"),
             "expected a head-rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn first_pr_parses_an_existing_pr() {
+        // The idempotency query `gh pr list --json number,url` returns a JSON array.
+        let (n, url) =
+            first_pr(r#"[{"number":42,"url":"https://github.com/o/r/pull/42"}]"#).unwrap();
+        assert_eq!(n, 42);
+        assert_eq!(url, "https://github.com/o/r/pull/42");
+        // Multiple PRs: take the first (the query is --limit 1, but be tolerant).
+        let (n2, _) = first_pr(
+            r#"[{"number":7,"url":"https://github.com/o/r/pull/7"},{"number":9,"url":"x"}]"#,
+        )
+        .unwrap();
+        assert_eq!(n2, 7);
+    }
+
+    #[test]
+    fn first_pr_is_none_for_empty_or_malformed() {
+        assert!(first_pr("[]").is_none(), "no open PR → create one");
+        assert!(first_pr("").is_none());
+        assert!(first_pr("not json").is_none());
+        assert!(
+            first_pr(r#"[{"url":"x"}]"#).is_none(),
+            "missing number → can't reattach"
         );
     }
 }
