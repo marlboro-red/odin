@@ -35,11 +35,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 ";
 
+/// A composite index on `(workflow, status)` so the `/metrics` aggregate (`GROUP BY workflow,
+/// status`) streams from the index in group order instead of scanning every row and building a
+/// temp B-tree. The pre-existing `runs_status` index (on `status` alone) can't serve a grouping
+/// that leads with `workflow`.
+const SCHEMA_V2_METRICS_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS runs_workflow_status ON runs(workflow, status);";
+
 /// Ordered migrations tracked by SQLite's `PRAGMA user_version`. The entry at index `i`
 /// upgrades the database from version `i` to `i + 1` (so `MIGRATIONS.len()` is the current
 /// version). **Append** new migrations; never edit or reorder a released one — an in-place
 /// edit would not re-run on a database already at that version.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2_METRICS_INDEX];
 
 /// A durable run store backed by a SQLite database.
 pub struct SqliteStore {
