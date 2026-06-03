@@ -19,8 +19,9 @@ use crate::validate::rules::{step_ptr, suggest};
 /// The engine-reserved artifact, always referenceable.
 const DIFF: &str = "DIFF";
 
-/// Roots that are always allowed but whose children are not statically modeled.
-const OPEN_ROOTS: &[&str] = &["trigger", "run"];
+/// Roots that are always allowed but whose children are not statically modeled. `retry` exposes
+/// the per-attempt `retry.attempt` / `retry.feedback` to every step (see `retry.feedback`).
+const OPEN_ROOTS: &[&str] = &["trigger", "run", "retry"];
 
 /// Checks every template reference in the workflow, appending diagnostics.
 pub(crate) fn check(
@@ -290,9 +291,16 @@ fn check_var(
         }
         r if OPEN_ROOTS.contains(&r) => { /* allowed; children not modeled */ }
         other => {
+            // Derive the hint from the actual root sets so it can't drift when a root is added.
+            let roots = CHECKED_ROOTS
+                .iter()
+                .chain(OPEN_ROOTS)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
             d.push(
                 unknown_ref(pointer, &format!("{other:?}"))
-                    .with_help("valid roots: params, trigger, steps, artifacts, run".to_owned()),
+                    .with_help(format!("valid roots: {roots}")),
             );
         }
     }

@@ -58,7 +58,7 @@ use crate::api::{
 use crate::context::render::{build_context, eval_when, render_template};
 use crate::error::{Error, Result};
 use crate::ids::{RunId, StepId};
-use crate::ir::{Backoff, JudgeSpec, Step, StepKind, Workflow, WorkspaceConfig};
+use crate::ir::{Backoff, FeedbackMode, JudgeSpec, Step, StepKind, Workflow, WorkspaceConfig};
 use crate::provider::process::{ProcessOptions, run_process};
 use crate::registry::Registry;
 use crate::traits::{
@@ -113,6 +113,12 @@ struct StepOutcome {
     gates: IndexMap<String, bool>,
     side_effects: Vec<SideEffect>,
     error: Option<String>,
+    /// The raw, *un-wrapped* failure diagnostic (gate stdout+stderr, the exit stderr, or the
+    /// judge verdict) — what `retry.feedback` surfaces so a retried step can self-correct. Unlike
+    /// `error` (a human/log summary like `gate "test" failed\nstderr:\n…`), this has no synthetic
+    /// headline, so the *first line* is real content. `None` on success or when there is no detail
+    /// beyond `error`. Transient — not persisted to `StepState`.
+    failure_detail: Option<String>,
     /// Captured stderr from the dispatch (provider/`run:`), folded into `error` on failure.
     /// Transient — not persisted to `StepState`.
     stderr: String,
@@ -130,6 +136,7 @@ impl StepOutcome {
             gates: IndexMap::new(),
             side_effects: Vec::new(),
             error: Some(error.into()),
+            failure_detail: None,
             stderr: String::new(),
             attempts: 1,
             judge_score: None,
@@ -145,6 +152,7 @@ impl StepOutcome {
             gates: IndexMap::new(),
             side_effects: Vec::new(),
             error: None,
+            failure_detail: None,
             stderr: String::new(),
             attempts: 1,
             judge_score: None,
@@ -601,15 +609,17 @@ impl LocalEngine {
             return outcome;
         }
         if outcome.exit_code.unwrap_or(0) != 0 {
+            let code = outcome.exit_code.unwrap_or(-1);
+            let headline = format!("exited with code {code}");
+            outcome.failure_detail = Some(failure_detail(&headline, &outcome.stderr));
             outcome.status = StepStatus::Failed;
-            outcome.error = Some(with_stderr_tail(
-                &format!("exited with code {}", outcome.exit_code.unwrap_or(-1)),
-                &outcome.stderr,
-            ));
+            outcome.error = Some(with_stderr_tail(&headline, &outcome.stderr));
             return outcome;
         }
 
-        // Gates: every named command must exit 0.
+        // Gates: every named command must exit 0. Capture BOTH streams — most verifiers put the
+        // actionable detail on stdout (test runners: which assertion failed) while compilers use
+        // stderr — so `retry.feedback` needs both to be useful.
         for (name, command) in &step.gates {
             let cmd = match render_template(command, ctx, "gate") {
                 Ok(s) => s,
@@ -619,17 +629,16 @@ impl LocalEngine {
                     return outcome;
                 }
             };
-            let (passed, gate_stderr) = match self.shell(&cmd, workdir, timeout, cancel).await {
-                Ok((code, _, stderr)) => (code == 0, stderr),
+            let (passed, gate_output) = match self.shell(&cmd, workdir, timeout, cancel).await {
+                Ok((code, stdout, stderr)) => (code == 0, join_streams(&stdout, &stderr)),
                 Err(e) => (false, e.to_string()),
             };
             outcome.gates.insert(name.as_str().to_owned(), passed);
             if !passed {
+                let headline = format!("gate {:?} failed", name.as_str());
+                outcome.failure_detail = Some(failure_detail(&headline, &gate_output));
                 outcome.status = StepStatus::Failed;
-                outcome.error = Some(with_stderr_tail(
-                    &format!("gate {:?} failed", name.as_str()),
-                    &gate_stderr,
-                ));
+                outcome.error = Some(with_stderr_tail(&headline, &gate_output));
             }
         }
 
@@ -779,6 +788,8 @@ impl LocalEngine {
             None
         };
         let mut attempt: u32 = 0;
+        // The prior attempt's failure reason, fed forward to the next attempt as `retry.feedback`.
+        let mut prior_error: Option<String> = None;
         let outcome = loop {
             attempt += 1;
             // Before a *retry*, rewind the workdir to the pre-step snapshot.
@@ -796,11 +807,24 @@ impl LocalEngine {
                 },
             )
             .await;
-            let mut outcome = self.exec_step(step, ctx, workdir, timeout, cancel).await;
+            // Per-attempt context: always exposes `retry.attempt`; on a retry with `feedback`
+            // enabled, `retry.feedback` carries the prior failure so the prompt can address it.
+            let attempt_ctx =
+                attempt_context(ctx, step.retry.feedback, attempt, prior_error.as_deref());
+            let mut outcome = self
+                .exec_step(step, &attempt_ctx, workdir, timeout, cancel)
+                .await;
             if outcome.status != StepStatus::Failed || attempt >= max_attempts {
                 outcome.attempts = u8::try_from(attempt).unwrap_or(u8::MAX);
                 break outcome;
             }
+            // Feed the *un-wrapped* diagnostic forward (so `concise` sees real content, not a
+            // synthetic headline); fall back to the summary `error` for failure kinds without a
+            // dedicated detail (judge/provider/action errors are already single-line).
+            prior_error = outcome
+                .failure_detail
+                .clone()
+                .or_else(|| outcome.error.clone());
             tokio::time::sleep(backoff_delay(step.retry.backoff, attempt)).await;
         };
         // The retry rewind point is dead once the step settles; drop its ref so the snapshot
@@ -2085,6 +2109,7 @@ fn skipped_outcome() -> StepOutcome {
         gates: IndexMap::new(),
         side_effects: Vec::new(),
         error: None,
+        failure_detail: None,
         stderr: String::new(),
         attempts: 1,
         judge_score: None,
@@ -2146,6 +2171,45 @@ fn with_stderr_tail(message: &str, stderr: &str) -> String {
         "{message}\nstderr (last {MAX} bytes):\n…{}",
         &stderr[start..]
     )
+}
+
+/// Joins a command's `stdout` and `stderr` into one diagnostic blob (stderr first, since it
+/// usually carries the error summary), trimming each and dropping an empty stream. Used for gate
+/// failures, where the actionable detail may land on either stream depending on the tool.
+fn join_streams(stdout: &str, stderr: &str) -> String {
+    match (stderr.trim(), stdout.trim()) {
+        ("", out) => out.to_owned(),
+        (err, "") => err.to_owned(),
+        (err, out) => format!("{err}\n{out}"),
+    }
+}
+
+/// Upper bound on the bytes of failure context fed into `retry.feedback`. Each retry re-renders a
+/// (paid) provider prompt, so the feedback is capped regardless of which failure path produced it.
+const FEEDBACK_MAX: usize = 2000;
+
+/// The last `max` bytes of `s` on a char boundary, prefixed with `…` when truncated.
+fn clip_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &s[start..])
+}
+
+/// The raw diagnostic `retry.feedback` surfaces: the un-wrapped `detail` (tail-capped to the most
+/// recent bytes, with no synthetic headline so its *first* line is real content), or the `headline`
+/// alone when there is no detail. Distinct from [`with_stderr_tail`], which keeps the headline for a
+/// human/log summary.
+fn failure_detail(headline: &str, detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return headline.to_owned();
+    }
+    clip_tail(detail, FEEDBACK_MAX)
 }
 
 /// Base inter-attempt retry delay.
@@ -2242,8 +2306,42 @@ fn build_ctx(
         "steps": steps_obj,
         "artifacts": artifacts,
         "run": { "id": state.run_id.to_string(), "workflow": workflow.name.as_str() },
+        // A default `retry` root so `retry.*` resolves in EVERY template position — including a
+        // step-level `when:` guard, evaluated once before any attempt. `attempt_context` overrides
+        // this per attempt for the step body; here it reflects the pre-attempt state.
+        "retry": { "attempt": 1, "feedback": "" },
     });
     build_context(&root)
+}
+
+/// Builds a step's per-attempt template context: the base context with its `retry` root *replaced*
+/// by one carrying the 1-based `attempt` and — when `feedback` is enabled and a prior attempt
+/// failed — that failure's un-wrapped diagnostic as `feedback` (empty otherwise). The explicit
+/// `retry` overrides the default seeded by `build_ctx` (verified: spread keys lose to explicit).
+/// `retry.attempt` is always present so a prompt can branch on `{% if retry.attempt > 1 %}`.
+fn attempt_context(
+    base: &minijinja::Value,
+    feedback: FeedbackMode,
+    attempt: u32,
+    prior_error: Option<&str>,
+) -> minijinja::Value {
+    let fb = match feedback {
+        FeedbackMode::Off => String::new(),
+        // First *non-blank* line of the un-wrapped failure — a brief signal. (For multi-line tool
+        // output the headline may not be the whole story; `verbose` is the mode for that.)
+        FeedbackMode::Concise => prior_error
+            .and_then(|e| e.lines().find(|l| !l.trim().is_empty()))
+            .unwrap_or_default()
+            .to_owned(),
+        FeedbackMode::Verbose => prior_error.unwrap_or_default().to_owned(),
+    };
+    // Bound the feedback regardless of mode/source: gate/exit detail is already ≤ FEEDBACK_MAX, but
+    // a provider/action error string (the fallback source) or a pathological single line is not.
+    let fb = clip_tail(&fb, FEEDBACK_MAX);
+    minijinja::context! {
+        retry => minijinja::context! { attempt => attempt, feedback => fb },
+        ..base.clone()
+    }
 }
 
 #[cfg(test)]
@@ -3420,6 +3518,109 @@ steps:
             "no guard matched and no else ⇒ selected is empty"
         );
         assert_eq!(s.status, RunStatus::Succeeded); // the selector still passes
+    }
+
+    #[tokio::test]
+    async fn retry_feedback_injects_the_prior_failure_into_the_next_attempt() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // Attempt 1 fails (exit 1); attempt 2 echoes `retry.feedback`, which must carry the prior
+        // failure reason ("exited with code 1") — proving the feedback loop, not a blind re-run.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: flaky\n    run: \"if [ {{ retry.attempt }} -eq 1 ]; then exit 1; fi; echo 'fb=[{{ retry.feedback }}]'\"\n    retry: { max: 1, feedback: concise }\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let flaky = s.steps.iter().find(|x| x.id.as_str() == "flaky").unwrap();
+        assert_eq!(flaky.attempts, 2, "should pass on the second attempt");
+        let stdout = flaky
+            .outputs
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            stdout.contains("exited with code 1"),
+            "retry.feedback should carry the prior failure; stdout: {stdout:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_attempt_is_one_with_feedback_off() {
+        // Without feedback, `retry.attempt` is still available (== 1 on the only attempt) and
+        // `retry.feedback` is empty.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"echo a=[{{ retry.attempt }}] f=[{{ retry.feedback }}]\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let st = s.steps.iter().find(|x| x.id.as_str() == "s").unwrap();
+        let stdout = st
+            .outputs
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            stdout.contains("a=[1]") && stdout.contains("f=[]"),
+            "stdout: {stdout:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_feedback_carries_gate_stdout_not_just_the_label() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // The gate writes its diagnostic to STDOUT (as test runners do) and fails on attempt 1,
+        // then passes on attempt 2. `retry.feedback` must carry that stdout — not the bare
+        // `gate "check" failed` label — or a self-correct loop has nothing to act on.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: s\n    run: \"echo 'fb=[{{ retry.feedback }}]'\"\n    gates:\n      check: \"if [ {{ retry.attempt }} -eq 1 ]; then echo 'ASSERT_FAIL left=4 right=5'; exit 1; fi\"\n    retry: { max: 1, feedback: verbose }\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let st = s.steps.iter().find(|x| x.id.as_str() == "s").unwrap();
+        assert_eq!(st.attempts, 2);
+        let stdout = st
+            .outputs
+            .get("stdout")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            stdout.contains("ASSERT_FAIL left=4 right=5"),
+            "gate stdout should reach retry.feedback; stdout: {stdout:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_root_resolves_in_a_when_guard_without_failing() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // A step-level `when:` is evaluated once, before any attempt, against the base context.
+        // `retry.*` must still resolve there (pre-attempt: attempt 1, empty feedback) rather than
+        // erroring under strict undefined-behavior and failing a workflow that validates clean.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"echo ok\", when: \"retry.attempt == 1 and retry.feedback == ''\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let st = s.steps.iter().find(|x| x.id.as_str() == "s").unwrap();
+        assert_eq!(
+            st.status,
+            StepStatus::Passed,
+            "the guard should be true, not error"
+        );
     }
 
     #[tokio::test]

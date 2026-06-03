@@ -406,13 +406,44 @@ pub struct RetrySpec {
     /// layer); parsed and validated so workflows are forward-compatible (`ODIN023`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_fallback_provider: Option<ProviderRef>,
+    /// Expose the prior attempt's failure reason to this step's templates as `retry.feedback`,
+    /// turning a retry into a feedback-driven self-correct loop (implement → verify → redo with
+    /// the failure as context). Defaults to `off` (a retry re-runs the identical prompt).
+    #[serde(default, skip_serializing_if = "FeedbackMode::is_off")]
+    pub feedback: FeedbackMode,
 }
 
 impl RetrySpec {
     /// True if this is the do-nothing default (used to skip it on serialize).
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.max == 0 && self.backoff == Backoff::Fixed && self.on_fallback_provider.is_none()
+        self.max == 0
+            && self.backoff == Backoff::Fixed
+            && self.on_fallback_provider.is_none()
+            && self.feedback == FeedbackMode::Off
+    }
+}
+
+/// What prior-attempt failure context a retried step exposes to its templates as
+/// `retry.feedback`. `retry.attempt` (the 1-based attempt number) is always available.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FeedbackMode {
+    /// No feedback — `retry.feedback` is empty and a retry re-runs the identical prompt (default).
+    #[default]
+    Off,
+    /// Expose the **first line** of the prior failure reason (the headline).
+    Concise,
+    /// Expose the **full** prior failure reason (exit/stderr tail, failed gate, or judge verdict).
+    Verbose,
+}
+
+impl FeedbackMode {
+    /// Used to skip the default on serialize.
+    #[must_use]
+    pub fn is_off(&self) -> bool {
+        matches!(self, FeedbackMode::Off)
     }
 }
 
@@ -490,6 +521,25 @@ mod tests {
         let twice = serde_yaml_ng::to_string(&parse(&once).unwrap()).unwrap();
         assert_eq!(once, twice, "case serialization should be idempotent");
         assert!(once.contains("case:") && once.contains("label: bug"));
+    }
+
+    #[test]
+    fn retry_feedback_parses_and_serializes() {
+        let s = parse("id: x\nrun: ./go\nretry: {max: 2, feedback: verbose}\n").unwrap();
+        assert_eq!(s.retry.max, 2);
+        assert!(matches!(s.retry.feedback, super::FeedbackMode::Verbose));
+        assert!(!s.retry.is_noop());
+        assert!(
+            serde_yaml_ng::to_string(&s)
+                .unwrap()
+                .contains("feedback: verbose"),
+            "feedback should serialize when set"
+        );
+        // The default (off) is the noop retry and is skipped on serialize.
+        let d = parse("id: y\nrun: ./go\n").unwrap();
+        assert!(matches!(d.retry.feedback, super::FeedbackMode::Off));
+        assert!(d.retry.is_noop());
+        assert!(!serde_yaml_ng::to_string(&d).unwrap().contains("feedback"));
     }
 
     #[test]

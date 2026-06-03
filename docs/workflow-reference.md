@@ -272,7 +272,50 @@ fails.
 retry:
   max: 2                      # additional attempts after the first (0 = no retry)
   backoff: exponential        # `fixed` (default) or `exponential`
+  feedback: concise           # `off` (default), `concise`, or `verbose`
   on_fallback_provider: codex # parsed + validated, but INERT in v1 (ODIN023)
+```
+
+A plain `retry` re-runs the step *blind* — the next attempt sees exactly the same prompt as
+the first. Set **`feedback`** to close the loop into an **implement → verify → redo** cycle:
+each attempt after the first re-renders the step's prompt with the prior failure available under
+a `retry.*` template root, so the agent can read what went wrong and correct it. The feedback is
+the failure's *diagnostic*: a gate's **combined stdout+stderr** (so test-runner output, which most
+tools write to stdout, is included), the failing command's stderr, or the judge's verdict.
+
+| `feedback` | What the next attempt sees in `retry.feedback`                                   |
+| ---------- | -------------------------------------------------------------------------------- |
+| `off`      | nothing — `retry.feedback` is empty (a blind retry)                              |
+| `concise`  | the **first non-blank line** of the diagnostic — a brief signal                  |
+| `verbose`  | the **full** diagnostic (capped at ~2 KB, most-recent output kept)               |
+
+Prefer **`verbose`** when the agent needs to *act on* the failure (compiler errors, a failing
+assertion span across several lines); `concise` is a lightweight signal best paired with output
+whose first line is the error. Two notes: `verbose` enlarges the prompt (and so the token cost) of
+each retry; and like any free text, `retry.feedback` can carry tool output — interpolate it into a
+provider `prompt` (as below), **not** into a `run:`/gate shell command, where untrusted text would
+reach a shell unescaped (cf. [ODIN031](#odin031)).
+
+The `retry.*` root resolves in every template position. In a step body it reflects the current
+attempt; in a step-level `when:` guard (evaluated once, before any attempt) it is the pre-attempt
+state — `retry.attempt == 1`, `retry.feedback` empty.
+
+| Field            | Value                                                            |
+| ---------------- | --------------------------------------------------------------- |
+| `retry.attempt`  | 1-based attempt number (`1` on the first try, `2` on the first retry, …) |
+| `retry.feedback` | the prior attempt's diagnostic, shaped by `feedback` (empty when `off` or on attempt 1) |
+
+```yaml
+- id: implement
+  provider: claude
+  prompt: |
+    Fix the failing test.
+    {% if retry.attempt > 1 %}
+    Your previous attempt failed:
+    {{ retry.feedback }}
+    {% endif %}
+  gates: { test: "cargo test" }
+  retry: { max: 3, feedback: verbose }
 ```
 
 ### Artifacts
@@ -335,6 +378,7 @@ rendered):
 | `{{ artifacts.DIFF }}` | The cumulative git diff captured so far (vs the run's base commit, refreshed after each passing non-`scratch` step). |
 | `{{ trigger.* }}` | The free-form trigger payload (e.g. a webhook event body). |
 | `{{ run.id }}` / `{{ run.workflow }}` | This run's id and its workflow name. |
+| `{{ retry.attempt }}` / `{{ retry.feedback }}` | This step's 1-based attempt number and the prior attempt's failure (see [Retry](#retry)). Empty on the first attempt. |
 
 References are checked statically: an unknown `params`/`steps`/`artifacts` reference, or a
 `steps.<id>` that isn't an upstream dependency, is [ODIN017](#odin017); a template that

@@ -168,6 +168,7 @@ error, never a silent empty string).
 | `steps.<id>.outputs.<k>` / `.exit_code` / `.status` | a step, iff `<id>` is a **transitive dependency** | `<id>` must be a declared, upstream step |
 | `artifacts.<NAME>` | a step, iff `<NAME>` ∈ its `requires` (or `DIFF`) | `<NAME>` checked |
 | `run.<…>` | everywhere | root only |
+| `retry.attempt` / `retry.feedback` | everywhere (per-attempt; see [retry feedback](workflow-reference.md#retry)) | root only |
 
 The dependency-awareness means a `steps.x` reference is only legal if `x` is reachable
 through `depends_on`, which stays correct as the DAG fans out.

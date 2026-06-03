@@ -1,0 +1,61 @@
+# A self-correcting "implement → verify → redo" loop built from a single step's `retry`.
+#
+#   odin validate examples/self-correct.yaml
+#
+# How the loop works here:
+#   - `implement` writes code, then its `gates` (`build`, `test`) run as the verifier. If a gate
+#     fails, the step fails — and because `retry.feedback` is set, the engine re-renders the
+#     prompt for the next attempt with the failing gate's combined stdout+stderr exposed under the
+#     `retry.*` template root. The agent reads what broke and corrects it, up to `retry.max` times.
+#   - `retry.attempt` is the 1-based try number; `retry.feedback` is empty on the first attempt,
+#     then carries the prior failure (`verbose` = the full diagnostic, used here so the agent sees
+#     the actual build/test output; `concise` = just its first line, a lighter signal).
+#   - This turns a blind retry into a closed feedback loop: the same single step is the
+#     implementer AND, via its gates, the verifier — no separate plumbing.
+#
+# This is a VALIDATION showcase, not runnable as-is: the `provider:` step needs the real claude
+# CLI and the gate commands assume a Cargo project at --repo. For an end-to-end run, start from
+# the README quickstart.
+
+schema_version: "1.0"
+name: self-correct
+version: "1.0.0"
+description: Implement a change, verify it with gates, and let the agent fix its own failures.
+durable: true
+workspace:
+  type: worktree
+
+params:
+  task:
+    type: string
+    default: "Add a `clamp(lo, hi)` method to the Range type and a unit test for it."
+    description: What to implement.
+
+steps:
+  - id: implement
+    provider: claude
+    prompt: |
+      {{ params.task }}
+
+      Edit the working tree, then make sure `cargo build` and `cargo test` both pass.
+      {% if retry.attempt > 1 %}
+
+      Attempt {{ retry.attempt }}: your previous attempt did NOT pass the gates. The failure was:
+
+          {{ retry.feedback }}
+
+      Read it carefully and fix the specific problem before anything else.
+      {% endif %}
+    gates:
+      build: "cargo build --quiet"
+      test: "cargo test --quiet"
+    retry:
+      max: 3
+      feedback: verbose # re-prompt with the full failing-gate output (build/test diagnostics)
+
+  # Runs only once the loop has converged: `implement` reached `passed` (its gates held), so the
+  # retry loop stopped. If `implement` instead exhausted its retries and failed, this step is
+  # skipped (its dependency did not pass), so a "converged" line only ever prints when gates held.
+  - id: report
+    run: "echo 'implement converged: {{ steps.implement.status }}'"
+    depends_on: [implement]
