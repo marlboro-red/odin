@@ -37,6 +37,18 @@ futures-util = { version = "0.3.32", default-features = false, optional = true }
 # Pinned below 0.40: rusqlite 0.40 pulls libsqlite3-sys 0.38, whose build script uses
 # the still-unstable `cfg_select!` and won't compile on stable.
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+# Structured logging/tracing. The engine *emits* spans/events via this facade; it pulls no
+# tokio, so the parse-only `ir` build stays runtime-free. A subscriber is installed only by the
+# binaries (see the `telemetry` feature), never by the library itself.
+tracing = { version = "0.1.41", optional = true }
+
+# Telemetry — a `tracing` subscriber + optional OTLP exporter, for the BINARIES to install via
+# `odin_core::telemetry`. Opt-in (off in `full`) so the default / `ir` / MSRV builds pay nothing.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"], optional = true }
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
 
 [dev-dependencies]
 serde_yaml_ng = "0.10.0"
@@ -57,11 +69,24 @@ runtime = [
     "dep:futures-core",
     "dep:futures-util",
     "dep:rusqlite",
+    "dep:tracing",
 ]
 # Ships the Noop/Mock trait impls for downstream tests.
 mock = ["runtime"]
-# Everything.
+# Everything (the library surface — telemetry/otlp are binary concerns, intentionally excluded).
 full = ["ir", "templating", "runtime"]
+# A binary-side convenience: `odin_core::telemetry::init` installs a `tracing` subscriber
+# (EnvFilter + text/JSON fmt). The `otlp` feature adds an OpenTelemetry OTLP span exporter.
+telemetry = ["runtime", "dep:tracing-subscriber"]
+# Adds an OpenTelemetry OTLP span exporter to `telemetry` (heavy: pulls tonic/grpc + the OTel
+# SDK). Off by default and excluded from `full`, so default / `ir` / MSRV builds stay lean.
+otlp = [
+    "telemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
 
 # The cross-model review example drives the engine with model-pinned providers, so it needs
 # the runtime + templating stack. Without this, a reduced-feature build (e.g. `--features ir`)

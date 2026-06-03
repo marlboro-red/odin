@@ -29,7 +29,7 @@ cron = "0.12.1"
 hex = "0.4.3"
 hmac = "0.12.1"
 indexmap = "2.12.0"
-odin-core = { workspace = true }
+odin-core = { workspace = true, features = ["telemetry"] }
 serde_json = "1.0.150"
 sha2 = "0.10.9"
 tokio = { version = "1.52.3", default-features = false, features = [
@@ -42,6 +42,12 @@ tokio = { version = "1.52.3", default-features = false, features = [
     "io-util",
 ] }
 tokio-util = { version = "0.7.18", default-features = false }
+tracing = "0.1.41"
+
+[features]
+# Compile the OpenTelemetry OTLP span exporter into `odind` (heavy; opt-in). Activate it at
+# runtime with `--otlp-endpoint <url>`; without this feature that flag is ignored with a warning.
+otlp = ["odin-core/otlp"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

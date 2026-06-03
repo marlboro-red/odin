@@ -137,6 +137,8 @@ odin-core = { version = "0.0.1", default-features = false, features = ["ir", "te
 - [Integration guide](docs/integration-guide.md) — embed `odin-core`: the five traits,
   `EngineBuilder`, custom plugins, data in/out, the daemon.
 - [`odin` CLI](docs/cli.md) and [`odind` daemon](docs/daemon.md) references.
+- [Observability](docs/observability.md) — structured `tracing` logs (text/JSON), `$ODIN_LOG`
+  levels, and optional OpenTelemetry/OTLP span export.
 - [Architecture](docs/architecture.md) — the layered design and data-flow contracts.
 - `cargo doc --open -p odin-core --all-features` — the API reference.
 

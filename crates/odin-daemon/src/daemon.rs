@@ -51,9 +51,9 @@ impl Daemon {
         let mut map: HashMap<WorkflowId, Workflow> = HashMap::new();
         for workflow in workflows {
             if let Some(prev) = map.insert(workflow.name.clone(), workflow) {
-                eprintln!(
-                    "odind: duplicate workflow name {:?}; the later definition replaces the earlier",
-                    prev.name.as_str()
+                tracing::warn!(
+                    workflow = %prev.name.as_str(),
+                    "duplicate workflow name; the later definition replaces the earlier"
                 );
             }
         }
@@ -111,9 +111,10 @@ impl Daemon {
                 if let TriggerDecl::Cron(cron) = decl {
                     match CronTrigger::new(&cron.schedule, workflow.name.clone()) {
                         Ok(trigger) => triggers.push(Box::new(trigger)),
-                        Err(e) => eprintln!(
-                            "odind: skipping cron trigger for workflow {:?}: {e}",
-                            workflow.name.as_str()
+                        Err(e) => tracing::warn!(
+                            workflow = %workflow.name.as_str(),
+                            error = %e,
+                            "skipping cron trigger (invalid schedule)"
                         ),
                     }
                 }
@@ -157,20 +158,20 @@ impl Daemon {
         let pending = self.workflows.values().cloned().collect::<Vec<_>>();
         match self.engine.resume_all(&pending).await {
             Ok(resumed) if !resumed.is_empty() => {
-                eprintln!("odind: resumed {} incomplete run(s)", resumed.len());
+                tracing::info!(count = resumed.len(), "resumed incomplete runs");
             }
             Ok(_) => {}
-            Err(e) => eprintln!("odind: resume_all failed: {e}"),
+            Err(e) => tracing::error!(error = %e, "resume_all failed"),
         }
 
         if self.triggers.is_empty() {
-            eprintln!("odind: no triggers registered; nothing to serve");
+            tracing::warn!("no triggers registered; nothing to serve");
             return Ok(());
         }
-        eprintln!(
-            "odind: serving {} trigger(s), up to {} run(s) at once",
-            self.triggers.len(),
-            self.max_concurrent_runs
+        tracing::info!(
+            triggers = self.triggers.len(),
+            max_concurrent_runs = self.max_concurrent_runs,
+            "serving"
         );
 
         // Bounds concurrent runs across ALL triggers; a burst queues for a free slot.
@@ -208,8 +209,9 @@ impl Daemon {
                                 // while this task holds an `Arc<Semaphore>`, but log rather than
                                 // drop the event silently if a future change ever closes it.
                                 let Ok(_permit) = permits.acquire_owned().await else {
-                                    eprintln!(
-                                        "odind: {kind} dispatch slot unavailable (semaphore closed); event dropped"
+                                    tracing::error!(
+                                        %kind,
+                                        "dispatch slot unavailable (semaphore closed); event dropped"
                                     );
                                     return;
                                 };
@@ -218,7 +220,7 @@ impl Daemon {
                         }
                         Ok(None) => break,
                         Err(e) => {
-                            eprintln!("odind: {kind} trigger stopped: {e}");
+                            tracing::error!(%kind, error = %e, "trigger stopped");
                             break;
                         }
                     }
@@ -229,7 +231,7 @@ impl Daemon {
         }
         while let Some(joined) = set.join_next().await {
             if let Err(e) = joined {
-                eprintln!("odind: trigger task panicked: {e}");
+                tracing::error!(error = %e, "trigger task panicked");
             }
         }
         Ok(())
@@ -238,31 +240,27 @@ impl Daemon {
 
 /// Looks up the event's target workflow and runs it, logging the outcome. A missing
 /// workflow or a failing run is logged and swallowed so the daemon stays up.
+#[tracing::instrument(
+    name = "dispatch",
+    skip_all,
+    fields(source = %event.source, workflow = %event.workflow.as_str())
+)]
 async fn dispatch(
     engine: &dyn Engine,
     workflows: &HashMap<WorkflowId, Workflow>,
     event: TriggerEvent,
 ) {
     let Some(workflow) = workflows.get(&event.workflow) else {
-        eprintln!(
-            "odind: event from {} targets unknown workflow {:?}",
-            event.source,
-            event.workflow.as_str()
-        );
+        tracing::warn!("event targets an unknown workflow; ignoring");
         return;
     };
-    eprintln!(
-        "odind: {} → starting {}",
-        event.source,
-        workflow.name.as_str()
-    );
+    tracing::info!("dispatching run");
     match engine.run(workflow, event.input).await {
-        Ok(summary) => eprintln!(
-            "odind: run {} of {} finished: {:?}",
-            summary.run_id,
-            workflow.name.as_str(),
-            summary.status
+        Ok(summary) => tracing::info!(
+            run_id = %summary.run_id,
+            status = ?summary.status,
+            "run finished"
         ),
-        Err(e) => eprintln!("odind: run of {} failed: {e}", workflow.name.as_str()),
+        Err(e) => tracing::error!(error = %e, "run failed"),
     }
 }
