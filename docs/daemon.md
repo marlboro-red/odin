@@ -19,7 +19,7 @@ odind --workflows ./workflows --repo . \
 | `--repo <DIR>` | `.` | Git repository the engine provisions workspaces from. |
 | `--db <FILE>` | `<repo>/.odin/state.db` | SQLite state database. |
 | `--max-concurrent-runs <N>` | `4` | Ceiling on runs executing at once across the whole daemon (clamped to ≥ 1). |
-| `--webhook-addr <ADDR>` | `127.0.0.1:9292` | Address the webhook HTTP server binds to (only started if a workflow declares a `github_webhook` trigger). |
+| `--webhook-addr <ADDR>` | `127.0.0.1:9292` | Address the HTTP server binds to. Always started (serves `/metrics` + `/health`); also `/webhook` and/or `/approve` when configured. |
 | `--webhook-secret <SECRET>` | `$ODIN_WEBHOOK_SECRET` | HMAC secret for verifying webhook signatures. |
 | `--webhook-allow-unsigned` | off | Explicitly run the webhook server **without** signature verification (local testing only). |
 | `--log-format <text\|json>` | `text` | Diagnostic-log format (level via `$ODIN_LOG`/`$RUST_LOG`, default `info`). See [observability](observability.md). |
@@ -41,12 +41,13 @@ idempotently. Set `ODIN_SQLITE_SYNCHRONOUS=full` for zero-loss at higher write l
 1. Load every `*.yaml`/`*.yml` in `--workflows` (sorted; unreadable/unparseable files are
    skipped with a warning). An empty result is fatal.
 2. Open the SQLite store and build the engine over `--repo`.
-3. Build the webhook server from every `github_webhook` trigger, and enforce the
-   [fail-closed secret rule](#security).
+3. Build the HTTP server: `/webhook` per `github_webhook` trigger and `/approve` if any workflow
+   has an approval gate (enforcing the [fail-closed secret rule](#security) for those), plus the
+   always-on read-only [`/metrics`](#metrics) and `/health`.
 4. Derive a cron trigger per `cron` declaration.
 5. **Resume** any incomplete (durable) runs found in the store — crash recovery comes first.
-6. Serve all triggers, dispatching runs concurrently, until `ctrl-c` — which **drains**
-   in-flight runs before exiting.
+6. Serve the HTTP server and all triggers, dispatching runs concurrently, until `ctrl-c` — which
+   **drains** in-flight runs before exiting.
 
 All logging goes to stderr.
 
@@ -181,6 +182,39 @@ curl -sS http://127.0.0.1:9292/approve \
   fills, the delivery fails with `503` (GitHub retries it — see step 5) rather than applying
   unbounded back-pressure to the HTTP handler. Together with `--max-concurrent-runs`, this
   bounds the work a flood of valid deliveries can spawn.
+
+---
+
+## Metrics
+
+The HTTP server always exposes **`GET /metrics`** in [Prometheus text exposition
+format](https://prometheus.io/docs/instrumentation/exposition_formats/) — a cheap aggregate read
+of the run-state store (one indexed `GROUP BY`, no run blobs parsed), so the server runs even for
+a cron-only daemon with no webhooks or approvals.
+
+```text
+# HELP odin_runs_total Completed runs by workflow and terminal status.
+# TYPE odin_runs_total counter
+odin_runs_total{workflow="issue-to-pr",status="succeeded"} 142
+odin_runs_total{workflow="issue-to-pr",status="failed"} 7
+# TYPE odin_runs_in_flight gauge
+odin_runs_in_flight 3
+# TYPE odin_runs_awaiting_approval gauge
+odin_runs_awaiting_approval 2
+# TYPE odin_runs_pending gauge
+odin_runs_pending 0
+```
+
+- **`odin_runs_total{workflow,status}`** (counter) — runs that reached a terminal status
+  (`succeeded`/`failed`/`cancelled`); monotonic as runs finish.
+- **`odin_runs_in_flight`**, **`odin_runs_awaiting_approval`**, **`odin_runs_pending`** (gauges)
+  — the live counts of the corresponding non-terminal statuses, summed across workflows.
+
+`/metrics` (like `/health`) is **unauthenticated** — it's read-only operational data and
+Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the same reverse
+proxy / network boundary as the rest of the server (it should not face the public internet).
+For span-level tracing and OTLP export, see [observability](observability.md); `/metrics` is the
+pull-based counterpart for dashboards/alerting.
 
 ---
 

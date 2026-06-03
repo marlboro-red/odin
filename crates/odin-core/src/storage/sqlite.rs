@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::api::RunStatus;
 use crate::error::StoreError;
 use crate::ids::RunId;
-use crate::traits::{RunEvent, RunState, Store};
+use crate::traits::{RunEvent, RunState, RunStatusCount, Store, StoreMetrics};
 
 /// The baseline schema (migration to v1). Idempotent (`IF NOT EXISTS`), so it also adopts a
 /// pre-versioning database that already has the tables.
@@ -239,6 +239,27 @@ impl Store for SqliteStore {
             out.push(serde_json::from_str(&db(row)?)?);
         }
         Ok(out)
+    }
+
+    async fn metrics(&self) -> Result<StoreMetrics, StoreError> {
+        // One indexed aggregate, no JSON blobs parsed: the `workflow` and `status` columns are
+        // denormalized, so the counts are SQLite's to compute.
+        let conn = self.conn.lock().await;
+        let mut stmt =
+            db(conn
+                .prepare("SELECT workflow, status, COUNT(*) FROM runs GROUP BY workflow, status"))?;
+        let rows = db(stmt.query_map([], |row| {
+            Ok(RunStatusCount {
+                workflow: row.get::<_, String>(0)?,
+                status: row.get::<_, String>(1)?,
+                count: row.get::<_, i64>(2)?.max(0).unsigned_abs(),
+            })
+        }))?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(db(row)?);
+        }
+        Ok(StoreMetrics { runs })
     }
 }
 

@@ -77,6 +77,21 @@ async fn post_approve(addr: SocketAddr, body: &[u8], signature: Option<&str>) ->
     resp.lines().next().unwrap_or_default().to_owned()
 }
 
+/// GETs a raw HTTP/1.1 request and returns `(status line, body)`.
+async fn get(addr: SocketAddr, path: &str) -> (String, String) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    let status = resp.lines().next().unwrap_or_default().to_owned();
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map_or_else(String::new, |(_, b)| b.to_owned());
+    (status, body)
+}
+
 /// An engine + a bound approval server over a temp repo, with one run already PAUSED at its
 /// gate. `/approve` resumes inline (no daemon needed — it calls the engine directly).
 struct Harness {
@@ -112,6 +127,7 @@ impl Harness {
         let mut server =
             WebhookServer::new("127.0.0.1:0".parse().unwrap(), secret.map(str::to_owned));
         server.enable_approvals(engine, Arc::from(vec![workflow]));
+        server.enable_metrics(store.clone());
         let bound = server.bind().await.unwrap();
         let addr = bound.local_addr();
         let shutdown = CancellationToken::new();
@@ -292,6 +308,39 @@ async fn rerun_with_an_approve_decision_is_400() {
         "rerun only applies to a reject, got: {status}"
     );
     assert_eq!(h.status().await, RunStatus::AwaitingApproval);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_endpoint_reports_run_counts_unauthenticated() {
+    let h = Harness::start(Some(SECRET)).await;
+
+    // One run is paused awaiting approval. `/metrics` needs no signature.
+    let (status, body) = get(h.addr, "/metrics").await;
+    assert!(status.contains("200"), "got: {status}");
+    assert!(
+        body.contains("# TYPE odin_runs_awaiting_approval gauge"),
+        "body:\n{body}"
+    );
+    assert!(
+        body.contains("odin_runs_awaiting_approval 1"),
+        "body:\n{body}"
+    );
+    assert!(body.contains("odin_runs_in_flight 0"), "body:\n{body}");
+
+    // After approving, the run becomes a succeeded terminal counter and the gauge drops to 0.
+    let ab = approve_body(h.run_id);
+    let st = post_approve(h.addr, &ab, Some(&sign(SECRET, &ab))).await;
+    assert!(st.contains("200"), "approve: {st}");
+    let (_, body2) = get(h.addr, "/metrics").await;
+    assert!(
+        body2.contains(r#"odin_runs_total{workflow="appr-flow",status="succeeded"} 1"#),
+        "body:\n{body2}"
+    );
+    assert!(
+        body2.contains("odin_runs_awaiting_approval 0"),
+        "body:\n{body2}"
+    );
     h.shutdown().await;
 }
 

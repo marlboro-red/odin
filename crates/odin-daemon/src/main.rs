@@ -24,7 +24,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use odin_core::ir::{StepKind, TriggerDecl};
 use odin_core::telemetry::{self, Options};
-use odin_core::{EngineBuilder, SqliteStore, Workflow};
+use odin_core::{EngineBuilder, SqliteStore, Store, Workflow};
 use odin_daemon::{Daemon, WebhookServer};
 
 /// Run Odin workflows from event triggers (cron schedules + GitHub webhooks).
@@ -115,10 +115,11 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating state directory {}", parent.display()))?;
     }
-    let store = SqliteStore::open(&db).context("opening the run state database")?;
+    let store: Arc<dyn Store> =
+        Arc::new(SqliteStore::open(&db).context("opening the run state database")?);
     let engine = EngineBuilder::new()
         .repo(&cli.repo)
-        .store(Arc::new(store))
+        .store(store.clone())
         .build()?;
 
     // Build the webhook server from every `github_webhook` decl (before the workflows are
@@ -149,11 +150,14 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     if has_approvals {
         webhook_server.enable_approvals(engine.clone(), Arc::from(workflows.clone()));
     }
+    // The read-only `/metrics` + `/health` endpoints are always served (Prometheus scrapes them),
+    // so the HTTP server runs even for a webhook-less, approval-less daemon.
+    webhook_server.enable_metrics(store.clone());
 
-    // Fail closed: a network-facing endpoint without a verification secret would accept
-    // requests from anyone — and `/approve` mutates run state. Only an explicit opt-in permits
-    // running unsigned.
-    if webhook_server.serves() && !has_secret && !cli.webhook_allow_unsigned {
+    // Fail closed: a network-facing endpoint that MUTATES run state (`/webhook`, `/approve`)
+    // without a verification secret would accept requests from anyone. Only an explicit opt-in
+    // permits running those unsigned. (`/metrics` + `/health` are read-only and need no secret.)
+    if webhook_server.serves_mutations() && !has_secret && !cli.webhook_allow_unsigned {
         anyhow::bail!(
             "a github_webhook trigger or an approval gate exposes a network endpoint, but no \
              secret is configured; set --webhook-secret or $ODIN_WEBHOOK_SECRET (or pass \
@@ -180,31 +184,28 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
-    let result = if webhook_server.serves() {
-        tracing::info!(
-            subscriptions = webhook_server.subscription_count(),
-            approvals = has_approvals,
-            body_cap_mib = 25,
-            "http server configured"
+    // The HTTP server always runs (it serves `/metrics` + `/health` unconditionally, and
+    // `/webhook` / `/approve` when configured), alongside the supervisor loop.
+    tracing::info!(
+        subscriptions = webhook_server.subscription_count(),
+        approvals = has_approvals,
+        body_cap_mib = 25,
+        "http server configured"
+    );
+    let bound = webhook_server.bind().await?;
+    // No built-in TLS: a non-loopback bind over plain HTTP must sit behind a
+    // TLS-terminating reverse proxy, or signatures travel in cleartext.
+    if !bound.local_addr().ip().is_loopback() {
+        tracing::warn!(
+            addr = %bound.local_addr(),
+            "http server bound to a non-loopback address over plain HTTP; terminate TLS at a \
+             reverse proxy in front of it"
         );
-        let bound = webhook_server.bind().await?;
-        // No built-in TLS: a non-loopback bind over plain HTTP must sit behind a
-        // TLS-terminating reverse proxy, or signatures travel in cleartext.
-        if !bound.local_addr().ip().is_loopback() {
-            tracing::warn!(
-                addr = %bound.local_addr(),
-                "webhook bound to a non-loopback address over plain HTTP; terminate TLS at a \
-                 reverse proxy in front of it"
-            );
-        }
-        tracing::info!(addr = %bound.local_addr(), "http server listening (/webhook, /approve, /health)");
-        // Drive the supervisor loop and the HTTP server together; both end on shutdown.
-        let (daemon_res, server_res) = tokio::join!(daemon.run(), bound.serve(shutdown));
-        daemon_res.and(server_res)
-    } else {
-        // No webhook trigger and no approval gate: run the supervisor loop alone.
-        daemon.run().await
-    };
+    }
+    tracing::info!(addr = %bound.local_addr(), "http server listening (/webhook, /approve, /metrics, /health)");
+    // Drive the supervisor loop and the HTTP server together; both end on shutdown.
+    let (daemon_res, server_res) = tokio::join!(daemon.run(), bound.serve(shutdown));
+    let result = daemon_res.and(server_res);
     signal.abort();
     result
 }

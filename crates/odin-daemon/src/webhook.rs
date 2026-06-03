@@ -41,7 +41,9 @@ use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
 use odin_core::ir::GithubWebhookDecl;
 use odin_core::traits::{Trigger, TriggerEvent};
-use odin_core::{Decision, Engine, Error, RunId, RunInput, TriggerError, Workflow, WorkflowId};
+use odin_core::{
+    Decision, Engine, Error, RunId, RunInput, Store, TriggerError, Workflow, WorkflowId,
+};
 use sha2::Sha256;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -184,6 +186,7 @@ pub struct WebhookServer {
     secret: Option<String>,
     subscriptions: Vec<Subscription>,
     approvals: Option<ApprovalCtx>,
+    store: Option<Arc<dyn Store>>,
 }
 
 /// What the `POST /approve` handler needs to record a decision and resume the run: a shared
@@ -206,7 +209,14 @@ impl WebhookServer {
             secret,
             subscriptions: Vec::new(),
             approvals: None,
+            store: None,
         }
+    }
+
+    /// Provides the run-state store for the unauthenticated `GET /metrics` endpoint (Prometheus
+    /// text exposition). Without it, `/metrics` reports `503`.
+    pub fn enable_metrics(&mut self, store: Arc<dyn Store>) {
+        self.store = Some(store);
     }
 
     /// Enables the `POST /approve` endpoint, wiring it to `engine` and the daemon's `workflows`
@@ -217,10 +227,11 @@ impl WebhookServer {
         self.approvals = Some(ApprovalCtx { engine, workflows });
     }
 
-    /// Whether the server has anything to serve: a webhook subscription or the approval
-    /// endpoint. The daemon skips starting the HTTP server entirely when neither is present.
+    /// Whether the server exposes a **state-mutating** endpoint (`/webhook` or `/approve`) —
+    /// the ones that must be signed. Used for the fail-closed secret check; `/metrics` and
+    /// `/health` are read-only and don't require a secret.
     #[must_use]
-    pub fn serves(&self) -> bool {
+    pub fn serves_mutations(&self) -> bool {
         !self.subscriptions.is_empty() || self.approvals.is_some()
     }
 
@@ -278,6 +289,7 @@ impl WebhookServer {
                 secret: self.secret,
                 subscriptions: self.subscriptions,
                 approvals: self.approvals,
+                store: self.store,
                 dedup: Mutex::new(DeliveryDedup::new()),
             }),
         })
@@ -298,8 +310,8 @@ impl BoundWebhookServer {
         self.local_addr
     }
 
-    /// Serves `POST /webhook` and `GET /health` until `shutdown` fires, draining in-flight
-    /// requests on the way out.
+    /// Serves `POST /webhook`, `POST /approve`, `GET /metrics`, and `GET /health` until
+    /// `shutdown` fires, draining in-flight requests on the way out.
     ///
     /// # Errors
     /// Returns an error if the server task fails (not from individual bad requests, which
@@ -316,6 +328,7 @@ impl BoundWebhookServer {
         let app = Router::new()
             .route("/webhook", post(handle_webhook))
             .route("/approve", post(handle_approve))
+            .route("/metrics", get(handle_metrics))
             .route("/health", get(handle_health))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(self.state);
@@ -333,6 +346,8 @@ struct AppState {
     subscriptions: Vec<Subscription>,
     /// Present when `POST /approve` is enabled (some workflow has an approval gate).
     approvals: Option<ApprovalCtx>,
+    /// The run-state store for `GET /metrics` (always set when the daemon serves).
+    store: Option<Arc<dyn Store>>,
     /// Recent delivery ids, to drop GitHub's retries of an already-handled delivery.
     dedup: Mutex<DeliveryDedup>,
 }
@@ -340,6 +355,27 @@ struct AppState {
 #[allow(clippy::unused_async)] // axum route handlers must be async.
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// `GET /metrics` — Prometheus text exposition of run counts. **Unauthenticated** (like
+/// `/health`): read-only operational data, scraped over the same network boundary. Keep it
+/// loopback or behind a reverse proxy.
+async fn handle_metrics(State(state): State<Arc<AppState>>) -> Response {
+    let Some(store) = state.store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "metrics not enabled").into_response();
+    };
+    match store.metrics().await {
+        Ok(snapshot) => (
+            StatusCode::OK,
+            [("content-type", "text/plain; version=0.0.4")],
+            crate::metrics::render(&snapshot),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics: store read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response()
+        }
+    }
 }
 
 /// The body of a `POST /approve`: which run, the decision, who decided, and a note. `decision`
