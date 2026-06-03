@@ -100,6 +100,18 @@ pub struct RunSummary {
     pub finished_at: Option<DateTime<Utc>>,
 }
 
+/// The result of rejecting a paused run and rerunning it with the feedback: the rejected run's
+/// summary and the freshly started run, which carries the reject note as its `feedback` param
+/// (so the workflow can address it). See [`crate::Engine::reject_and_rerun`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct RerunOutcome {
+    /// The original run, now `failed` at the rejected gate.
+    pub rejected: RunSummary,
+    /// The fresh run started with the feedback (may itself pause again at a gate).
+    pub rerun: RunSummary,
+}
+
 /// Per-step result in a [`RunSummary`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]

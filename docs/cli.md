@@ -182,6 +182,7 @@ A workflow with an [`approval` gate](workflow-reference.md#approval-step) pauses
 ```sh
 odin approve <RUN_ID> --workflow <FILE> --by alice --note "lgtm"
 odin reject  <RUN_ID> --workflow <FILE> --by bob   --note "fix the failing test"
+odin reject  <RUN_ID> --workflow <FILE> --by bob   --note "handle empty input too" --rerun
 ```
 
 | Flag | Meaning |
@@ -190,12 +191,31 @@ odin reject  <RUN_ID> --workflow <FILE> --by bob   --note "fix the failing test"
 | `--workflow <FILE>` | The workflow file the run was started from (needed to resume). |
 | `--by <NAME>` | Who is deciding (recorded for the audit trail; default `cli`). |
 | `--note <TEXT>` | Free-text note. **Required** on `reject` — it's the feedback, surfaced as `steps.<gate>.outputs.feedback`. |
+| `--rerun` | (`reject` only) After failing the gate, start a **fresh run** of the workflow carrying the note as the `feedback` param. |
 | `--repo` / `--db` | Database location (as above). |
 
 **Approve** resumes the run (it continues to completion, or pauses again at a later gate).
 **Reject** fails the gate (downstream skips) and the run ends `failed`, carrying the note.
 The resumed run summary is printed. **Exit:** `0` succeeded or paused again; `1` failed
 (incl. a reject); `2` unknown run / not awaiting / store error.
+
+**`reject --rerun`** closes the loop: it fails the gate as above, then immediately starts a new
+run of the same workflow with the note injected as `params.feedback` (alongside the original
+run's params), so the agent can address it and try again. The workflow opts in by referencing
+`{{ params.feedback }}` (declare a `feedback` string param). Both summaries are printed — the
+failed original and the fresh run (which typically pauses at the gate again for another look):
+
+```text
+Run a91b… — failed
+  ✗ gate
+      ↳ rejected by bob: handle empty input too
+  ⊘ ship
+↻ rerunning as 9f2c… with your feedback
+Run 9f2c… — awaiting approval
+  ✓ implement (exit 0)
+  ✓ review
+  ⏸ gate
+```
 
 A long-running [`odind`](daemon.md) can also be decided over HTTP — a signed
 [`POST /approve`](daemon.md#approving-a-paused-run-over-http) is the daemon-side equivalent of

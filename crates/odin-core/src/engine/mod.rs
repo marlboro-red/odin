@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::api::{Decision, RunInput, RunSummary};
+use crate::api::{Decision, RerunOutcome, RunInput, RunSummary};
 use crate::error::Result;
 use crate::ids::RunId;
 use crate::ir::Workflow;
@@ -59,6 +59,23 @@ pub trait Engine: Send + Sync {
         note: Option<String>,
         workflows: &[Workflow],
     ) -> Result<Option<RunSummary>>;
+
+    /// Rejects the run's pending gate (failing it, carrying `note` as the feedback) and then
+    /// starts a FRESH run of the same workflow with `note` injected as the `feedback` param,
+    /// plus the original run's params/trigger — so the workflow can address the feedback and
+    /// try again. Returns both summaries. `Ok(None)` if the run id is unknown. `workflows` must
+    /// include the run's own workflow definition.
+    ///
+    /// # Errors
+    /// Returns [`crate::error::Error::Input`] if the run is not awaiting approval, or another
+    /// [`crate::error::Error`] if the store, the reject, or starting the new run fails.
+    async fn reject_and_rerun(
+        &self,
+        run_id: RunId,
+        approver: String,
+        note: String,
+        workflows: &[Workflow],
+    ) -> Result<Option<RerunOutcome>>;
 }
 
 /// Wires a [`Registry`] of plugins, a repository root, and a [`Store`] into an engine.

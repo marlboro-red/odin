@@ -9,6 +9,9 @@
 #   odin approve <run-id> --workflow examples/gated-deploy.yaml --by you --note "lgtm"
 #   odin reject  <run-id> --workflow examples/gated-deploy.yaml --by you --note "fix the tests"
 # A reject fails the gate, carrying the note as `steps.gate.outputs.feedback`, and skips the push.
+# Add --rerun to a reject to start a FRESH run with your note as `params.feedback` (used by the
+# implement step below), so the agent addresses it and tries again:
+#   odin reject  <run-id> --workflow examples/gated-deploy.yaml --by you --note "handle empties" --rerun
 
 schema_version: "1.0"
 name: gated-deploy
@@ -21,11 +24,15 @@ workspace:
 
 steps:
   # An agent implements the change in the worktree; its diff is the implicit DIFF artifact.
+  # On a `reject --rerun`, this run is restarted with `params.feedback` set to the reviewer's
+  # note, so the agent addresses it and tries again.
   - id: implement
     provider: claude
     prompt: |
       Make the change described below, editing the working tree.
       {{ params.task | default("Tidy the README.") }}
+      {% if params.feedback %}A previous attempt was rejected with this feedback — address it:
+      {{ params.feedback }}{% endif %}
 
   # A second agent reviews the diff so the human approver has a summary to act on.
   - id: review
@@ -52,3 +59,6 @@ params:
   task:
     type: string
     description: What the agent should implement.
+  feedback:
+    type: string
+    description: Reviewer feedback from a rejected attempt — set automatically by `reject --rerun`.

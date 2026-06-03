@@ -52,7 +52,8 @@ use tracing::Instrument as _;
 
 use super::Engine;
 use crate::api::{
-    ApprovalDecision, Decision, RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus,
+    ApprovalDecision, Decision, RerunOutcome, RunInput, RunStatus, RunSummary, SideEffect,
+    StepResult, StepStatus,
 };
 use crate::context::render::{build_context, eval_when, render_template};
 use crate::error::{Error, Result};
@@ -1817,6 +1818,54 @@ impl Engine for LocalEngine {
             ))),
         }
     }
+
+    async fn reject_and_rerun(
+        &self,
+        run_id: RunId,
+        approver: String,
+        note: String,
+        workflows: &[Workflow],
+    ) -> Result<Option<RerunOutcome>> {
+        // 1. Reject the gate (fails the run, recording `note` as the gate's feedback).
+        let Some(rejected) = self
+            .submit_approval(
+                run_id,
+                Decision::Rejected,
+                approver,
+                Some(note.clone()),
+                workflows,
+            )
+            .await?
+        else {
+            return Ok(None); // unknown run
+        };
+        // 2. Seed the rerun from the original run's input (unchanged by the reject). The store
+        //    must exist — `submit_approval` already required it to get this far.
+        let store = self
+            .store
+            .clone()
+            .ok_or_else(|| Error::Input("approvals require a durable store".to_owned()))?;
+        let Some(original) = store.load_run(run_id).await? else {
+            return Ok(None);
+        };
+        // `submit_approval` already validated the workflow is present, so this holds.
+        let Some(workflow) = workflows.iter().find(|w| w.name == original.workflow) else {
+            return Err(Error::Input(format!(
+                "run {run_id} targets workflow {:?}, which was not provided",
+                original.workflow.as_str()
+            )));
+        };
+        // 3. Start a fresh run carrying the original params/trigger plus the feedback. Clear the
+        //    idempotency key (a rerun is a distinct run, not a retry of the original key).
+        let mut input = original.input.clone();
+        input
+            .params
+            .insert("feedback".to_owned(), Value::String(note));
+        input.idempotency_key = None;
+        tracing::info!(rejected = %run_id, "rerunning with feedback");
+        let rerun = self.run(workflow, input).await?;
+        Ok(Some(RerunOutcome { rejected, rerun }))
+    }
 }
 
 impl LocalEngine {
@@ -3414,6 +3463,50 @@ steps:
         // And the run reached its terminal state exactly once.
         let final_summary = eng.summary(run_id).await.unwrap().unwrap();
         assert_eq!(final_summary.status, RunStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn reject_and_rerun_fails_the_original_and_starts_a_fresh_run_with_feedback() {
+        let repo = init_repo().await;
+        let store: Arc<dyn crate::traits::Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(APPROVAL_WF);
+
+        // Start with a param so we can prove the rerun inherits the original input.
+        let mut input = RunInput::manual();
+        input.params.insert("task".to_owned(), json!("original"));
+        let s1 = eng.run(&wf, input).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+
+        let outcome = eng
+            .reject_and_rerun(
+                s1.run_id,
+                "bob".to_owned(),
+                "needs tests".to_owned(),
+                std::slice::from_ref(&wf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The original run is now failed at the rejected gate.
+        assert_eq!(outcome.rejected.run_id, s1.run_id);
+        assert_eq!(outcome.rejected.status, RunStatus::Failed);
+        // The rerun is a DISTINCT run that paused again at its own gate.
+        assert_ne!(outcome.rerun.run_id, s1.run_id);
+        assert_eq!(outcome.rerun.status, RunStatus::AwaitingApproval);
+        // It carries the feedback as a param, alongside the original run's params.
+        let rerun = store.load_run(outcome.rerun.run_id).await.unwrap().unwrap();
+        assert_eq!(
+            rerun.input.params.get("feedback").and_then(|v| v.as_str()),
+            Some("needs tests"),
+            "the reject note is injected as the feedback param"
+        );
+        assert_eq!(
+            rerun.input.params.get("task").and_then(|v| v.as_str()),
+            Some("original"),
+            "the rerun inherits the original run's params"
+        );
     }
 
     /// A provider that always replies with a fixed string (a stand-in judge/agent).

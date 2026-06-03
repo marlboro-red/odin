@@ -166,6 +166,22 @@ Decide it with `odin approve`/`odin reject` (see the [CLI reference](cli.md)) or
 — the input to act on for a re-run. A paused run is **not** crash-resumed; it waits indefinitely
 for a decision.
 
+To close the loop, `reject --rerun` (and `POST /approve` with `"rerun": true`) fails the gate and
+then starts a **fresh run** of the same workflow with the note injected as `params.feedback`
+(alongside the original run's params). Reference it with `{{ params.feedback }}` — declaring a
+`feedback` string param — so the agent addresses the feedback and tries again:
+
+```yaml
+params:
+  feedback: { type: string, description: "Reviewer feedback (set by reject --rerun)." }
+steps:
+  - id: implement
+    provider: claude
+    prompt: |
+      {{ params.task }}
+      {% if params.feedback %}A previous attempt was rejected — address: {{ params.feedback }}{% endif %}
+```
+
 ### Gates
 
 ```yaml

@@ -344,7 +344,8 @@ async fn handle_health() -> impl IntoResponse {
 
 /// The body of a `POST /approve`: which run, the decision, who decided, and a note. `decision`
 /// is the `snake_case` [`Decision`] (`"approved"` / `"rejected"`); `note` is **required** on a
-/// reject (it's the feedback). `run_id` is the UUID string.
+/// reject (it's the feedback). `run_id` is the UUID string. `rerun` (reject only) additionally
+/// starts a fresh run carrying the note as the `feedback` param.
 #[derive(serde::Deserialize)]
 struct ApproveRequest {
     run_id: String,
@@ -353,6 +354,8 @@ struct ApproveRequest {
     approver: Option<String>,
     #[serde(default)]
     note: Option<String>,
+    #[serde(default)]
+    rerun: bool,
 }
 
 /// Records a human decision on a paused run's approval gate and resumes it — the daemon-side
@@ -404,11 +407,33 @@ async fn handle_approve(
         )
             .into_response();
     }
+    if req.rerun && !matches!(req.decision, Decision::Rejected) {
+        return (StatusCode::BAD_REQUEST, "`rerun` only applies to a reject").into_response();
+    }
     let approver = req
         .approver
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "http".to_owned());
 
+    // A reject-and-rerun returns BOTH summaries (rejected + the fresh run); a plain decision
+    // returns the resumed run's summary. Either way `Ok(None)` is an unknown run (404) and an
+    // `Error::Input` is the caller's fault (409, vs 500 for a store/resume failure).
+    if req.rerun {
+        // `note` is guaranteed non-empty here (a reject was required above).
+        let note = req.note.unwrap_or_default();
+        return match ctx
+            .engine
+            .reject_and_rerun(run_id, approver, note, &ctx.workflows)
+            .await
+        {
+            Ok(Some(outcome)) => {
+                tracing::info!(rejected = %run_id, rerun = %outcome.rerun.run_id, "approve: rejected and reran");
+                (StatusCode::OK, Json(outcome)).into_response()
+            }
+            Ok(None) => not_found(run_id),
+            Err(e) => approve_error(run_id, &e),
+        };
+    }
     match ctx
         .engine
         .submit_approval(run_id, req.decision, approver, req.note, &ctx.workflows)
@@ -418,23 +443,30 @@ async fn handle_approve(
             tracing::info!(run = %run_id, status = ?summary.status, "approve: decision applied");
             (StatusCode::OK, Json(summary)).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            format!("no run {run_id} in the store"),
-        )
-            .into_response(),
-        Err(e) => {
-            // A bad request (not awaiting / unknown workflow) is the caller's fault → 409;
-            // a store/resume failure is ours → 500.
-            tracing::warn!(run = %run_id, error = %e, "approve: submit_approval failed");
-            let code = if matches!(e, Error::Input(_)) {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (code, format!("{e}")).into_response()
-        }
+        Ok(None) => not_found(run_id),
+        Err(e) => approve_error(run_id, &e),
     }
+}
+
+/// A 404 for an unknown run id.
+fn not_found(run_id: RunId) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        format!("no run {run_id} in the store"),
+    )
+        .into_response()
+}
+
+/// Maps an approval engine error to a response: a bad request (not awaiting / unknown workflow)
+/// is the caller's fault → `409`; a store/resume failure is ours → `500`.
+fn approve_error(run_id: RunId, e: &Error) -> Response {
+    tracing::warn!(run = %run_id, error = %e, "approve: decision failed");
+    let code = if matches!(e, Error::Input(_)) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (code, format!("{e}")).into_response()
 }
 
 /// Verifies the signature, parses the event, and routes it to every matching subscription.
