@@ -16,7 +16,9 @@ use crate::error::StoreError;
 use crate::ids::RunId;
 use crate::traits::{RunEvent, RunState, Store};
 
-const SCHEMA: &str = "
+/// The baseline schema (migration to v1). Idempotent (`IF NOT EXISTS`), so it also adopts a
+/// pre-versioning database that already has the tables.
+const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS runs (
     run_id     TEXT PRIMARY KEY,
     workflow   TEXT NOT NULL,
@@ -32,6 +34,12 @@ CREATE TABLE IF NOT EXISTS events (
     PRIMARY KEY (run_id, seq)
 );
 ";
+
+/// Ordered migrations tracked by SQLite's `PRAGMA user_version`. The entry at index `i`
+/// upgrades the database from version `i` to `i + 1` (so `MIGRATIONS.len()` is the current
+/// version). **Append** new migrations; never edit or reorder a released one — an in-place
+/// edit would not re-run on a database already at that version.
+const MIGRATIONS: &[&str] = &[SCHEMA_V1];
 
 /// A durable run store backed by a SQLite database.
 pub struct SqliteStore {
@@ -59,13 +67,67 @@ impl SqliteStore {
         // A shared on-disk DB can be opened by a second `odin run`/reader; make writers
         // wait rather than fail with SQLITE_BUSY, and use WAL so readers don't block.
         db(conn.busy_timeout(std::time::Duration::from_secs(5)))?;
+        let synchronous = sync_mode();
         if wal {
             let _: String = db(conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0)))?;
+            // Choose durability EXPLICITLY rather than relying on the default. NORMAL is the
+            // SQLite-recommended setting under WAL: corruption-safe, and the only failure mode
+            // is losing the most recent checkpoint(s) on a power loss — which resume re-runs
+            // idempotently. An operator who needs zero loss sets `ODIN_SQLITE_SYNCHRONOUS=full`.
+            db(conn.pragma_update(None, "synchronous", synchronous))?;
         }
-        db(conn.execute_batch(SCHEMA))?;
+        Self::migrate(&conn)?;
+        tracing::debug!(
+            schema_version = MIGRATIONS.len(),
+            synchronous,
+            durable = wal,
+            "opened run-state store"
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Brings the database up to the current schema version, applying any pending migrations
+    /// atomically. Refuses a database written by a **newer** build rather than operating on a
+    /// schema it doesn't understand.
+    fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        let target = i64::try_from(MIGRATIONS.len()).unwrap_or(i64::MAX);
+        let current: i64 = db(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
+        if current > target {
+            return Err(StoreError::Backend(format!(
+                "run-state database is at schema v{current}, newer than this build supports \
+                 (v{target}); upgrade odin to read it"
+            )));
+        }
+        if current == target {
+            return Ok(());
+        }
+        // Apply pending migrations in one transaction so a failure leaves the DB untouched.
+        db(conn.execute_batch("BEGIN"))?;
+        let applied = (|| -> rusqlite::Result<()> {
+            for migration in &MIGRATIONS[usize::try_from(current).unwrap_or(0)..] {
+                conn.execute_batch(migration)?;
+            }
+            // `user_version` takes no bind parameters; `target` is an internal constant.
+            conn.pragma_update(None, "user_version", target)
+        })();
+        match applied {
+            Ok(()) => db(conn.execute_batch("COMMIT")),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(StoreError::Backend(format!("schema migration failed: {e}")))
+            }
+        }
+    }
+}
+
+/// The `synchronous` mode for on-disk databases: `NORMAL` (the WAL default) unless the operator
+/// opts into `FULL` via `$ODIN_SQLITE_SYNCHRONOUS=full` for zero-loss durability.
+fn sync_mode() -> &'static str {
+    match std::env::var("ODIN_SQLITE_SYNCHRONOUS") {
+        Ok(v) if v.eq_ignore_ascii_case("full") => "FULL",
+        _ => "NORMAL",
     }
 }
 
@@ -295,5 +357,46 @@ mod tests {
         let incomplete = store.load_incomplete().await.unwrap();
         assert_eq!(incomplete.len(), 1);
         assert_eq!(incomplete[0].run_id, run_id);
+    }
+
+    #[tokio::test]
+    async fn fresh_database_is_at_the_current_schema_version() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().await;
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, i64::try_from(super::MIGRATIONS.len()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_database_from_a_newer_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        SqliteStore::open(&path).unwrap(); // create at the current version, then close.
+        // Simulate a database written by a future odin (schema v999).
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", 999_i64)
+            .unwrap();
+        match SqliteStore::open(&path) {
+            Err(e) => assert!(
+                format!("{e}").contains("newer"),
+                "expected a refuse-newer-schema error, got: {e}"
+            ),
+            Ok(_) => panic!("a newer-schema database must be refused, not opened"),
+        }
+    }
+
+    #[tokio::test]
+    async fn on_disk_store_sets_synchronous_explicitly() {
+        // Durability must be chosen, not defaulted: NORMAL (== 1) under WAL.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(dir.path().join("state.db")).unwrap();
+        let conn = store.conn.lock().await;
+        let sync: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "1 == NORMAL, the WAL-recommended default");
     }
 }

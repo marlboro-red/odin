@@ -26,7 +26,15 @@ odind --workflows ./workflows --repo . \
 | `--otlp-endpoint <URL>` | — | Export spans to an OpenTelemetry OTLP collector. Honored only when built with `--features otlp`; otherwise ignored with a warning. |
 
 `ODIN_WEBHOOK_SECRET` is the webhook secret (empty = "no secret"); `ODIN_LOG` (then `RUST_LOG`)
-sets the log level. Logs go to **stderr** — see [observability](observability.md).
+sets the log level (logs go to **stderr** — see [observability](observability.md));
+`ODIN_SQLITE_SYNCHRONOUS=full` upgrades the state DB from the default WAL `NORMAL` durability to
+`FULL` (no last-checkpoint loss on power failure, at a write-latency cost — see below).
+
+The state database is **versioned** (`PRAGMA user_version`) and migrates itself forward on
+open; a database written by a *newer* `odind` is refused rather than silently misread. Under
+WAL the durability is `synchronous=NORMAL` by default: corruption-safe, with the only failure
+mode being the loss of the most recent checkpoint(s) on a power loss — which resume re-runs
+idempotently. Set `ODIN_SQLITE_SYNCHRONOUS=full` for zero-loss at higher write latency.
 
 ## What startup does
 

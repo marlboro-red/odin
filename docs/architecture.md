@@ -239,6 +239,12 @@ resumes each non-terminal run. `RunState` carries enough to resume deterministic
 original `RunInput`, per-step progress, the resolved artifact catalogue, the workspace
 lease, the base commit, and the latest snapshot pointer.
 
+The shipped `SqliteStore` runs in **WAL** mode with an explicit, operator-tunable
+`synchronous` (`NORMAL` by default — the WAL-recommended setting; `ODIN_SQLITE_SYNCHRONOUS=full`
+for zero-loss). Its schema is **versioned** via `PRAGMA user_version` and migrated forward on
+open through an append-only migration list; a database written by a *newer* build is refused
+rather than silently misread.
+
 To make resume **idempotent**, a durable run takes an *off-branch* git snapshot of the
 workspace after each shared-workdir step (a dangling commit anchored by a per-run ref that's
 deleted on completion — it never reaches the workflow's branch or its PR). On resume the
