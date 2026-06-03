@@ -1802,6 +1802,17 @@ impl Engine for LocalEngine {
         let Some(mut state) = store.load_run(run_id).await? else {
             return Ok(None);
         };
+        // The run's own workflow must be among those provided, or `resume_all` couldn't
+        // continue it. Check BEFORE mutating any state: recording the decision + flipping to
+        // Running first would leave the run stuck (un-resumable, no longer awaiting) and drop
+        // its snapshot ref via the unserved-workflow cleanup path.
+        if !workflows.iter().any(|w| w.name == state.workflow) {
+            return Err(Error::Input(format!(
+                "run {run_id} targets workflow {:?}, which was not provided — pass its file via \
+                 --workflow",
+                state.workflow.as_str()
+            )));
+        }
         if state.status != RunStatus::AwaitingApproval {
             return Err(Error::Input(format!(
                 "run {run_id} is not awaiting approval (status is {:?})",
@@ -3252,6 +3263,41 @@ steps:
         let s2 = eng
             .submit_approval(
                 run_id,
+                Decision::Approved,
+                "alice".to_owned(),
+                None,
+                std::slice::from_ref(&wf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2.status, RunStatus::Succeeded, "error: {:?}", s2.error);
+    }
+
+    #[tokio::test]
+    async fn submit_approval_with_a_missing_workflow_errors_without_bricking_the_run() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+
+        // Deciding without the run's workflow provided must error and NOT mutate the run...
+        let err = eng
+            .submit_approval(s1.run_id, Decision::Approved, "alice".to_owned(), None, &[])
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("workflow"),
+            "should refuse a missing workflow, got: {err}"
+        );
+        // ...so a CORRECT approval still works (the run wasn't left stuck).
+        let s2 = eng
+            .submit_approval(
+                s1.run_id,
                 Decision::Approved,
                 "alice".to_owned(),
                 None,
