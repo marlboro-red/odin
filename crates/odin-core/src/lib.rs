@@ -91,6 +91,8 @@ pub mod telemetry;
 #[cfg(feature = "runtime")]
 pub mod traits;
 #[cfg(feature = "runtime")]
+pub mod view;
+#[cfg(feature = "runtime")]
 pub mod workspace;
 
 pub use api::{
@@ -131,6 +133,8 @@ pub use traits::{
     PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState, RunStatusCount, StepState,
     StoreMetrics, TriggerEvent, WorkspaceHandle,
 };
+#[cfg(feature = "runtime")]
+pub use view::{GateView, RunDetailView, RunView, StepView};
 #[cfg(feature = "runtime")]
 pub use workspace::{SlotPoolWorkspace, WorktreeWorkspace};
 
