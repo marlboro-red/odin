@@ -218,7 +218,7 @@ async function sign(secret, body) {
 async function decide(runId, decision, noteEl) {
   const note = (noteEl?.value || "").trim();
   if (decision === "rejected" && !note) { toast("a reject needs a note (the feedback)", false); noteEl?.focus(); return; }
-  const rerun = decision === "rejected" && $("#rerun-"+runId)?.checked;
+  const rerun = decision === "rejected" && $("#rerun-"+CSS.escape(runId))?.checked;
   const body = JSON.stringify({ run_id: runId, decision, approver: $("#approver").value.trim() || "dashboard", note, rerun });
   try {
     const sig = await sign($("#secret").value.trim(), body);
