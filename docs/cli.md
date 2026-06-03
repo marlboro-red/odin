@@ -13,6 +13,9 @@ Commands:
   list                 List recent runs from the store
   show <RUN_ID>        Show a run's details
   logs <RUN_ID>        Show a run's event log
+  approve <RUN_ID>     Approve a run paused at an approval gate
+  reject  <RUN_ID>     Reject a paused run (optionally rerun with feedback)
+  prune                Delete old/excess terminal runs from the store
 ```
 
 Every command takes `--json` for machine-readable output on **stdout**. A command's normal
@@ -220,6 +223,47 @@ Run 9f2c… — awaiting approval
 A long-running [`odind`](daemon.md) can also be decided over HTTP — a signed
 [`POST /approve`](daemon.md#approving-a-paused-run-over-http) is the daemon-side equivalent of
 these commands.
+
+---
+
+## `odin prune [flags]`
+
+Bound the store's growth by deleting old or excess **terminal** runs (`succeeded`/`failed`/
+`cancelled`) and their event logs, and reclaiming their git snapshot refs. **In-flight and
+awaiting-approval runs are never touched** — only terminal runs are eligible. Requires an explicit
+age or count limit (it refuses to run with neither).
+
+| Flag | Meaning |
+|------|---------|
+| `--older-than <DURATION>` | Prune terminal runs last updated longer ago than this — `90d`, `12h`, `2w` (units `s`/`m`/`h`/`d`/`w`). |
+| `--keep-last <N>` | Keep at most `N` terminal runs **per workflow** (newest first); prune the rest. |
+| `--workflow <NAME>` | Restrict pruning to a single workflow. |
+| `--dry-run` | Preview what would be pruned; delete nothing. |
+| `--yes` | Skip the confirmation prompt (**required** to prune non-interactively). |
+| `--json` | Emit the prune report as JSON. |
+| `--repo` / `--db` | Database location (as above). |
+
+Both limits may be combined — a run is pruned only if it satisfies **all** set limits (e.g.
+`--older-than 90d --keep-last 200` keeps the newest 200 per workflow *and* anything younger than
+90 days). Without `--yes` (and not a `--dry-run`), `prune` previews the selection and prompts
+`y/N` on a TTY; **a non-interactive stdin auto-declines**, so an unattended `odin prune` without
+`--yes` is a no-op.
+
+```sh
+$ odin prune --repo . --keep-last 1 --dry-run
+Would prune 3 run(s), 0 event(s):
+  3 prune-demo × succeeded
+
+$ odin prune --repo . --older-than 90d --keep-last 200 --yes
+Pruned 3 run(s), 12 event(s):
+  3 prune-demo × succeeded
+```
+
+**Metrics stay correct:** pruning does *not* make the [`odin_runs_total`](daemon.md#metrics)
+counter drop — each pruned run is folded into a persistent tally first, so the counter remains
+monotonic (it reflects lifetime completions, not just retained rows). `odin list` naturally shows
+fewer runs after a prune. **Exit:** `0` (incl. a dry-run, a no-op, or a declined prune); `2` on
+an error (no age/count limit given, or a store/engine failure).
 
 ---
 

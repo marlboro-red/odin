@@ -104,6 +104,52 @@ enum Command {
     Approve(ApprovalCmd),
     /// Reject a run paused at an `approval` gate (failing the gate with `--note` feedback).
     Reject(ApprovalCmd),
+    /// Delete old/excess terminal runs from the store (never touches in-flight or awaiting runs).
+    Prune(PruneCmd),
+}
+
+/// Arguments for `prune`. Requires at least one of `--older-than` / `--keep-last`.
+#[derive(clap::Args)]
+struct PruneCmd {
+    /// Prune terminal runs last updated longer ago than this (e.g. `90d`, `12h`, `2w`).
+    #[arg(long, value_name = "DURATION")]
+    older_than: Option<String>,
+    /// Keep at most this many terminal runs per workflow (newest first); prune the rest.
+    #[arg(long, value_name = "N")]
+    keep_last: Option<u32>,
+    /// Restrict pruning to a single workflow (by name).
+    #[arg(long, value_name = "NAME")]
+    workflow: Option<String>,
+    /// Preview what would be pruned and delete nothing.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip the interactive confirmation (required to prune non-interactively).
+    #[arg(long)]
+    yes: bool,
+    /// Emit the prune report as JSON.
+    #[arg(long)]
+    json: bool,
+    /// The git repository whose `.odin/state.db` to use. Defaults to the current dir.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Path to the run-state SQLite database. Overrides `--repo`.
+    #[arg(long)]
+    db: Option<PathBuf>,
+}
+
+impl From<PruneCmd> for cmd::prune::PruneArgs {
+    fn from(c: PruneCmd) -> Self {
+        Self {
+            older_than: c.older_than,
+            keep_last: c.keep_last,
+            workflow: c.workflow,
+            dry_run: c.dry_run,
+            yes: c.yes,
+            json: c.json,
+            repo: c.repo,
+            db: c.db,
+        }
+    }
 }
 
 /// Shared arguments for `approve` / `reject`.
@@ -216,5 +262,6 @@ fn main() -> ExitCode {
         } => finish(cmd::inspect::logs(&run_id, repo, db, json)),
         Command::Approve(c) => finish(cmd::approval::approve(c.into())),
         Command::Reject(c) => finish(cmd::approval::reject(c.into())),
+        Command::Prune(c) => finish(cmd::prune::run(c.into())),
     }
 }

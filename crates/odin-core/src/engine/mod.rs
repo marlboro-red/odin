@@ -15,7 +15,7 @@ use crate::error::Result;
 use crate::ids::RunId;
 use crate::ir::Workflow;
 use crate::registry::Registry;
-use crate::traits::Store;
+use crate::traits::{PrunePolicy, PruneReport, Store};
 
 /// The thing embedders drive to run workflows.
 #[async_trait]
@@ -76,6 +76,15 @@ pub trait Engine: Send + Sync {
         note: String,
         workflows: &[Workflow],
     ) -> Result<Option<RerunOutcome>>;
+
+    /// Applies a retention `policy`: prunes matching **terminal** runs from the [`Store`] (never
+    /// non-terminal ones) and reclaims each pruned run's leftover git snapshot refs from the
+    /// repo. With `dry_run`, reports what would be pruned and changes nothing. Returns the
+    /// [`PruneReport`] (empty if no store is configured).
+    ///
+    /// # Errors
+    /// Returns a [`crate::error::Error`] if the store read/write fails.
+    async fn prune(&self, policy: &PrunePolicy, dry_run: bool) -> Result<PruneReport>;
 }
 
 /// Wires a [`Registry`] of plugins, a repository root, and a [`Store`] into an engine.

@@ -207,7 +207,9 @@ odin_runs_pending 0
 ```
 
 - **`odin_runs_total{workflow,status}`** (counter) — runs that reached a terminal status
-  (`succeeded`/`failed`/`cancelled`); monotonic as runs finish.
+  (`succeeded`/`failed`/`cancelled`); monotonic lifetime completions. It survives
+  [`odin prune`](cli.md#odin-prune-flags): pruned runs are folded into a persistent tally before
+  deletion, so the counter never drops even as old rows are removed.
 - **`odin_runs_in_flight`**, **`odin_runs_awaiting_approval`**, **`odin_runs_pending`** (gauges)
   — the live counts of the corresponding non-terminal statuses, summed across workflows.
 
