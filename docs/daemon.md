@@ -23,6 +23,9 @@ odind --workflows ./workflows --repo . \
 | `--webhook-secret <SECRET>` | `$ODIN_WEBHOOK_SECRET` | HMAC secret for verifying webhook signatures. |
 | `--webhook-allow-unsigned` | off | Explicitly run the webhook server **without** signature verification (local testing only). |
 | `--dashboard` | off | Serve the [web status dashboard](#dashboard) at `http://<webhook-addr>/` (and its read-only `/api/runs`). |
+| `--prune-interval <DURATION>` | off | Run a periodic [retention sweep](#retention) every DURATION (e.g. `24h`). Requires an age and/or count limit below. |
+| `--prune-older-than <DURATION>` | — | Sweep age limit: prune terminal runs last updated longer ago than this (e.g. `90d`). |
+| `--prune-keep-last <N>` | — | Sweep count limit: keep at most `N` terminal runs per workflow. |
 | `--log-format <text\|json>` | `text` | Diagnostic-log format (level via `$ODIN_LOG`/`$RUST_LOG`, default `info`). See [observability](observability.md). |
 | `--otlp-endpoint <URL>` | — | Export spans to an OpenTelemetry OTLP collector. Honored only when built with `--features otlp`; otherwise ignored with a warning. |
 
@@ -218,6 +221,31 @@ Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the s
 proxy / network boundary as the rest of the server (it should not face the public internet).
 For span-level tracing and OTLP export, see [observability](observability.md); `/metrics` is the
 pull-based counterpart for dashboards/alerting.
+
+---
+
+## Retention
+
+The run store grows with every run. **`--prune-interval <DURATION>`** turns on a background sweep
+that bounds it — every interval, it deletes old/excess **terminal** runs exactly like
+[`odin prune`](cli.md#odin-prune-flags), driven by `--prune-older-than` and/or `--prune-keep-last`
+(at least one is **required**, else startup errors). It's **off by default**.
+
+```sh
+odind --workflows ./wf --prune-interval 24h --prune-older-than 90d --prune-keep-last 200
+```
+
+- The first sweep fires **one interval after start**, never at startup — startup runs crash
+  recovery (`resume_all`), and deletion must not race it.
+- Only terminal runs are ever deleted; in-flight and awaiting-approval runs are untouched (the
+  [same safety contract](cli.md#odin-prune-flags) as the CLI). A sweep failure is logged, not
+  fatal.
+- It runs even for a webhook-only / approval-only daemon (no cron triggers needed).
+- `odin_runs_total` stays monotonic across sweeps (the pruned tally — see [Metrics](#metrics)).
+
+Suggested production values: `--prune-interval 24h --prune-older-than 90d --prune-keep-last 200`.
+For one-off or externally-scheduled pruning, use the [`odin prune`](cli.md#odin-prune-flags) CLI
+instead.
 
 ---
 

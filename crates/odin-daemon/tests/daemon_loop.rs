@@ -8,10 +8,12 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use std::time::{Duration, Instant};
+
 use odin_core::traits::TriggerEvent;
 use odin_core::{
-    EngineBuilder, RunInput, RunStatus, SqliteStore, Store, Trigger, TriggerError, Workflow,
-    WorkflowId,
+    EngineBuilder, PrunePolicy, RunInput, RunStatus, SqliteStore, Store, Trigger, TriggerError,
+    Workflow, WorkflowId,
 };
 use odin_daemon::Daemon;
 
@@ -78,6 +80,50 @@ fn engine_with_store(repo: &Path) -> (Arc<dyn odin_core::Engine>, Arc<SqliteStor
         .build()
         .unwrap();
     (engine, store)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduled_prune_sweeps_terminal_runs_on_its_interval() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (engine, store) = engine_with_store(repo.path());
+    let wf = tick_workflow("tick");
+
+    // Three succeeded (terminal) runs.
+    for _ in 0..3 {
+        engine.run(&wf, RunInput::manual()).await.unwrap();
+    }
+    assert_eq!(store.recent(10).await.unwrap().len(), 3);
+
+    // A daemon with NO triggers but a fast prune sweep (keep the newest 1). It must still serve
+    // (not early-return) and prune on its interval.
+    let daemon = Daemon::new(engine, [wf]).with_prune(
+        PrunePolicy {
+            keep_last: Some(1),
+            ..PrunePolicy::default()
+        },
+        Duration::from_millis(120),
+    );
+    let shutdown = daemon.cancellation_token();
+    let task = tokio::spawn(daemon.run());
+
+    // The first sweep fires one interval after start; poll until it has pruned down to 1.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut remaining = 3;
+    while Instant::now() < deadline {
+        remaining = store.recent(10).await.unwrap().len();
+        if remaining == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert_eq!(
+        remaining, 1,
+        "the scheduled sweep keeps only the newest run"
+    );
+
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
