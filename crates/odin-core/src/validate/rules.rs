@@ -453,11 +453,24 @@ pub(crate) fn approval_durable(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 }
 
 /// ODIN033/034/035 — a `case:` step must have ≥1 branch with a unique, non-empty label.
+/// ODIN036 — a selector carrying `gates:`/`judge:` (inert, and a failing gate would break it).
 pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     for (i, s) in wf.steps.iter().enumerate() {
         let StepKind::Case(c) = &s.kind else {
             continue;
         };
+        if !s.gates.is_empty() || s.judge.is_some() {
+            d.push(Diagnostic::new(
+                DiagCode::CaseInertChecks,
+                step_ptr(i),
+                format!(
+                    "case step {:?} carries gates/judge; a selector produces no output to check, \
+                     and a failing gate would flip it to failed and break a merge-back that \
+                     depends on it",
+                    s.id.as_str()
+                ),
+            ));
+        }
         if c.branches.is_empty() {
             d.push(Diagnostic::new(
                 DiagCode::CaseNoBranches,

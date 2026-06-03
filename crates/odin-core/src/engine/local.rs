@@ -554,10 +554,10 @@ impl LocalEngine {
             StepKind::Approval(_) => {
                 StepOutcome::failed("internal: an approval gate was dispatched".to_owned())
             }
-            // A desugared `case:` selector: evaluate the branch guards in order; the first true
-            // (else the `else` label) wins. Records `outputs.selected = <label>` and always
-            // passes — branching is a decision, never a failure. The lifted branch steps are
-            // gated on this `selected` value, and a join downstream depends on the selector.
+            // A `case:` selector: evaluate the branch guards in order; the first true (else the
+            // `else` label) wins. Records `outputs.selected = <label>` and always passes —
+            // branching is a decision, never a failure. The author's branch-body steps are gated
+            // on this `selected` value, and a join downstream depends on the selector.
             StepKind::Case(c) => {
                 let mut selected: Option<String> = None;
                 for b in &c.branches {
@@ -3381,6 +3381,45 @@ steps:
         // Neither branch ran (both gated on bug/docs).
         assert_eq!(step_status(&s, "fix"), Some(StepStatus::Skipped));
         assert_eq!(step_status(&s, "write"), Some(StepStatus::Skipped));
+    }
+
+    #[tokio::test]
+    async fn case_selects_the_first_matching_branch() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // Both guards are true; the FIRST branch (alpha) must win.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: r\n    case:\n      branches:\n        - {label: alpha, when: \"1 == 1\"}\n        - {label: beta,  when: \"2 == 2\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let r = s.steps.iter().find(|x| x.id.as_str() == "r").unwrap();
+        assert_eq!(
+            r.outputs.get("selected").and_then(|v| v.as_str()),
+            Some("alpha")
+        );
+    }
+
+    #[tokio::test]
+    async fn case_with_no_match_and_no_else_selects_empty() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: c, run: \"echo zzz\"}\n  - id: r\n    depends_on: [c]\n    case:\n      branches:\n        - {label: bug, when: \"steps.c.outputs.stdout | trim == 'bug'\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let r = s.steps.iter().find(|x| x.id.as_str() == "r").unwrap();
+        assert_eq!(
+            r.outputs.get("selected").and_then(|v| v.as_str()),
+            Some(""),
+            "no guard matched and no else ⇒ selected is empty"
+        );
+        assert_eq!(s.status, RunStatus::Succeeded); // the selector still passes
     }
 
     #[tokio::test]

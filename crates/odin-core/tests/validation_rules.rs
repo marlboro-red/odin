@@ -428,3 +428,11 @@ fn a_valid_case_step_is_clean() {
         "name: x\nsteps:\n  - {id: c, run: \"echo bug\"}\n  - id: r\n    depends_on: [c]\n    case:\n      branches:\n        - {label: bug,  when: \"steps.c.outputs.stdout == 'bug'\"}\n        - {label: docs, when: \"steps.c.outputs.stdout == 'docs'\"}\n      else: other\n  - {id: fix, run: \"echo fix\", depends_on: [r], when: \"steps.r.outputs.selected == 'bug'\"}\n",
     );
 }
+
+#[test]
+fn odin036_gates_or_judge_on_a_case_selector_warns() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: r\n    gates: {check: \"true\"}\n    case:\n      branches:\n        - {label: a, when: \"true\"}\n",
+        DiagCode::CaseInertChecks,
+    );
+}

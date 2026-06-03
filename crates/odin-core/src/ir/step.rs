@@ -85,8 +85,8 @@ pub enum StepKind {
     Run(RunStep),
     /// A human-in-the-loop gate: the run **pauses** here until a person approves or rejects it.
     Approval(ApprovalStep),
-    /// Conditional branching: select exactly one of N labeled branches by ordered guards. After
-    /// the load-time desugar pass this is a *selector* (branch bodies are lifted to top-level).
+    /// Conditional branching: a *selector* that records which of N labeled branches to take. The
+    /// branch *bodies* are ordinary downstream steps the author gates on `outputs.selected`.
     Case(CaseStep),
 }
 

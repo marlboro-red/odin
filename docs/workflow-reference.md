@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN035`).
+(`ODIN001`–`ODIN036`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -230,7 +230,9 @@ You write the branch **bodies** as ordinary steps gated on the decision:
 A guard is a minijinja boolean checked like a [`when:`](#common-step-fields-all-kinds); a guard
 referencing an unknown root is flagged ([ODIN017](#odin017)). A `case:` step must declare at least
 one branch ([ODIN033](#odin033)) with unique ([ODIN034](#odin034)), non-empty ([ODIN035](#odin035))
-labels. See [`examples/triage.yaml`](../examples/triage.yaml).
+labels, and shouldn't carry `gates:`/`judge:` ([ODIN036](#odin036)). The branches are tried in
+order, so a guard-less branch (an explicit catch-all) shadows any branch after it. See
+[`examples/triage.yaml`](../examples/triage.yaml).
 
 > A merge-back depends on the selector, so it runs once the branch is **decided**, not once the
 > chosen branch's **work** finishes. To order a step after a branch's work, make it part of that
@@ -441,7 +443,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN035`)
+## Diagnostics catalogue (`ODIN001`–`ODIN036`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -483,6 +485,7 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin033"></a>ODIN033 | error | A `case:` step declares no `branches` (it could only ever select `else`, or nothing); give it at least one branch. |
 | <a id="odin034"></a>ODIN034 | error | Two branches of one `case:` (or a branch and the `else`) share a `label`, so `selected` is ambiguous. |
 | <a id="odin035"></a>ODIN035 | error | A `case:` branch has an empty `label`. |
+| <a id="odin036"></a>ODIN036 | **warning** | A `case:` selector carries `gates:`/`judge:` — inert (it has no output to check), and a failing gate would flip the always-passing selector to failed and break a merge-back that depends on it. |
 
 ¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 
