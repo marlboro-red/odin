@@ -13,6 +13,7 @@ Commands:
   list                 List recent runs from the store
   show <RUN_ID>        Show a run's details
   logs <RUN_ID>        Show a run's event log
+  status               At-a-glance status of recent runs (--watch to live-refresh)
   approve <RUN_ID>     Approve a run paused at an approval gate
   reject  <RUN_ID>     Reject a paused run (optionally rerun with feedback)
   prune                Delete old/excess terminal runs from the store
@@ -175,6 +176,30 @@ Events are `run_started`, `step_started`, `gate_result`, `judge_result`, `step_f
 `run_finished`. Human mode prints compact JSON per line; `--json` pretty-prints the array.
 **Exit:** `0` (incl. empty); `1` no database; `2` invalid UUID or store error.
 
+### `odin status [flags]`
+
+An at-a-glance view of recent runs — the terminal counterpart to the [web
+dashboard](daemon.md#dashboard). A summary header (counts by status) over a row per run: a status
+glyph, short id, workflow, step progress, and age; an awaiting-approval run shows its gate message.
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--repo` / `--db` | `.` / `<repo>/.odin/state.db` | Database location (as above). |
+| `--limit <N>` | `20` | Maximum number of runs to show. |
+| `--watch` | off | Live-refresh every 2 s until `ctrl-c`. |
+| `--json` | off | Emit the runs as JSON — the same [`RunView`](#json-shapes) shape as the daemon's `/api/runs`. |
+
+```text
+2 running  ·  1 awaiting approval  ·  14 succeeded  ·  1 failed
+
+▸ running   a91b2c3d issue-to-pr          2/4   12s
+⏸ awaiting  7f3ce8a1 gated-deploy         2/4    3m  ↳ Ship it?
+✓ succeeded 2b8e1f4d nightly              4/4    1m
+✗ failed    c4d5a6b7 fix-flaky            1/3    5m
+```
+
+**Exit:** `0` (incl. no database — `--json` still emits `[]`); `2` on a store error.
+
 ---
 
 ## Approving a paused run
@@ -282,6 +307,11 @@ an error (no age/count limit given, or a store/engine failure).
 - **`show --json`** → the full `RunState` (the persisted checkpoint).
 - **`list --json`** → `[{ "run_id", "workflow", "status", "updated_at" }, …]`.
 - **`logs --json`** → an array of `RunEvent` (each tagged by `kind`).
+- **`status --json`** → `[ RunView, … ]`, a `RunView` being `{ "run_id", "workflow", "status",
+  "updated_at", "steps": [ { "id", "status", "exit_code", "error" } ], "gate": { "step",
+  "message" } | null }`. This is the **same shape** the daemon's
+  [`GET /api/runs`](daemon.md#dashboard) returns (and `/api/runs/{id}` adds `"diff"` + `"error"`),
+  so one schema serves the CLI, the API, and the dashboard.
 
 Statuses serialize snake_case (`pending`, `running`, `succeeded`, `failed`, `cancelled` for a
 run; `pending`, `running`, `passed`, `failed`, `skipped` for a step). `cost_micros` is integer micro-dollars (cost is display-only; the engine never

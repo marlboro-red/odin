@@ -106,6 +106,24 @@ enum Command {
     Reject(ApprovalCmd),
     /// Delete old/excess terminal runs from the store (never touches in-flight or awaiting runs).
     Prune(PruneCmd),
+    /// At-a-glance status of recent runs (counts + steps); `--watch` live-refreshes.
+    Status {
+        /// The git repository whose `.odin/state.db` to read. Defaults to the current dir.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Path to the run-state SQLite database. Overrides `--repo`.
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Maximum number of runs to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Live-refresh every 2s until ctrl-c.
+        #[arg(long)]
+        watch: bool,
+        /// Emit the runs as JSON (the same shape as the daemon's `/api/runs`).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Arguments for `prune`. Requires at least one of `--older-than` / `--keep-last`.
@@ -263,5 +281,18 @@ fn main() -> ExitCode {
         Command::Approve(c) => finish(cmd::approval::approve(c.into())),
         Command::Reject(c) => finish(cmd::approval::reject(c.into())),
         Command::Prune(c) => finish(cmd::prune::run(c.into())),
+        Command::Status {
+            repo,
+            db,
+            limit,
+            watch,
+            json,
+        } => finish(cmd::status::run(cmd::status::StatusArgs {
+            repo,
+            db,
+            limit,
+            watch,
+            json,
+        })),
     }
 }

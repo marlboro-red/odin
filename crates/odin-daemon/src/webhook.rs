@@ -431,7 +431,7 @@ async fn handle_api_runs(
     let limit = q.limit.unwrap_or(50).min(500);
     match store.recent(limit).await {
         Ok(runs) => {
-            let rows: Vec<_> = runs.iter().map(crate::dashboard::project_row).collect();
+            let rows: Vec<_> = runs.iter().map(odin_core::RunView::project).collect();
             Json(rows).into_response()
         }
         Err(e) => {
@@ -453,7 +453,7 @@ async fn handle_api_run(State(state): State<Arc<AppState>>, Path(id): Path<Strin
         return (StatusCode::BAD_REQUEST, "invalid run id").into_response();
     };
     match store.load_run(run_id).await {
-        Ok(Some(state)) => Json(crate::dashboard::project_detail(&state)).into_response(),
+        Ok(Some(state)) => Json(odin_core::RunDetailView::project(&state)).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, "no such run").into_response(),
         Err(e) => {
             tracing::warn!(error = %e, "dashboard: run detail read failed");
