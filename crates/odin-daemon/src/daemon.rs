@@ -269,7 +269,12 @@ impl Daemon {
 /// so a prune never races the startup crash-resume; thereafter it applies the policy each period
 /// until shutdown. A prune failure is logged, not fatal — the daemon stays up.
 async fn prune_loop(engine: &Arc<dyn Engine>, sched: &PruneSchedule, shutdown: &CancellationToken) {
-    let start = tokio::time::Instant::now() + sched.period;
+    // Delay the first tick by one period (checked, so an absurd interval degrades to a warning
+    // rather than a panic on `Instant + Duration`).
+    let Some(start) = tokio::time::Instant::now().checked_add(sched.period) else {
+        tracing::warn!("prune interval is too large to schedule; scheduled pruning disabled");
+        return;
+    };
     let mut tick = tokio::time::interval_at(start, sched.period);
     loop {
         tokio::select! {
