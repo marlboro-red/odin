@@ -16,6 +16,11 @@ use clap::{Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Diagnostic-log format (the level is `$ODIN_LOG`/`$RUST_LOG`, default `info`; e.g.
+    /// `ODIN_LOG=debug odin run …` to see per-step engine spans). Command *output*
+    /// (summaries, tables, `--json`) always goes to stdout regardless.
+    #[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"], global = true)]
+    log_format: String,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +112,12 @@ fn finish(result: anyhow::Result<ExitCode>) -> ExitCode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Structured diagnostics (engine spans/events) to stderr; command output stays on stdout.
+    // The CLI is one-shot, so no OTLP exporter — that's the daemon's long-running concern.
+    let _telemetry = odin_core::telemetry::init(&odin_core::telemetry::Options {
+        format: cli.log_format.parse().unwrap_or_default(),
+        otlp_endpoint: None,
+    });
     match cli.command {
         Command::Validate { file, json } => match cmd::validate::run(&file, json) {
             Ok(code) => code,

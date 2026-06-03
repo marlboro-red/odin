@@ -7,8 +7,13 @@
 //!
 //! ```text
 //! odind --workflows ./workflows --repo . [--db ./.odin/state.db] \
-//!       [--webhook-addr 127.0.0.1:9292] [--webhook-secret <SECRET>]
+//!       [--webhook-addr 127.0.0.1:9292] [--webhook-secret <SECRET>] \
+//!       [--log-format text|json] [--otlp-endpoint http://localhost:4317]
 //! ```
+//!
+//! Logging is structured via `tracing`; control the level with `$ODIN_LOG` (then `$RUST_LOG`),
+//! defaulting to `info`. `--otlp-endpoint` exports spans to an OpenTelemetry collector when
+//! built with `--features otlp`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,6 +23,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use clap::Parser;
 use odin_core::ir::TriggerDecl;
+use odin_core::telemetry::{self, Options};
 use odin_core::{EngineBuilder, SqliteStore, Workflow};
 use odin_daemon::{Daemon, WebhookServer};
 
@@ -51,12 +57,20 @@ struct Cli {
     /// only). Without this, a declared webhook trigger and no secret is a startup error.
     #[arg(long)]
     webhook_allow_unsigned: bool,
+    /// Log output format.
+    #[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
+    log_format: String,
+    /// Export spans to an OpenTelemetry OTLP collector (e.g. `http://localhost:4317`). Honored
+    /// only when built with `--features otlp`; otherwise ignored with a warning.
+    #[arg(long, value_name = "URL")]
+    otlp_endpoint: Option<String>,
 }
 
 fn main() -> ExitCode {
     match real_main() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            // Top-level fatal: telemetry may already be torn down, so write directly.
             eprintln!("odind: {e:#}");
             ExitCode::FAILURE
         }
@@ -65,15 +79,30 @@ fn main() -> ExitCode {
 
 fn real_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Build the runtime first, then run everything inside it so the OTLP batch exporter has a
+    // tokio context at telemetry init.
+    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
+    runtime.block_on(serve(cli))
+}
+
+async fn serve(cli: Cli) -> anyhow::Result<()> {
+    // Install telemetry first so everything below is captured; hold the guard for the whole
+    // process (dropping it flushes the OTLP exporter).
+    let format = cli.log_format.parse().unwrap_or_default();
+    let _telemetry = telemetry::init(&Options {
+        format,
+        otlp_endpoint: cli.otlp_endpoint.clone(),
+    });
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "odind starting");
 
     let workflows = load_workflows(&cli.workflows)?;
     if workflows.is_empty() {
         anyhow::bail!("no valid workflows found in {}", cli.workflows.display());
     }
-    eprintln!(
-        "odind: loaded {} workflow(s) from {}",
-        workflows.len(),
-        cli.workflows.display()
+    tracing::info!(
+        count = workflows.len(),
+        dir = %cli.workflows.display(),
+        "loaded workflows"
     );
 
     let db = cli
@@ -128,46 +157,41 @@ fn real_main() -> anyhow::Result<()> {
     }
     let shutdown = daemon.cancellation_token();
 
-    let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
-    runtime.block_on(async move {
-        // On ctrl-c, ask the daemon + webhook server to stop accepting new events and drain
-        // in-flight work (rather than dropping the futures mid-flight).
-        let signal_token = shutdown.clone();
-        let signal = tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                eprintln!("odind: ctrl-c received, draining in-flight runs…");
-                signal_token.cancel();
-            }
-        });
+    // On ctrl-c, ask the daemon + webhook server to stop accepting new events and drain
+    // in-flight work (rather than dropping the futures mid-flight).
+    let signal_token = shutdown.clone();
+    let signal = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("ctrl-c received, draining in-flight runs");
+            signal_token.cancel();
+        }
+    });
 
-        let result = if webhook_server.is_empty() {
-            daemon.run().await
-        } else {
-            eprintln!(
-                "odind: webhook server: {} subscription(s), 25 MiB body cap",
-                webhook_server.subscription_count()
+    let result = if webhook_server.is_empty() {
+        daemon.run().await
+    } else {
+        tracing::info!(
+            subscriptions = webhook_server.subscription_count(),
+            body_cap_mib = 25,
+            "webhook server configured"
+        );
+        let bound = webhook_server.bind().await?;
+        // No built-in TLS: a non-loopback bind over plain HTTP must sit behind a
+        // TLS-terminating reverse proxy, or signatures travel in cleartext.
+        if !bound.local_addr().ip().is_loopback() {
+            tracing::warn!(
+                addr = %bound.local_addr(),
+                "webhook bound to a non-loopback address over plain HTTP; terminate TLS at a \
+                 reverse proxy in front of it"
             );
-            let bound = webhook_server.bind().await?;
-            // No built-in TLS: a non-loopback bind over plain HTTP must sit behind a
-            // TLS-terminating reverse proxy, or signatures travel in cleartext.
-            if !bound.local_addr().ip().is_loopback() {
-                eprintln!(
-                    "odind: WARNING webhook server bound to non-loopback {} over plain HTTP; \
-                     terminate TLS at a reverse proxy in front of it",
-                    bound.local_addr()
-                );
-            }
-            eprintln!(
-                "odind: webhook server listening on http://{}/webhook",
-                bound.local_addr()
-            );
-            // Drive the supervisor loop and the HTTP server together; both end on shutdown.
-            let (daemon_res, server_res) = tokio::join!(daemon.run(), bound.serve(shutdown));
-            daemon_res.and(server_res)
-        };
-        signal.abort();
-        result
-    })
+        }
+        tracing::info!(url = %format_args!("http://{}/webhook", bound.local_addr()), "webhook server listening");
+        // Drive the supervisor loop and the HTTP server together; both end on shutdown.
+        let (daemon_res, server_res) = tokio::join!(daemon.run(), bound.serve(shutdown));
+        daemon_res.and(server_res)
+    };
+    signal.abort();
+    result
 }
 
 /// Loads every `*.yaml` / `*.yml` workflow in `dir` (sorted for determinism). A single
@@ -181,7 +205,7 @@ fn load_workflows(dir: &Path) -> anyhow::Result<Vec<Workflow>> {
         .filter_map(|entry| match entry {
             Ok(entry) => Some(entry.path()),
             Err(e) => {
-                eprintln!("odind: skipping unreadable directory entry: {e}");
+                tracing::warn!(error = %e, "skipping unreadable directory entry");
                 None
             }
         })
@@ -194,16 +218,18 @@ fn load_workflows(dir: &Path) -> anyhow::Result<Vec<Workflow>> {
         let src = match std::fs::read_to_string(&path) {
             Ok(src) => src,
             Err(e) => {
-                eprintln!("odind: skipping {}: {e}", path.display());
+                tracing::warn!(path = %path.display(), error = %e, "skipping unreadable workflow");
                 continue;
             }
         };
         match Workflow::from_yaml_str(&src) {
             Ok(workflow) => {
-                eprintln!("odind:   • {} ({})", workflow.name.as_str(), path.display());
+                tracing::debug!(workflow = %workflow.name.as_str(), path = %path.display(), "loaded workflow");
                 workflows.push(workflow);
             }
-            Err(e) => eprintln!("odind: skipping {}: {e}", path.display()),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "skipping unparseable workflow");
+            }
         }
     }
     Ok(workflows)

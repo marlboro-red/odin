@@ -48,6 +48,7 @@ use chrono::Utc;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use indexmap::IndexMap;
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 use super::Engine;
 use crate::api::{RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus};
@@ -1094,6 +1095,13 @@ impl LocalEngine {
             };
             exclusive_running = false; // an exclusive step ran alone, so this clears it
 
+            tracing::info!(
+                step = %id,
+                status = ?outcome.status,
+                exit_code = outcome.exit_code,
+                attempts = outcome.attempts,
+                "step finished"
+            );
             if let Some(u) = &outcome.usage {
                 usage.add(*u);
             }
@@ -1181,6 +1189,7 @@ impl LocalEngine {
     /// scratch step's file edits stay in its throwaway worktree; its diff is surfaced as
     /// `outputs.diff` and the worktree is removed. Returns `(id, outcome)` for the driver.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(name = "step", skip_all, fields(step = %step.id, scratch = step.scratch))]
     async fn run_one(
         &self,
         run_id: RunId,
@@ -1445,9 +1454,17 @@ impl Engine for LocalEngine {
         self.emit(run_id, RunEvent::RunStarted { at: started_at })
             .await;
 
+        let run_span = tracing::info_span!(
+            "run",
+            run_id = %run_id,
+            workflow = %workflow.name,
+            durable = workflow.durable,
+        );
+        tracing::info!(parent: &run_span, "run started");
         let cancel = CancelToken::new();
         let exec = self
             .execute(workflow, &mut state, &workdir, &params, &cancel)
+            .instrument(run_span.clone())
             .await;
         // The run is terminal now — drop the snapshot ref so its commits can be collected.
         // Fully unconditional: durable runs snapshot per step, AND a retrying step snapshots
@@ -1485,6 +1502,16 @@ impl Engine for LocalEngine {
             },
         )
         .await;
+        let elapsed_ms = (Utc::now() - started_at).num_milliseconds();
+        tracing::info!(
+            parent: &run_span,
+            run_id = %run_id,
+            status = ?status,
+            steps = summary.steps.len(),
+            cost_micros = summary.usage.cost_micros,
+            elapsed_ms,
+            "run finished"
+        );
 
         Ok(summary)
     }
@@ -1518,8 +1545,17 @@ impl Engine for LocalEngine {
                 match Self::resolve_params(workflow, &state.input) {
                     Ok(params) => {
                         let cancel = CancelToken::new();
+                        let run_span = tracing::info_span!(
+                            "run",
+                            run_id = %state.run_id,
+                            workflow = %workflow.name,
+                            durable = workflow.durable,
+                            resumed = true,
+                        );
+                        tracing::info!(parent: &run_span, "resuming run");
                         let exec = self
                             .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
+                            .instrument(run_span)
                             .await;
                         // Reclaim the run's snapshot refs unconditionally (matches run() and the
                         // unserved-workflow path above): a retrying step snapshots even in a

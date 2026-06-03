@@ -86,6 +86,8 @@ pub mod provider;
 pub mod registry;
 #[cfg(feature = "runtime")]
 pub mod storage;
+#[cfg(feature = "telemetry")]
+pub mod telemetry;
 #[cfg(feature = "runtime")]
 pub mod traits;
 #[cfg(feature = "runtime")]

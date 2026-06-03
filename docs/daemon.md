@@ -22,8 +22,11 @@ odind --workflows ./workflows --repo . \
 | `--webhook-addr <ADDR>` | `127.0.0.1:9292` | Address the webhook HTTP server binds to (only started if a workflow declares a `github_webhook` trigger). |
 | `--webhook-secret <SECRET>` | `$ODIN_WEBHOOK_SECRET` | HMAC secret for verifying webhook signatures. |
 | `--webhook-allow-unsigned` | off | Explicitly run the webhook server **without** signature verification (local testing only). |
+| `--log-format <text\|json>` | `text` | Diagnostic-log format (level via `$ODIN_LOG`/`$RUST_LOG`, default `info`). See [observability](observability.md). |
+| `--otlp-endpoint <URL>` | — | Export spans to an OpenTelemetry OTLP collector. Honored only when built with `--features otlp`; otherwise ignored with a warning. |
 
-`ODIN_WEBHOOK_SECRET` is the only environment variable; an empty value counts as "no secret".
+`ODIN_WEBHOOK_SECRET` is the webhook secret (empty = "no secret"); `ODIN_LOG` (then `RUST_LOG`)
+sets the log level. Logs go to **stderr** — see [observability](observability.md).
 
 ## What startup does
 

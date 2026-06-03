@@ -278,9 +278,9 @@ impl BoundWebhookServer {
     /// are answered with a 4xx and logged).
     pub async fn serve(self, shutdown: CancellationToken) -> anyhow::Result<()> {
         if self.state.secret.is_none() && !self.state.subscriptions.is_empty() {
-            eprintln!(
-                "odind: WARNING no webhook secret set (ODIN_WEBHOOK_SECRET / --webhook-secret); \
-                 accepting UNSIGNED webhook requests — dev mode only"
+            tracing::warn!(
+                "no webhook secret set (ODIN_WEBHOOK_SECRET / --webhook-secret); accepting \
+                 UNSIGNED webhook requests — dev mode only"
             );
         }
         let app = Router::new()
@@ -324,7 +324,7 @@ async fn handle_webhook(
     let payload = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(value) => value,
         Err(e) => {
-            eprintln!("odind: webhook: rejecting invalid JSON body: {e}");
+            tracing::warn!(error = %e, "webhook: rejecting invalid JSON body");
             return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
         }
     };
@@ -348,7 +348,7 @@ async fn handle_webhook(
     // Recording after success keeps the contract at-least-once: the worst case is two in-flight
     // deliveries of one id both enqueuing (a duplicate run), never a dropped one.
     if delivery != "?" && dedup(&state).contains(delivery) {
-        eprintln!("odind: webhook: duplicate delivery {delivery} ignored");
+        tracing::info!(%delivery, "webhook: duplicate delivery ignored");
         return (StatusCode::OK, "duplicate delivery ignored").into_response();
     }
 
@@ -365,9 +365,11 @@ async fn handle_webhook(
             );
             if let Err(e) = sub.tx.try_send(event) {
                 dropped += 1;
-                eprintln!(
-                    "odind: webhook: dropping {label} event for {} ({e})",
-                    sub.workflow.as_str()
+                tracing::warn!(
+                    %label,
+                    workflow = %sub.workflow.as_str(),
+                    error = %e,
+                    "webhook: dropping event (subscription queue full)"
                 );
             }
         }
@@ -376,8 +378,9 @@ async fn handle_webhook(
         // Couldn't enqueue every matched run (queue overflow). Leave the delivery UN-recorded
         // and return a non-2xx so GitHub retries it. (A retry may re-enqueue subscriptions that
         // already accepted — at-least-once, preferred over silently losing the event.)
-        eprintln!(
-            "odind: webhook: {label} delivery={delivery} → {dropped}/{matched} enqueue(s) failed; asking GitHub to retry"
+        tracing::warn!(
+            %label, %delivery, dropped, matched,
+            "webhook: enqueue(s) failed; returning 503 so GitHub retries"
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -389,7 +392,7 @@ async fn handle_webhook(
     if delivery != "?" {
         dedup(&state).record(delivery);
     }
-    eprintln!("odind: webhook: {label} delivery={delivery} → matched {matched} subscription(s)");
+    tracing::info!(%label, %delivery, matched, "webhook: delivery accepted");
     (StatusCode::ACCEPTED, format!("accepted; matched {matched}")).into_response()
 }
 
@@ -410,7 +413,7 @@ fn dedup(state: &AppState) -> std::sync::MutexGuard<'_, DeliveryDedup> {
 fn verify_signature(secret: Option<&str>, headers: &HeaderMap, body: &[u8]) -> Option<Response> {
     let secret = secret?; // dev mode: accept unsigned (warned about at startup).
     let Some(header) = header_str(headers, "x-hub-signature-256") else {
-        eprintln!("odind: webhook: rejecting unsigned request (a secret is configured)");
+        tracing::warn!("webhook: rejecting unsigned request (a secret is configured)");
         return Some((StatusCode::BAD_REQUEST, "missing signature").into_response());
     };
     let Some(hex_sig) = header.strip_prefix("sha256=") else {
@@ -424,7 +427,7 @@ fn verify_signature(secret: Option<&str>, headers: &HeaderMap, body: &[u8]) -> O
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC key length is flexible");
     mac.update(body);
     if mac.verify_slice(&expected).is_err() {
-        eprintln!("odind: webhook: rejecting request with invalid signature");
+        tracing::warn!("webhook: rejecting request with invalid signature");
         return Some((StatusCode::UNAUTHORIZED, "invalid signature").into_response());
     }
     None
