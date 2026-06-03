@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::api::RunStatus;
 use crate::error::StoreError;
 use crate::ids::RunId;
-use crate::traits::{RunEvent, RunState, Store};
+use crate::traits::{RunEvent, RunState, RunStatusCount, Store, StoreMetrics};
 
 /// The baseline schema (migration to v1). Idempotent (`IF NOT EXISTS`), so it also adopts a
 /// pre-versioning database that already has the tables.
@@ -35,11 +35,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 ";
 
+/// A composite index on `(workflow, status)` so the `/metrics` aggregate (`GROUP BY workflow,
+/// status`) streams from the index in group order instead of scanning every row and building a
+/// temp B-tree. The pre-existing `runs_status` index (on `status` alone) can't serve a grouping
+/// that leads with `workflow`.
+const SCHEMA_V2_METRICS_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS runs_workflow_status ON runs(workflow, status);";
+
 /// Ordered migrations tracked by SQLite's `PRAGMA user_version`. The entry at index `i`
 /// upgrades the database from version `i` to `i + 1` (so `MIGRATIONS.len()` is the current
 /// version). **Append** new migrations; never edit or reorder a released one — an in-place
 /// edit would not re-run on a database already at that version.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2_METRICS_INDEX];
 
 /// A durable run store backed by a SQLite database.
 pub struct SqliteStore {
@@ -239,6 +246,27 @@ impl Store for SqliteStore {
             out.push(serde_json::from_str(&db(row)?)?);
         }
         Ok(out)
+    }
+
+    async fn metrics(&self) -> Result<StoreMetrics, StoreError> {
+        // One indexed aggregate, no JSON blobs parsed: the `workflow` and `status` columns are
+        // denormalized, so the counts are SQLite's to compute.
+        let conn = self.conn.lock().await;
+        let mut stmt =
+            db(conn
+                .prepare("SELECT workflow, status, COUNT(*) FROM runs GROUP BY workflow, status"))?;
+        let rows = db(stmt.query_map([], |row| {
+            Ok(RunStatusCount {
+                workflow: row.get::<_, String>(0)?,
+                status: row.get::<_, String>(1)?,
+                count: row.get::<_, i64>(2)?.max(0).unsigned_abs(),
+            })
+        }))?;
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(db(row)?);
+        }
+        Ok(StoreMetrics { runs })
     }
 }
 

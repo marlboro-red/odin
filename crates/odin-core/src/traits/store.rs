@@ -63,6 +63,58 @@ pub trait Store: Send + Sync {
     async fn events(&self, _run_id: RunId) -> Result<Vec<RunEvent>, StoreError> {
         Ok(Vec::new())
     }
+
+    /// A cheap aggregate snapshot for operational metrics (e.g. a Prometheus `/metrics`
+    /// endpoint): run counts grouped by workflow and status. Defaults to empty, so metrics are
+    /// an optional capability.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backend read fails.
+    async fn metrics(&self) -> Result<StoreMetrics, StoreError> {
+        Ok(StoreMetrics::default())
+    }
+}
+
+/// A cheap aggregate snapshot of run state for operational metrics (e.g. a Prometheus
+/// `/metrics` endpoint): the number of runs in each (workflow, status) group.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct StoreMetrics {
+    /// One entry per (workflow, status) group present in the store.
+    pub runs: Vec<RunStatusCount>,
+}
+
+impl StoreMetrics {
+    /// Builds a snapshot from per-`(workflow, status)` counts.
+    #[must_use]
+    pub fn new(runs: Vec<RunStatusCount>) -> Self {
+        Self { runs }
+    }
+}
+
+/// The number of runs of one workflow in one status. `status` is the lowercase serde string
+/// (`"succeeded"`, `"running"`, `"awaiting_approval"`, …).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RunStatusCount {
+    /// The workflow name.
+    pub workflow: String,
+    /// The run status, as its lowercase serde string.
+    pub status: String,
+    /// How many runs are in this (workflow, status) group.
+    pub count: u64,
+}
+
+impl RunStatusCount {
+    /// Builds one `(workflow, status)` count.
+    #[must_use]
+    pub fn new(workflow: impl Into<String>, status: impl Into<String>, count: u64) -> Self {
+        Self {
+            workflow: workflow.into(),
+            status: status.into(),
+            count,
+        }
+    }
 }
 
 /// The full durable state of a run — the checkpoint payload.

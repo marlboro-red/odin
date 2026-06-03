@@ -128,7 +128,7 @@ pub use traits::{Action, Provider, Store, Trigger, Workspace};
 #[cfg(feature = "runtime")]
 pub use traits::{
     AcquireCtx, ActionCtx, ActionOutcome, CancelToken, InvocationCtx, InvocationOutcome, RunEvent,
-    RunState, StepState, TriggerEvent, WorkspaceHandle,
+    RunState, RunStatusCount, StepState, StoreMetrics, TriggerEvent, WorkspaceHandle,
 };
 #[cfg(feature = "runtime")]
 pub use workspace::{SlotPoolWorkspace, WorktreeWorkspace};

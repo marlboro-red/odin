@@ -20,6 +20,6 @@ pub mod workspace;
 
 pub use action::{Action, ActionCtx, ActionOutcome};
 pub use provider::{CancelToken, InvocationCtx, InvocationOutcome, Provider};
-pub use store::{RunEvent, RunState, StepState, Store};
+pub use store::{RunEvent, RunState, RunStatusCount, StepState, Store, StoreMetrics};
 pub use trigger::{Trigger, TriggerEvent};
 pub use workspace::{AcquireCtx, Workspace, WorkspaceHandle};
