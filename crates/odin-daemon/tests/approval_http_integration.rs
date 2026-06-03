@@ -128,6 +128,7 @@ impl Harness {
             WebhookServer::new("127.0.0.1:0".parse().unwrap(), secret.map(str::to_owned));
         server.enable_approvals(engine, Arc::from(vec![workflow]));
         server.enable_metrics(store.clone());
+        server.enable_dashboard();
         let bound = server.bind().await.unwrap();
         let addr = bound.local_addr();
         let shutdown = CancellationToken::new();
@@ -342,6 +343,51 @@ async fn metrics_endpoint_reports_run_counts_unauthenticated() {
         "body:\n{body2}"
     );
     h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_serves_the_page_and_lists_runs_unauthenticated() {
+    let h = Harness::start(Some(SECRET)).await;
+
+    // The single-page app at `/` (no signature).
+    let (status, page) = get(h.addr, "/").await;
+    assert!(status.contains("200"), "got: {status}");
+    assert!(page.contains("Odin"), "the dashboard HTML should render");
+
+    // The read API lists the paused run with its gate message.
+    let (api_status, body) = get(h.addr, "/api/runs").await;
+    assert!(api_status.contains("200"), "got: {api_status}");
+    let runs: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let run = &runs[0];
+    assert_eq!(run["status"], "awaiting_approval");
+    assert_eq!(run["workflow"], "appr-flow");
+    assert_eq!(run["gate"]["message"], "ship it?");
+    assert_eq!(run["gate"]["step"], "gate");
+
+    // The detail endpoint resolves by id.
+    let (d_status, _) = get(h.addr, &format!("/api/runs/{}", h.run_id)).await;
+    assert!(d_status.contains("200"), "got: {d_status}");
+    let (nf, _) = get(h.addr, "/api/runs/not-a-uuid").await;
+    assert!(nf.contains("400"), "bad id should be 400, got: {nf}");
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_is_404_when_not_enabled() {
+    // A server without `enable_dashboard()` must not serve the page or the read API.
+    let server = WebhookServer::new("127.0.0.1:0".parse().unwrap(), None);
+    let bound = server.bind().await.unwrap();
+    let addr = bound.local_addr();
+    let token = CancellationToken::new();
+    let task = tokio::spawn(bound.serve(token.clone()));
+
+    assert!(get(addr, "/").await.0.contains("404"));
+    assert!(get(addr, "/api/runs").await.0.contains("404"));
+    // `/health` is always on, dashboard or not.
+    assert!(get(addr, "/health").await.0.contains("200"));
+
+    token.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
