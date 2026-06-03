@@ -456,6 +456,7 @@ impl LocalEngine {
     }
 
     /// Dispatches a step to its provider / shell `run:` / action body, before gates.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(
         &self,
         step: &Step,
@@ -552,6 +553,35 @@ impl LocalEngine {
             // the run's recorded decisions; they never reach `dispatch`.
             StepKind::Approval(_) => {
                 StepOutcome::failed("internal: an approval gate was dispatched".to_owned())
+            }
+            // A desugared `case:` selector: evaluate the branch guards in order; the first true
+            // (else the `else` label) wins. Records `outputs.selected = <label>` and always
+            // passes — branching is a decision, never a failure. The lifted branch steps are
+            // gated on this `selected` value, and a join downstream depends on the selector.
+            StepKind::Case(c) => {
+                let mut selected: Option<String> = None;
+                for b in &c.branches {
+                    let matched = match &b.when {
+                        Some(expr) => match eval_when(expr, ctx) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                return StepOutcome::failed(format!(
+                                    "case guard for branch {:?}: {e}",
+                                    b.label
+                                ));
+                            }
+                        },
+                        None => true,
+                    };
+                    if matched {
+                        selected = Some(b.label.clone());
+                        break;
+                    }
+                }
+                let selected = selected.or_else(|| c.else_.clone()).unwrap_or_default();
+                let mut outputs = IndexMap::new();
+                outputs.insert("selected".to_owned(), Value::String(selected));
+                StepOutcome::passing(0, outputs, None)
             }
         }
     }
@@ -3302,6 +3332,55 @@ steps:
             .iter()
             .find(|x| x.id.as_str() == id)
             .map(|x| x.status)
+    }
+
+    const CASE_WF: &str = "name: casewf\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: classify, run: \"echo bug\"}\n  - id: route\n    depends_on: [classify]\n    case:\n      branches:\n        - {label: bug,  when: \"steps.classify.outputs.stdout | trim == 'bug'\"}\n        - {label: docs, when: \"steps.classify.outputs.stdout | trim == 'docs'\"}\n      else: other\n  - {id: fix,   run: \"echo fixing\",  depends_on: [route], when: \"steps.route.outputs.selected == 'bug'\"}\n  - {id: write, run: \"echo writing\", depends_on: [route], when: \"steps.route.outputs.selected == 'docs'\"}\n  - {id: done,  run: \"echo done\",    depends_on: [route], when: \"steps.route.outputs.selected == 'bug'\"}\n";
+
+    #[tokio::test]
+    async fn case_selects_one_branch_and_join_merges_back() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(CASE_WF);
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+
+        // The selector ran and recorded the decision.
+        assert_eq!(step_status(&s, "route"), Some(StepStatus::Passed));
+        let route = s.steps.iter().find(|x| x.id.as_str() == "route").unwrap();
+        assert_eq!(
+            route.outputs.get("selected").and_then(|v| v.as_str()),
+            Some("bug")
+        );
+
+        // Exactly the `bug` branch ran; the `docs` branch skipped.
+        assert_eq!(step_status(&s, "fix"), Some(StepStatus::Passed));
+        assert_eq!(step_status(&s, "write"), Some(StepStatus::Skipped));
+        // The join depends on the (always-passing) selector + gates on the decision → it runs.
+        assert_eq!(step_status(&s, "done"), Some(StepStatus::Passed));
+    }
+
+    #[tokio::test]
+    async fn case_falls_through_to_else_when_no_guard_matches() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // classify prints "feature", which matches neither bug nor docs → else `other`.
+        let wf = parse(&CASE_WF.replace("echo bug", "echo feature"));
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let route = s.steps.iter().find(|x| x.id.as_str() == "route").unwrap();
+        assert_eq!(
+            route.outputs.get("selected").and_then(|v| v.as_str()),
+            Some("other")
+        );
+        // Neither branch ran (both gated on bug/docs).
+        assert_eq!(step_status(&s, "fix"), Some(StepStatus::Skipped));
+        assert_eq!(step_status(&s, "write"), Some(StepStatus::Skipped));
     }
 
     #[tokio::test]

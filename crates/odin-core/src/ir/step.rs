@@ -1,7 +1,8 @@
 //! Steps and the exactly-one-of-kind discriminated union.
 //!
 //! A step is one node in the workflow DAG. Its *kind* — provider invocation, built-in
-//! action, or shell `run:` hook — is an exactly-one-of choice. We deserialize a `Step`
+//! action, shell `run:` hook, human `approval:` gate, or `case:` branch selector — is an
+//! exactly-one-of choice. We deserialize a `Step`
 //! through a private, `deny_unknown_fields` raw struct and then resolve the kind by
 //! hand, so that:
 //!
@@ -84,11 +85,15 @@ pub enum StepKind {
     Run(RunStep),
     /// A human-in-the-loop gate: the run **pauses** here until a person approves or rejects it.
     Approval(ApprovalStep),
+    /// Conditional branching: select exactly one of N labeled branches by ordered guards. After
+    /// the load-time desugar pass this is a *selector* (branch bodies are lifted to top-level).
+    Case(CaseStep),
 }
 
 impl StepKind {
     /// Resolves the raw discriminant fields into a kind, rejecting none / more-than-one
     /// and any field that belongs to a different kind.
+    #[allow(clippy::too_many_arguments)]
     fn from_discriminants(
         provider: Option<ProviderRef>,
         prompt: Option<String>,
@@ -97,29 +102,41 @@ impl StepKind {
         with: Option<IndexMap<String, Value>>,
         run: Option<String>,
         approval: Option<ApprovalStep>,
+        case: Option<CaseStep>,
     ) -> Result<Self, String> {
         let count = [
             provider.is_some(),
             action.is_some(),
             run.is_some(),
             approval.is_some(),
+            case.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
         .count();
         if count == 0 {
             return Err(
-                "step must declare exactly one of `provider:`, `action:`, `run:`, or \
-                 `approval:` (found none)"
+                "step must declare exactly one of `provider:`, `action:`, `run:`, `approval:`, \
+                 or `case:` (found none)"
                     .to_owned(),
             );
         }
         if count > 1 {
             return Err(
-                "step declares more than one of `provider:`, `action:`, `run:`, `approval:` — \
-                 choose exactly one"
+                "step declares more than one of `provider:`, `action:`, `run:`, `approval:`, \
+                 `case:` — choose exactly one"
                     .to_owned(),
             );
+        }
+
+        if let Some(case) = case {
+            if prompt.is_some() || prompt_file.is_some() {
+                return Err("`prompt`/`prompt_file` are only valid on `provider:` steps".to_owned());
+            }
+            if with.is_some() {
+                return Err("`with:` is only valid on `action:` steps".to_owned());
+            }
+            return Ok(StepKind::Case(case));
         }
 
         if let Some(provider) = provider {
@@ -203,11 +220,43 @@ pub struct ApprovalStep {
     pub message: Option<String>,
 }
 
+/// A conditional-branching **selector**. Evaluates each branch's `when:` guard in order and
+/// records the **first** matching label (or `else`) as `outputs.selected`; it always passes
+/// (branching is a decision, not a failure). Branch *bodies* are ordinary downstream steps the
+/// author gates on the decision, e.g. `when: "steps.<id>.outputs.selected == 'bug'"`, and a join
+/// `depends_on: [<id>]` (the selector always passes) so the merge-back works.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CaseStep {
+    /// The labeled branches, tried in order; the first whose guard is true wins.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub branches: Vec<CaseBranch>,
+    /// Fallback label selected when no guard matched. If absent, `selected` is the empty string.
+    #[serde(default, rename = "else", skip_serializing_if = "Option::is_none")]
+    pub else_: Option<String>,
+}
+
+/// One labeled arm of a [`CaseStep`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct CaseBranch {
+    /// The branch label, recorded as `outputs.selected` when chosen. Unique within the case.
+    pub label: String,
+    /// Minijinja boolean guard. `None` matches unconditionally (an explicit catch-all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
+}
+
 impl Serialize for StepKind {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
         let mut m = s.serialize_map(None)?;
         match self {
+            StepKind::Case(c) => {
+                m.serialize_entry("case", c)?;
+            }
             StepKind::Provider(p) => {
                 m.serialize_entry("provider", &p.provider)?;
                 if let Some(x) = &p.prompt {
@@ -254,6 +303,8 @@ struct StepRaw {
     #[serde(default)]
     approval: Option<ApprovalStep>,
     #[serde(default)]
+    case: Option<CaseStep>,
+    #[serde(default)]
     artifacts: Artifacts,
     #[serde(default)]
     gates: IndexMap<GateName, String>,
@@ -283,6 +334,7 @@ impl<'de> Deserialize<'de> for Step {
             r.with,
             r.run,
             r.approval,
+            r.case,
         )
         .map_err(|msg| D::Error::custom(format!("step \"{}\": {msg}", r.id)))?;
         Ok(Step {
@@ -404,6 +456,40 @@ mod tests {
         let err = parse("id: x\nprompt: hi\n").unwrap_err().to_string();
         assert!(err.contains("exactly one"), "got: {err}");
         assert!(err.contains("found none"), "got: {err}");
+    }
+
+    #[test]
+    fn case_step_parses_with_branches_and_else() {
+        let s = parse(
+            "id: route\ncase:\n  branches:\n    - {label: bug, when: \"a == 1\"}\n    - {label: docs}\n  else: other\n",
+        )
+        .unwrap();
+        let StepKind::Case(c) = s.kind else {
+            panic!("expected a case step");
+        };
+        assert_eq!(c.branches.len(), 2);
+        assert_eq!(c.branches[0].label, "bug");
+        assert_eq!(c.branches[0].when.as_deref(), Some("a == 1"));
+        assert_eq!(c.branches[1].when, None); // a guard-less branch is a catch-all
+        assert_eq!(c.else_.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn case_with_another_kind_is_more_than_one_error() {
+        let err = parse("id: x\nprovider: claude\nprompt: hi\ncase: {branches: []}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn case_step_round_trips_through_yaml() {
+        let yaml =
+            "id: route\ncase:\n  branches:\n    - {label: bug, when: \"a == 1\"}\n  else: other\n";
+        let once = serde_yaml_ng::to_string(&parse(yaml).unwrap()).unwrap();
+        let twice = serde_yaml_ng::to_string(&parse(&once).unwrap()).unwrap();
+        assert_eq!(once, twice, "case serialization should be idempotent");
+        assert!(once.contains("case:") && once.contains("label: bug"));
     }
 
     #[test]

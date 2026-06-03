@@ -452,6 +452,63 @@ pub(crate) fn approval_durable(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     }
 }
 
+/// ODIN033/034/035 — a `case:` step must have ≥1 branch with a unique, non-empty label.
+pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
+    for (i, s) in wf.steps.iter().enumerate() {
+        let StepKind::Case(c) = &s.kind else {
+            continue;
+        };
+        if c.branches.is_empty() {
+            d.push(Diagnostic::new(
+                DiagCode::CaseNoBranches,
+                format!("{}.case.branches", step_ptr(i)),
+                format!(
+                    "case step {:?} declares no branches; give it at least one",
+                    s.id.as_str()
+                ),
+            ));
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (bi, b) in c.branches.iter().enumerate() {
+            let ptr = format!("{}.case.branches[{bi}].label", step_ptr(i));
+            if b.label.is_empty() {
+                d.push(Diagnostic::new(
+                    DiagCode::CaseEmptyBranchLabel,
+                    ptr,
+                    format!(
+                        "case step {:?} has a branch with an empty label",
+                        s.id.as_str()
+                    ),
+                ));
+            } else if !seen.insert(b.label.as_str()) {
+                d.push(Diagnostic::new(
+                    DiagCode::CaseDuplicateBranchLabel,
+                    ptr,
+                    format!(
+                        "case step {:?} has two branches labeled {:?}",
+                        s.id.as_str(),
+                        b.label
+                    ),
+                ));
+            }
+        }
+        // The `else` label must not collide with a branch label (an ambiguous `selected`).
+        if let Some(el) = &c.else_ {
+            if seen.contains(el.as_str()) {
+                d.push(Diagnostic::new(
+                    DiagCode::CaseDuplicateBranchLabel,
+                    format!("{}.case.else", step_ptr(i)),
+                    format!(
+                        "case step {:?}'s `else` label {:?} collides with a branch label",
+                        s.id.as_str(),
+                        el
+                    ),
+                ));
+            }
+        }
+    }
+}
+
 /// ODIN026 — warn when the workflow targets a newer schema minor than this engine.
 pub(crate) fn schema(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     if wf.schema_version.minor > crate::ir::CURRENT_SCHEMA_MINOR {
