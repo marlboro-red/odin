@@ -182,6 +182,11 @@ steps:
       {% if params.feedback %}A previous attempt was rejected — address: {{ params.feedback }}{% endif %}
 ```
 
+`feedback` must be a **string** param if declared (the note is injected as one; a mismatched type
+is refused before the gate is failed). It carries the approver's free text — prefer interpolating
+it into a **provider prompt** (as above) over a `run:`/shell command, where untrusted text would
+reach a shell unescaped.
+
 ### Gates
 
 ```yaml

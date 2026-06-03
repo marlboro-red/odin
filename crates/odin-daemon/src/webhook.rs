@@ -419,8 +419,9 @@ async fn handle_approve(
     // returns the resumed run's summary. Either way `Ok(None)` is an unknown run (404) and an
     // `Error::Input` is the caller's fault (409, vs 500 for a store/resume failure).
     if req.rerun {
-        // `note` is guaranteed non-empty here (a reject was required above).
-        let note = req.note.unwrap_or_default();
+        // `note` is guaranteed non-empty here (a reject was required above). Trim to match the
+        // CLI's `reject --rerun`, which trims the note before injecting it as feedback.
+        let note = req.note.unwrap_or_default().trim().to_owned();
         return match ctx
             .engine
             .reject_and_rerun(run_id, approver, note, &ctx.workflows)

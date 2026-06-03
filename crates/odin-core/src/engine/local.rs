@@ -1826,41 +1826,52 @@ impl Engine for LocalEngine {
         note: String,
         workflows: &[Workflow],
     ) -> Result<Option<RerunOutcome>> {
-        // 1. Reject the gate (fails the run, recording `note` as the gate's feedback).
-        let Some(rejected) = self
-            .submit_approval(
-                run_id,
-                Decision::Rejected,
-                approver,
-                Some(note.clone()),
-                workflows,
-            )
-            .await?
-        else {
+        let Some(store) = self.store.clone() else {
+            return Err(Error::Input(
+                "approvals require a durable store; none is configured".to_owned(),
+            ));
+        };
+        // 1. Load the run FIRST — to find its workflow and pre-check that the feedback we'll
+        //    inject is acceptable — BEFORE the destructive reject. If a misdeclared `feedback`
+        //    param would make the rerun fail param validation, we must not fail the gate first
+        //    (that would leave a dead run with no possible rerun). The input is also captured
+        //    here; the reject doesn't mutate it.
+        let Some(original) = store.load_run(run_id).await? else {
             return Ok(None); // unknown run
         };
-        // 2. Seed the rerun from the original run's input (unchanged by the reject). The store
-        //    must exist — `submit_approval` already required it to get this far.
-        let store = self
-            .store
-            .clone()
-            .ok_or_else(|| Error::Input("approvals require a durable store".to_owned()))?;
-        let Some(original) = store.load_run(run_id).await? else {
-            return Ok(None);
-        };
-        // `submit_approval` already validated the workflow is present, so this holds.
         let Some(workflow) = workflows.iter().find(|w| w.name == original.workflow) else {
             return Err(Error::Input(format!(
-                "run {run_id} targets workflow {:?}, which was not provided",
+                "run {run_id} targets workflow {:?}, which was not provided — pass its file via \
+                 --workflow",
                 original.workflow.as_str()
             )));
         };
+        let feedback = Value::String(note.clone());
+        if let Some((_, spec)) = workflow
+            .params
+            .iter()
+            .find(|(n, _)| n.as_str() == "feedback")
+        {
+            if !spec.ty.matches(&feedback) {
+                return Err(Error::Input(format!(
+                    "workflow {:?} declares a `feedback` param of type {}, but `--rerun` injects \
+                     the note as a string; declare `feedback` as a string",
+                    workflow.name.as_str(),
+                    spec.ty.name()
+                )));
+            }
+        }
+        // 2. Reject the gate (fails the run, recording `note` as the gate's feedback).
+        let Some(rejected) = self
+            .submit_approval(run_id, Decision::Rejected, approver, Some(note), workflows)
+            .await?
+        else {
+            return Ok(None);
+        };
         // 3. Start a fresh run carrying the original params/trigger plus the feedback. Clear the
         //    idempotency key (a rerun is a distinct run, not a retry of the original key).
-        let mut input = original.input.clone();
-        input
-            .params
-            .insert("feedback".to_owned(), Value::String(note));
+        let mut input = original.input;
+        input.params.insert("feedback".to_owned(), feedback);
         input.idempotency_key = None;
         tracing::info!(rejected = %run_id, "rerunning with feedback");
         let rerun = self.run(workflow, input).await?;
@@ -3507,6 +3518,39 @@ steps:
             Some("original"),
             "the rerun inherits the original run's params"
         );
+    }
+
+    #[tokio::test]
+    async fn reject_and_rerun_refuses_a_misdeclared_feedback_param_without_failing_the_run() {
+        // `reject --rerun` injects the note as a STRING. A workflow that declares `feedback` as a
+        // different type would make the rerun fail param validation — so we must refuse BEFORE the
+        // destructive reject, leaving the run still resumable.
+        const BAD_FEEDBACK_WF: &str = "name: badfb\ndurable: true\nworkspace: { type: worktree }\nparams:\n  feedback: { type: number }\nsteps:\n  - {id: plan, run: \"echo planned\"}\n  - id: gate\n    approval: {}\n    depends_on: [plan]\n";
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(BAD_FEEDBACK_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+
+        let err = eng
+            .reject_and_rerun(
+                s1.run_id,
+                "bob".to_owned(),
+                "redo".to_owned(),
+                std::slice::from_ref(&wf),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("feedback"),
+            "should explain the misdeclared feedback param, got: {err}"
+        );
+        // The reject must NOT have fired — the run is still awaiting and can be decided normally.
+        let still = eng.summary(s1.run_id).await.unwrap().unwrap();
+        assert_eq!(still.status, RunStatus::AwaitingApproval);
     }
 
     /// A provider that always replies with a fixed string (a stand-in judge/agent).

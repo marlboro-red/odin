@@ -24,6 +24,9 @@ pub(crate) struct ApprovalArgs {
 
 /// Approves the run's pending gate and resumes it.
 pub(crate) fn approve(args: ApprovalArgs) -> anyhow::Result<ExitCode> {
+    if args.rerun {
+        anyhow::bail!("--rerun only applies to `reject` (there is nothing to redo on approve)");
+    }
     submit(Decision::Approved, args)
 }
 
