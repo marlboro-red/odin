@@ -122,7 +122,7 @@ verification and dedup, and the fail-closed security model.
 
 ## Where next
 
-- [Workflow reference](workflow-reference.md) — every field and all 32 diagnostics.
+- [Workflow reference](workflow-reference.md) — every field and all 36 diagnostics.
 - [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references.
 - [Integration guide](integration-guide.md) — embed `odin-core`, plug in custom
   providers/actions/workspaces/triggers.

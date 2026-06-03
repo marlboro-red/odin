@@ -169,6 +169,19 @@ fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
                 );
             }
         }
+        StepKind::Case(c) => {
+            // Branch guards are bare boolean expressions, like `when:`, checked the same way.
+            for (bi, b) in c.branches.iter().enumerate() {
+                if let Some(w) = &b.when {
+                    push(
+                        w.clone(),
+                        format!("{}.case.branches[{bi}].when", step_ptr(i)),
+                        true,
+                        false,
+                    );
+                }
+            }
+        }
     }
     for (name, cmd) in &s.gates {
         push(

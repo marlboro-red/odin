@@ -109,6 +109,17 @@ pub enum DiagCode {
     /// ODIN032 — a workflow with an `approval` step must be `durable: true`; a paused gate is
     /// unresumable without persistence.
     ApprovalRequiresDurable,
+    /// ODIN033 — a `case:` step declares no `branches` (it could only ever select the `else`
+    /// label, or nothing); give it at least one branch.
+    CaseNoBranches,
+    /// ODIN034 — two branches of one `case:` share a `label`, so `selected` is ambiguous.
+    CaseDuplicateBranchLabel,
+    /// ODIN035 — a `case:` branch has an empty `label`.
+    CaseEmptyBranchLabel,
+    /// ODIN036 — a `case:` selector carries `gates:`/`judge:`, which are inert (it produces no
+    /// stdout to judge) and, worse, a failing gate would flip the always-passing selector to
+    /// failed and break a merge-back that depends on it (warning).
+    CaseInertChecks,
 }
 
 impl DiagCode {
@@ -148,6 +159,10 @@ impl DiagCode {
             DiagCode::ParamDefaultType => "ODIN030",
             DiagCode::TriggerIntoShell => "ODIN031",
             DiagCode::ApprovalRequiresDurable => "ODIN032",
+            DiagCode::CaseNoBranches => "ODIN033",
+            DiagCode::CaseDuplicateBranchLabel => "ODIN034",
+            DiagCode::CaseEmptyBranchLabel => "ODIN035",
+            DiagCode::CaseInertChecks => "ODIN036",
         }
     }
 
@@ -164,7 +179,8 @@ impl DiagCode {
             | DiagCode::WebhookParamUndeclared
             | DiagCode::ScratchOnAction
             | DiagCode::DynamicTemplateRef
-            | DiagCode::TriggerIntoShell => Severity::Warning,
+            | DiagCode::TriggerIntoShell
+            | DiagCode::CaseInertChecks => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -348,13 +364,17 @@ mod tests {
             DiagCode::ParamDefaultType,
             DiagCode::TriggerIntoShell,
             DiagCode::ApprovalRequiresDurable,
+            DiagCode::CaseNoBranches,
+            DiagCode::CaseDuplicateBranchLabel,
+            DiagCode::CaseEmptyBranchLabel,
+            DiagCode::CaseInertChecks,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 32);
+        assert_eq!(seen.len(), 36);
     }
 
     #[test]

@@ -389,3 +389,50 @@ fn fan_in_dag_is_clean() {
         "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: ./b, depends_on: [a]}\n  - {id: c, run: ./c, depends_on: [a]}\n  - {id: d, action: github.open_pr, depends_on: [b, c]}\n",
     );
 }
+
+#[test]
+fn odin033_case_with_no_branches_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: r, case: {else: other}}\n",
+        DiagCode::CaseNoBranches,
+    );
+}
+
+#[test]
+fn odin034_case_duplicate_branch_label_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: r\n    case:\n      branches:\n        - {label: a, when: \"true\"}\n        - {label: a, when: \"false\"}\n",
+        DiagCode::CaseDuplicateBranchLabel,
+    );
+}
+
+#[test]
+fn odin034_else_label_colliding_with_a_branch_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: r\n    case:\n      branches:\n        - {label: a, when: \"true\"}\n      else: a\n",
+        DiagCode::CaseDuplicateBranchLabel,
+    );
+}
+
+#[test]
+fn odin035_case_empty_branch_label_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: r\n    case:\n      branches:\n        - {label: \"\", when: \"true\"}\n",
+        DiagCode::CaseEmptyBranchLabel,
+    );
+}
+
+#[test]
+fn a_valid_case_step_is_clean() {
+    assert_clean(
+        "name: x\nsteps:\n  - {id: c, run: \"echo bug\"}\n  - id: r\n    depends_on: [c]\n    case:\n      branches:\n        - {label: bug,  when: \"steps.c.outputs.stdout == 'bug'\"}\n        - {label: docs, when: \"steps.c.outputs.stdout == 'docs'\"}\n      else: other\n  - {id: fix, run: \"echo fix\", depends_on: [r], when: \"steps.r.outputs.selected == 'bug'\"}\n",
+    );
+}
+
+#[test]
+fn odin036_gates_or_judge_on_a_case_selector_warns() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: r\n    gates: {check: \"true\"}\n    case:\n      branches:\n        - {label: a, when: \"true\"}\n",
+        DiagCode::CaseInertChecks,
+    );
+}

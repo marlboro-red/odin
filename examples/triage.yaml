@@ -1,0 +1,78 @@
+# Conditional branching with `case:`. An agent classifies an issue, a `case:` selector records
+# which branch to take, and exactly one branch's steps run — then a merge-back step reports the
+# outcome.
+#
+#   odin validate examples/triage.yaml
+#
+# How branching works here:
+#   - `route` is a `case:` SELECTOR: it evaluates each branch's `when:` guard in order and records
+#     the first matching label (or `else`) as `steps.route.outputs.selected`. It always passes —
+#     branching is a decision, not a failure.
+#   - A branch ENTRY step gates on the decision (`when: steps.route.outputs.selected == 'bug'`).
+#     Further steps in that branch just `depends_on` the entry step — they skip automatically on
+#     the other branch (skip-propagation), so a multi-step body needs only the one guard.
+#   - A merge-back step `depends_on: [route]` (the selector ALWAYS passes), so it runs after the
+#     decision regardless of which branch was taken — unlike depending on the branch heads, where
+#     the not-taken branch's `Skipped` status would make the join skip itself.
+
+schema_version: "1.0"
+name: triage
+version: "1.0.0"
+description: Classify an issue, then take exactly one branch's actions.
+durable: true
+workspace:
+  type: worktree
+
+steps:
+  - id: classify
+    provider: claude
+    prompt: |
+      Reply with exactly one word — `bug`, `docs`, or `other` — classifying this issue:
+      {{ params.issue | default("The save button does nothing.") }}
+
+  # The selector. `steps.route.outputs.selected` is the chosen label.
+  - id: route
+    depends_on: [classify]
+    case:
+      branches:
+        - label: bug
+          when: "steps.classify.outputs.stdout | trim == 'bug'"
+        - label: docs
+          when: "steps.classify.outputs.stdout | trim == 'docs'"
+      else: other
+
+  # The `bug` branch: a two-step body (fix → commit). Only `fix_bug` carries the guard; `commit_fix`
+  # depends on it and so skips with it on any other branch.
+  - id: fix_bug
+    provider: claude
+    depends_on: [route]
+    when: "steps.route.outputs.selected == 'bug'"
+    prompt: "Reproduce and fix the bug, editing the working tree."
+  - id: commit_fix
+    action: git.commit
+    depends_on: [fix_bug]
+    with:
+      message: "Fix the reported bug"
+
+  # The `docs` branch.
+  - id: write_docs
+    provider: claude
+    depends_on: [route]
+    when: "steps.route.outputs.selected == 'docs'"
+    prompt: "Update the documentation for the request."
+  - id: commit_docs
+    action: git.commit
+    depends_on: [write_docs]
+    with:
+      message: "Update the docs"
+
+  # Merge-back: runs after the decision on every path (depends on the always-passing selector),
+  # reading `selected` to report what happened.
+  - id: summary
+    run: "echo 'triaged as {{ steps.route.outputs.selected }}'"
+    depends_on: [route]
+
+params:
+  issue:
+    type: string
+    description: The issue text to classify.

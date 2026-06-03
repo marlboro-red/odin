@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN032`).
+(`ODIN001`–`ODIN036`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -84,7 +84,7 @@ defaults:
 
 ## Steps
 
-A step is exactly one of four **kinds**, chosen by which key it carries:
+A step is exactly one of five **kinds**, chosen by which key it carries:
 
 | Kind | Key | Body runs |
 |------|-----|-----------|
@@ -92,9 +92,10 @@ A step is exactly one of four **kinds**, chosen by which key it carries:
 | **run** | `run:` | a shell command line in the step's working directory |
 | **action** | `action:` | a registered named side-effect (e.g. `github.open_pr`) |
 | **approval** | `approval:` | nothing — it **pauses** the run for a human to approve or reject ([below](#approval-step)) |
+| **case** | `case:` | nothing — a **selector** that records which branch to take ([below](#case-step)) |
 
 Declaring zero or more than one kind is a **parse error**, as is putting a provider-only key
-(`prompt`/`prompt_file`) on a `run`/`action`/`approval` step, or `with:` on a non-action step.
+(`prompt`/`prompt_file`) on a `run`/`action`/`approval`/`case` step, or `with:` on a non-action step.
 
 ### Common step fields (all kinds)
 
@@ -186,6 +187,56 @@ steps:
 is refused before the gate is failed). It carries the approver's free text — prefer interpolating
 it into a **provider prompt** (as above) over a `run:`/shell command, where untrusted text would
 reach a shell unescaped.
+
+### Case step
+
+A **conditional-branching selector**. It evaluates each branch's `when:` guard in order and records
+the **first** matching label (or `else`) as `steps.<id>.outputs.selected`. It **always passes** —
+branching is a decision, not a failure.
+
+```yaml
+- id: route
+  depends_on: [classify]
+  case:
+    branches:
+      - { label: bug,  when: "steps.classify.outputs.stdout | trim == 'bug'" }
+      - { label: docs, when: "steps.classify.outputs.stdout | trim == 'docs'" }
+    else: other                  # selected when no guard matches (optional; default is "")
+```
+
+You write the branch **bodies** as ordinary steps gated on the decision:
+
+```yaml
+# a branch entry gates on `selected`; further steps in the branch just depend on it (and so skip
+# with it on the other branch — skip-propagation), so a multi-step body needs only the one guard.
+- id: fix_bug
+  provider: claude
+  depends_on: [route]
+  when: "steps.route.outputs.selected == 'bug'"
+  prompt: "Fix the bug."
+- id: commit
+  action: git.commit
+  depends_on: [fix_bug]          # no guard needed
+  with: { message: "Fix the bug" }
+
+# a merge-back depends on the SELECTOR (which always passes), so it runs after the decision on
+# every path — unlike depending on the branch heads, where the not-taken branch's `Skipped`
+# status would make the join skip itself.
+- id: summary
+  run: "echo 'took {{ steps.route.outputs.selected }}'"
+  depends_on: [route]
+```
+
+A guard is a minijinja boolean checked like a [`when:`](#common-step-fields-all-kinds); a guard
+referencing an unknown root is flagged ([ODIN017](#odin017)). A `case:` step must declare at least
+one branch ([ODIN033](#odin033)) with unique ([ODIN034](#odin034)), non-empty ([ODIN035](#odin035))
+labels, and shouldn't carry `gates:`/`judge:` ([ODIN036](#odin036)). The branches are tried in
+order, so a guard-less branch (an explicit catch-all) shadows any branch after it. See
+[`examples/triage.yaml`](../examples/triage.yaml).
+
+> A merge-back depends on the selector, so it runs once the branch is **decided**, not once the
+> chosen branch's **work** finishes. To order a step after a branch's work, make it part of that
+> branch (depend on the branch's last step), as `commit` does above.
 
 ### Gates
 
@@ -392,7 +443,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN032`)
+## Diagnostics catalogue (`ODIN001`–`ODIN036`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -431,6 +482,10 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin030"></a>ODIN030 | error | A param's `default` value does not match its declared `type`. |
 | <a id="odin031"></a>ODIN031 | **warning** | An untrusted `trigger.*` value is interpolated into a shell command — a `run:` step, a gate, or `shell.exec`'s `command` — so a webhook payload reaches `sh -c` unescaped (injection risk). Map the fields you trust into typed `params`.¹ |
 | <a id="odin032"></a>ODIN032 | error | A workflow with an `approval` gate is not `durable` — a paused gate is persisted and resumed from the store, so it can't be approved without durability. |
+| <a id="odin033"></a>ODIN033 | error | A `case:` step declares no `branches` (it could only ever select `else`, or nothing); give it at least one branch. |
+| <a id="odin034"></a>ODIN034 | error | Two branches of one `case:` (or a branch and the `else`) share a `label`, so `selected` is ambiguous. |
+| <a id="odin035"></a>ODIN035 | error | A `case:` branch has an empty `label`. |
+| <a id="odin036"></a>ODIN036 | **warning** | A `case:` selector carries `gates:`/`judge:` — inert (it has no output to check), and a failing gate would flip the always-passing selector to failed and break a merge-back that depends on it. |
 
 ¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 
