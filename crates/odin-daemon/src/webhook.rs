@@ -32,9 +32,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context as _;
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
@@ -187,6 +187,7 @@ pub struct WebhookServer {
     subscriptions: Vec<Subscription>,
     approvals: Option<ApprovalCtx>,
     store: Option<Arc<dyn Store>>,
+    dashboard: bool,
 }
 
 /// What the `POST /approve` handler needs to record a decision and resume the run: a shared
@@ -210,6 +211,7 @@ impl WebhookServer {
             subscriptions: Vec::new(),
             approvals: None,
             store: None,
+            dashboard: false,
         }
     }
 
@@ -217,6 +219,16 @@ impl WebhookServer {
     /// text exposition). Without it, `/metrics` reports `503`.
     pub fn enable_metrics(&mut self, store: Arc<dyn Store>) {
         self.store = Some(store);
+    }
+
+    /// Enables the web dashboard (`GET /` + the read-only `GET /api/runs[/{id}]` it polls).
+    /// Reads are unauthenticated (like `/metrics`); the page's approve/reject buttons sign in
+    /// the browser and call the existing signed `/approve`. Requires [`enable_metrics`] for the
+    /// store. Off unless this is called.
+    ///
+    /// [`enable_metrics`]: Self::enable_metrics
+    pub fn enable_dashboard(&mut self) {
+        self.dashboard = true;
     }
 
     /// Enables the `POST /approve` endpoint, wiring it to `engine` and the daemon's `workflows`
@@ -290,6 +302,7 @@ impl WebhookServer {
                 subscriptions: self.subscriptions,
                 approvals: self.approvals,
                 store: self.store,
+                dashboard: self.dashboard,
                 dedup: Mutex::new(DeliveryDedup::new()),
             }),
         })
@@ -310,8 +323,9 @@ impl BoundWebhookServer {
         self.local_addr
     }
 
-    /// Serves `POST /webhook`, `POST /approve`, `GET /metrics`, and `GET /health` until
-    /// `shutdown` fires, draining in-flight requests on the way out.
+    /// Serves the routes (`POST /webhook`, `POST /approve`, `GET /metrics`, `GET /health`, and —
+    /// with `--dashboard` — `GET /` + `/api/runs[/{id}]`) until `shutdown` fires, draining
+    /// in-flight requests on the way out.
     ///
     /// # Errors
     /// Returns an error if the server task fails (not from individual bad requests, which
@@ -326,6 +340,9 @@ impl BoundWebhookServer {
             );
         }
         let app = Router::new()
+            .route("/", get(handle_dashboard))
+            .route("/api/runs", get(handle_api_runs))
+            .route("/api/runs/{id}", get(handle_api_run))
             .route("/webhook", post(handle_webhook))
             .route("/approve", post(handle_approve))
             .route("/metrics", get(handle_metrics))
@@ -346,8 +363,10 @@ struct AppState {
     subscriptions: Vec<Subscription>,
     /// Present when `POST /approve` is enabled (some workflow has an approval gate).
     approvals: Option<ApprovalCtx>,
-    /// The run-state store for `GET /metrics` (always set when the daemon serves).
+    /// The run-state store for `GET /metrics` + the dashboard API (set when the daemon serves).
     store: Option<Arc<dyn Store>>,
+    /// Whether the web dashboard (`GET /` + `/api/runs`) is enabled (`--dashboard`).
+    dashboard: bool,
     /// Recent delivery ids, to drop GitHub's retries of an already-handled delivery.
     dedup: Mutex<DeliveryDedup>,
 }
@@ -374,6 +393,71 @@ async fn handle_metrics(State(state): State<Arc<AppState>>) -> Response {
         Err(e) => {
             tracing::warn!(error = %e, "metrics: store read failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response()
+        }
+    }
+}
+
+/// `?limit=N` for `GET /api/runs` (how many recent runs to list).
+#[derive(serde::Deserialize)]
+struct RunsQuery {
+    limit: Option<usize>,
+}
+
+/// `GET /` — the web dashboard single-page app (only when `--dashboard` is set).
+#[allow(clippy::unused_async)] // axum route handlers must be async.
+async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Response {
+    if !state.dashboard {
+        return (
+            StatusCode::NOT_FOUND,
+            "dashboard not enabled (pass --dashboard)",
+        )
+            .into_response();
+    }
+    Html(crate::dashboard::HTML).into_response()
+}
+
+/// `GET /api/runs?limit=N` — the dashboard's run list (unauthenticated, read-only).
+async fn handle_api_runs(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<RunsQuery>,
+) -> Response {
+    if !state.dashboard {
+        return (StatusCode::NOT_FOUND, "dashboard not enabled").into_response();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "store unavailable").into_response();
+    };
+    // Cap the page so a giant store can't be dumped in one unauthenticated request.
+    let limit = q.limit.unwrap_or(50).min(500);
+    match store.recent(limit).await {
+        Ok(runs) => {
+            let rows: Vec<_> = runs.iter().map(crate::dashboard::project_row).collect();
+            Json(rows).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard: run list read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store read failed").into_response()
+        }
+    }
+}
+
+/// `GET /api/runs/{id}` — one run's detail incl. the captured diff (unauthenticated, read-only).
+async fn handle_api_run(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !state.dashboard {
+        return (StatusCode::NOT_FOUND, "dashboard not enabled").into_response();
+    }
+    let Some(store) = state.store.as_ref() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "store unavailable").into_response();
+    };
+    let Ok(run_id) = RunId::from_str(&id) else {
+        return (StatusCode::BAD_REQUEST, "invalid run id").into_response();
+    };
+    match store.load_run(run_id).await {
+        Ok(Some(state)) => Json(crate::dashboard::project_detail(&state)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "no such run").into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "dashboard: run detail read failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "store read failed").into_response()
         }
     }
 }

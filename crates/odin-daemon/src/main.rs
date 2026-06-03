@@ -57,6 +57,10 @@ struct Cli {
     /// only). Without this, a declared webhook trigger and no secret is a startup error.
     #[arg(long)]
     webhook_allow_unsigned: bool,
+    /// Serve the web status dashboard at `http://<webhook-addr>/` (and its read-only
+    /// `/api/runs`). Approve/reject from the page sign in your browser with the webhook secret.
+    #[arg(long)]
+    dashboard: bool,
     /// Log output format.
     #[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
     log_format: String,
@@ -153,6 +157,9 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     // The read-only `/metrics` + `/health` endpoints are always served (Prometheus scrapes them),
     // so the HTTP server runs even for a webhook-less, approval-less daemon.
     webhook_server.enable_metrics(store.clone());
+    if cli.dashboard {
+        webhook_server.enable_dashboard();
+    }
 
     // Fail closed: a network-facing endpoint that MUTATES run state (`/webhook`, `/approve`)
     // without a verification secret would accept requests from anyone. Only an explicit opt-in

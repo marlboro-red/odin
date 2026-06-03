@@ -22,6 +22,7 @@ odind --workflows ./workflows --repo . \
 | `--webhook-addr <ADDR>` | `127.0.0.1:9292` | Address the HTTP server binds to. Always started (serves `/metrics` + `/health`); also `/webhook` and/or `/approve` when configured. |
 | `--webhook-secret <SECRET>` | `$ODIN_WEBHOOK_SECRET` | HMAC secret for verifying webhook signatures. |
 | `--webhook-allow-unsigned` | off | Explicitly run the webhook server **without** signature verification (local testing only). |
+| `--dashboard` | off | Serve the [web status dashboard](#dashboard) at `http://<webhook-addr>/` (and its read-only `/api/runs`). |
 | `--log-format <text\|json>` | `text` | Diagnostic-log format (level via `$ODIN_LOG`/`$RUST_LOG`, default `info`). See [observability](observability.md). |
 | `--otlp-endpoint <URL>` | — | Export spans to an OpenTelemetry OTLP collector. Honored only when built with `--features otlp`; otherwise ignored with a warning. |
 
@@ -215,6 +216,32 @@ Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the s
 proxy / network boundary as the rest of the server (it should not face the public internet).
 For span-level tracing and OTLP export, see [observability](observability.md); `/metrics` is the
 pull-based counterpart for dashboards/alerting.
+
+---
+
+## Dashboard
+
+With **`--dashboard`**, the server also hosts a small built-in web UI at `http://<webhook-addr>/`
+— a single self-contained page (no build step, no external assets, no third-party JS). It
+**live-polls** a read-only JSON API and shows each run's status, steps, and captured diff; runs
+**awaiting approval** get inline **Approve / Reject** controls (with a note field and a `rerun`
+toggle).
+
+The split mirrors the rest of the server: **reads are unauthenticated** (like `/metrics`),
+**writes are signed**.
+
+- `GET /api/runs?limit=N` and `GET /api/runs/{id}` — the read API the page polls (projections of
+  the run store; no internal paths leaked). Served only with `--dashboard`.
+- **Approve / Reject** don't add a server route: the page asks for the webhook secret once (kept
+  in the browser's `localStorage`, never sent), HMAC-signs the request **in the browser** (Web
+  Crypto), and calls the existing signed [`POST /approve`](#approving-a-paused-run-over-http). So
+  the secret never leaves your browser except as a signature, and the dashboard needs no new
+  trust.
+
+Because the signing uses the Web Crypto API, the approve/reject buttons work on `http://localhost`
+(treated as a secure context) or behind **HTTPS**; over plain HTTP to a non-loopback address the
+browser disables `crypto.subtle`, so terminate TLS at a reverse proxy (which you want anyway —
+see [Security](#security)). The read-only views work regardless.
 
 ---
 
