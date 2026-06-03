@@ -242,6 +242,60 @@ async fn reject_without_a_note_is_rejected_and_the_run_stays_paused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_reject_with_rerun_fails_the_original_and_starts_a_fresh_run() {
+    let h = Harness::start(Some(SECRET)).await;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "run_id": h.run_id.to_string(),
+        "decision": "rejected",
+        "approver": "bob",
+        "note": "redo it",
+        "rerun": true,
+    }))
+    .unwrap();
+
+    let status = post_approve(h.addr, &body, Some(&sign(SECRET, &body))).await;
+    assert!(status.contains("200"), "expected 200 OK, got: {status}");
+
+    // The original is failed; a fresh run was started and paused at its gate, carrying feedback.
+    assert_eq!(h.status().await, RunStatus::Failed);
+    let runs = h.store.recent(10).await.unwrap();
+    assert_eq!(
+        runs.len(),
+        2,
+        "reject --rerun leaves the failed original + a fresh run"
+    );
+    let rerun = runs
+        .iter()
+        .find(|r| r.status == RunStatus::AwaitingApproval)
+        .expect("the rerun paused at its gate");
+    assert_eq!(
+        rerun.input.params.get("feedback").and_then(|v| v.as_str()),
+        Some("redo it"),
+        "the rerun carries the note as its feedback param"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rerun_with_an_approve_decision_is_400() {
+    let h = Harness::start(Some(SECRET)).await;
+    let body = serde_json::to_vec(&serde_json::json!({
+        "run_id": h.run_id.to_string(),
+        "decision": "approved",
+        "rerun": true,
+    }))
+    .unwrap();
+
+    let status = post_approve(h.addr, &body, Some(&sign(SECRET, &body))).await;
+    assert!(
+        status.contains("400"),
+        "rerun only applies to a reject, got: {status}"
+    );
+    assert_eq!(h.status().await, RunStatus::AwaitingApproval);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approving_an_unknown_run_is_404() {
     let h = Harness::start(Some(SECRET)).await;
     let body = approve_body(RunId::new());

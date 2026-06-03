@@ -94,7 +94,8 @@ pub mod traits;
 pub mod workspace;
 
 pub use api::{
-    ApprovalDecision, Decision, RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus,
+    ApprovalDecision, Decision, RerunOutcome, RunInput, RunStatus, RunSummary, SideEffect,
+    StepResult, StepStatus,
 };
 pub use error::{
     ActionError, Error, ProviderError, Result, StoreError, TriggerError, WorkspaceError,

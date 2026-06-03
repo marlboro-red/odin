@@ -151,18 +151,22 @@ refuses to start if a gate is present but no secret is configured (unless
   "run_id": "…",           // the paused run's id (UUID)
   "decision": "approved",  // or "rejected"
   "approver": "alice",     // optional (default "http"); recorded for the audit trail
-  "note": "lgtm"           // required on a reject (the feedback)
+  "note": "lgtm",          // required on a reject (the feedback)
+  "rerun": false           // reject only: also start a fresh run carrying the note as feedback
 }
 ```
 
 Unlike `/webhook` (which only enqueues), `/approve` records the decision and **resumes the run
 inline**, then answers with the resulting [`RunSummary`](cli.md#json-shapes) as JSON — so the
 caller sees whether the run completed, **failed** (a reject), or paused again at a later gate.
-Responses: `200` applied; `400` malformed body / bad run id / a reject with no note; `401`/`400`
-bad/missing signature; `404` unknown run; `409` the run isn't awaiting approval (e.g. already
-decided) or its workflow isn't loaded by this daemon; `503` no workflow has an approval gate.
-A resumed run is **not** counted against `--max-concurrent-runs` — an approval is a rare operator
-action, not trigger-driven load.
+With `"rerun": true` on a reject it instead returns a `RerunOutcome` — `{rejected, rerun}`, the
+failed original plus the fresh run started with `params.feedback` (the daemon-side
+[`reject --rerun`](cli.md#approving-a-paused-run)). Responses: `200` applied; `400` malformed
+body / bad run id / a reject with no note / `rerun` on an approve; `401`/`400` bad/missing
+signature; `404` unknown run; `409` the run isn't awaiting approval (e.g. already decided) or its
+workflow isn't loaded by this daemon; `503` no workflow has an approval gate. A resumed run is
+**not** counted against `--max-concurrent-runs` — an approval is a rare operator action, not
+trigger-driven load.
 
 ```sh
 curl -sS http://127.0.0.1:9292/approve \

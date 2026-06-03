@@ -120,6 +120,10 @@ struct ApprovalCmd {
     /// A note: the feedback to act on. **Required** when rejecting.
     #[arg(long)]
     note: Option<String>,
+    /// (reject only) After failing the gate, start a fresh run of the workflow carrying the
+    /// `--note` as the `feedback` param, so the agent can address it and try again.
+    #[arg(long)]
+    rerun: bool,
     /// The git repository whose `.odin/state.db` to use. Defaults to the current dir.
     #[arg(long)]
     repo: Option<PathBuf>,
@@ -135,6 +139,7 @@ impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
             workflow: c.workflow,
             by: c.by,
             note: c.note,
+            rerun: c.rerun,
             repo: c.repo,
             db: c.db,
         }
