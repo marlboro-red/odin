@@ -1358,7 +1358,7 @@ impl LocalEngine {
                 .map(|(id, st)| step_result(id, st))
                 .collect(),
             usage: total_usage(&state.steps),
-            side_effects: Vec::new(),
+            side_effects: collect_side_effects(&state.steps),
             diff: state
                 .artifacts
                 .get(&crate::ids::ArtifactName::new(DIFF))
@@ -1429,7 +1429,9 @@ impl Engine for LocalEngine {
             Err(e) => (
                 ExecResult {
                     steps: Vec::new(),
-                    side_effects: Vec::new(),
+                    // Reconstruct from persisted state so an execute error after some
+                    // side-effecting steps completed doesn't drop them from the summary.
+                    side_effects: collect_side_effects(&state.steps),
                     usage: Usage::default(),
                     diff: None,
                 },
@@ -1558,7 +1560,7 @@ impl Engine for LocalEngine {
             status: state.status,
             steps,
             usage,
-            side_effects: Vec::new(),
+            side_effects: collect_side_effects(&state.steps),
             diff,
             error: state.error,
             started_at: state.created_at,
@@ -1599,6 +1601,16 @@ fn total_usage(steps: &IndexMap<StepId, StepState>) -> Usage {
         }
     }
     usage
+}
+
+/// All side effects recorded across a run's steps, in step (execution) order. Used to
+/// reconstruct a `RunSummary` from persisted state on every read path (resume, post-hoc
+/// `summary(run_id)`, and the failure paths) so none silently drops a PR/commit/push.
+fn collect_side_effects(steps: &IndexMap<StepId, StepState>) -> Vec<SideEffect> {
+    steps
+        .values()
+        .flat_map(|st| st.side_effects.iter().cloned())
+        .collect()
 }
 
 fn step_result(id: &StepId, state: &StepState) -> StepResult {
@@ -2772,6 +2784,37 @@ steps:
                 .any(|s| matches!(s, SideEffect::Commit { .. })),
             "expected a Commit side-effect, got {:?}",
             summary.side_effects
+        );
+    }
+
+    #[tokio::test]
+    async fn reloaded_summary_reconstructs_side_effects_from_persisted_state() {
+        // A consumer reading a finished run by id via `summary(run_id)` must see its side
+        // effects, reconstructed from persisted StepState — not just the live `run()` return.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: act\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: edit, run: \"echo more >> README.md\"}\n  - id: save\n    action: git.commit\n    with: { message: \"automated change\" }\n    depends_on: [edit]\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summary.error
+        );
+
+        let reloaded = eng.summary(summary.run_id).await.unwrap().unwrap();
+        assert!(
+            reloaded
+                .side_effects
+                .iter()
+                .any(|s| matches!(s, SideEffect::Commit { .. })),
+            "reloaded summary must reconstruct the Commit side-effect: {:?}",
+            reloaded.side_effects
         );
     }
 
