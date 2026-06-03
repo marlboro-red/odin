@@ -22,9 +22,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
-use odin_core::ir::{StepKind, TriggerDecl};
+use odin_core::ir::{HumanDuration, StepKind, TriggerDecl};
 use odin_core::telemetry::{self, Options};
-use odin_core::{EngineBuilder, SqliteStore, Store, Workflow};
+use odin_core::{EngineBuilder, PrunePolicy, SqliteStore, Store, Workflow};
 use odin_daemon::{Daemon, WebhookServer};
 
 /// Run Odin workflows from event triggers (cron schedules + GitHub webhooks).
@@ -61,6 +61,17 @@ struct Cli {
     /// `/api/runs`). Approve/reject from the page sign in your browser with the webhook secret.
     #[arg(long)]
     dashboard: bool,
+    /// Run a periodic retention sweep every DURATION (e.g. `24h`), deleting old/excess terminal
+    /// runs. Off unless set; requires `--prune-older-than` and/or `--prune-keep-last`.
+    #[arg(long, value_name = "DURATION")]
+    prune_interval: Option<String>,
+    /// Retention age for `--prune-interval`: prune terminal runs last updated longer ago than
+    /// this (e.g. `90d`).
+    #[arg(long, value_name = "DURATION")]
+    prune_older_than: Option<String>,
+    /// Retention count for `--prune-interval`: keep at most this many terminal runs per workflow.
+    #[arg(long, value_name = "N")]
+    prune_keep_last: Option<u32>,
     /// Log output format.
     #[arg(long, value_name = "FORMAT", default_value = "text", value_parser = ["text", "json"])]
     log_format: String,
@@ -89,6 +100,7 @@ fn real_main() -> anyhow::Result<()> {
     runtime.block_on(serve(cli))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn serve(cli: Cli) -> anyhow::Result<()> {
     // Install telemetry first so everything below is captured; hold the guard for the whole
     // process (dropping it flushes the OTLP exporter).
@@ -176,6 +188,16 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     if let Some(n) = cli.max_concurrent_runs {
         daemon = daemon.with_max_concurrent_runs(n);
     }
+    if let Some(policy) = prune_policy(
+        cli.prune_interval.as_deref(),
+        cli.prune_older_than.as_deref(),
+        cli.prune_keep_last,
+    )? {
+        let period = HumanDuration::parse(cli.prune_interval.as_deref().unwrap_or_default())
+            .map_err(|e| anyhow::anyhow!("--prune-interval: {e}"))?
+            .as_duration();
+        daemon = daemon.with_prune(policy, period);
+    }
     for trigger in webhook_triggers {
         daemon.add_trigger(Box::new(trigger));
     }
@@ -217,6 +239,40 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     result
 }
 
+/// Builds the daemon's retention policy from the `--prune-*` flags, or `None` if `interval` is
+/// unset (pruning disabled). Errors if an interval is set with no age or count limit — that would
+/// be a no-op sweep loop, almost certainly a misconfiguration.
+fn prune_policy(
+    interval: Option<&str>,
+    older_than: Option<&str>,
+    keep_last: Option<u32>,
+) -> anyhow::Result<Option<PrunePolicy>> {
+    if interval.is_none() {
+        return Ok(None);
+    }
+    let max_age = match older_than {
+        Some(s) => {
+            let std = HumanDuration::parse(s)
+                .map_err(|e| anyhow::anyhow!("--prune-older-than: {e}"))?
+                .as_duration();
+            Some(
+                chrono::Duration::from_std(std)
+                    .map_err(|_| anyhow::anyhow!("--prune-older-than is too large"))?,
+            )
+        }
+        None => None,
+    };
+    let policy = PrunePolicy {
+        max_age,
+        keep_last,
+        workflow: None,
+    };
+    if policy.is_noop() {
+        anyhow::bail!("--prune-interval requires --prune-older-than and/or --prune-keep-last");
+    }
+    Ok(Some(policy))
+}
+
 /// Loads every `*.yaml` / `*.yml` workflow in `dir` (sorted for determinism). A single
 /// unreadable directory entry, unreadable file, or unparseable file is skipped with a
 /// warning rather than aborting startup — one bad file must not take the whole daemon down.
@@ -256,4 +312,35 @@ fn load_workflows(dir: &Path) -> anyhow::Result<Vec<Workflow>> {
         }
     }
     Ok(workflows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prune_policy;
+
+    #[test]
+    fn prune_policy_is_disabled_without_an_interval() {
+        // Limits given but no interval ⇒ pruning off.
+        assert!(prune_policy(None, Some("90d"), Some(10)).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_policy_refuses_an_interval_with_no_limit() {
+        // An interval with no age/count limit would be a no-op sweep loop.
+        assert!(prune_policy(Some("24h"), None, None).is_err());
+    }
+
+    #[test]
+    fn prune_policy_builds_from_age_and_count() {
+        let p = prune_policy(Some("24h"), Some("90d"), Some(200))
+            .unwrap()
+            .unwrap();
+        assert!(p.max_age.is_some());
+        assert_eq!(p.keep_last, Some(200));
+    }
+
+    #[test]
+    fn prune_policy_rejects_a_bad_age() {
+        assert!(prune_policy(Some("24h"), Some("not-a-duration"), None).is_err());
+    }
 }

@@ -6,11 +6,17 @@ use std::sync::Arc;
 use anyhow::Result;
 use odin_core::ir::TriggerDecl;
 use odin_core::traits::TriggerEvent;
-use odin_core::{Engine, Trigger, Workflow, WorkflowId};
+use odin_core::{Engine, PrunePolicy, Trigger, Workflow, WorkflowId};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::trigger::CronTrigger;
+
+/// A scheduled retention sweep: apply `policy` every `period`.
+struct PruneSchedule {
+    policy: PrunePolicy,
+    period: std::time::Duration,
+}
 
 /// Default ceiling on runs executing at once across the whole daemon (a webhook burst or a
 /// fast-firing cron won't spawn unbounded concurrent runs).
@@ -38,6 +44,7 @@ pub struct Daemon {
     triggers: Vec<Box<dyn Trigger>>,
     shutdown: CancellationToken,
     max_concurrent_runs: usize,
+    prune: Option<PruneSchedule>,
 }
 
 impl Daemon {
@@ -63,7 +70,17 @@ impl Daemon {
             triggers: Vec::new(),
             shutdown: CancellationToken::new(),
             max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
+            prune: None,
         }
+    }
+
+    /// Enables a periodic retention sweep: every `period`, apply `policy` (deleting matching
+    /// terminal runs). The FIRST sweep is one `period` after start, never at startup — startup
+    /// is the crash-resume path, which deletion must not race. Off unless this is called.
+    #[must_use]
+    pub fn with_prune(mut self, policy: PrunePolicy, period: std::time::Duration) -> Self {
+        self.prune = Some(PruneSchedule { policy, period });
+        self
     }
 
     /// Sets the ceiling on runs executing concurrently across the daemon (default 4). A burst
@@ -164,19 +181,29 @@ impl Daemon {
             Err(e) => tracing::error!(error = %e, "resume_all failed"),
         }
 
-        if self.triggers.is_empty() {
+        if self.triggers.is_empty() && self.prune.is_none() {
             tracing::warn!("no triggers registered; nothing to serve");
             return Ok(());
         }
         tracing::info!(
             triggers = self.triggers.len(),
             max_concurrent_runs = self.max_concurrent_runs,
+            prune = self.prune.is_some(),
             "serving"
         );
 
         // Bounds concurrent runs across ALL triggers; a burst queues for a free slot.
         let permits = Arc::new(Semaphore::new(self.max_concurrent_runs));
         let mut set = tokio::task::JoinSet::new();
+
+        // The optional periodic retention sweep, alongside the trigger tasks (so it runs even
+        // for a webhook/approval-only daemon with no cron triggers).
+        if let Some(sched) = self.prune {
+            let engine = Arc::clone(&self.engine);
+            let shutdown = self.shutdown.clone();
+            set.spawn(async move { prune_loop(&engine, &sched, &shutdown).await });
+        }
+
         for mut trigger in self.triggers {
             let engine = Arc::clone(&self.engine);
             let workflows = Arc::clone(&self.workflows);
@@ -235,6 +262,34 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+}
+
+/// The periodic retention sweep. The first tick is one `period` after start (via `interval_at`),
+/// so a prune never races the startup crash-resume; thereafter it applies the policy each period
+/// until shutdown. A prune failure is logged, not fatal — the daemon stays up.
+async fn prune_loop(engine: &Arc<dyn Engine>, sched: &PruneSchedule, shutdown: &CancellationToken) {
+    // Delay the first tick by one period (checked, so an absurd interval degrades to a warning
+    // rather than a panic on `Instant + Duration`).
+    let Some(start) = tokio::time::Instant::now().checked_add(sched.period) else {
+        tracing::warn!("prune interval is too large to schedule; scheduled pruning disabled");
+        return;
+    };
+    let mut tick = tokio::time::interval_at(start, sched.period);
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => break,
+            _ = tick.tick() => match engine.prune(&sched.policy, false).await {
+                Ok(report) if report.runs_pruned > 0 => tracing::info!(
+                    runs_pruned = report.runs_pruned,
+                    events_pruned = report.events_pruned,
+                    "scheduled prune"
+                ),
+                Ok(_) => tracing::debug!("scheduled prune: nothing eligible"),
+                Err(e) => tracing::warn!(error = %e, "scheduled prune failed"),
+            },
+        }
     }
 }
 
