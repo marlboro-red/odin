@@ -246,8 +246,18 @@ workdir is restored to the last snapshot before re-running, so a step interrupte
 re-applies from a clean tree instead of double-applying its file changes. This covers the
 uncommitted working-tree phase only: once a step `git commit`s, git's own commits are the
 durable record and snapshotting disengages (rewinding past a commit would corrupt the run
-branch). Side effects *outside* the workspace — a pushed branch, an opened PR — are external
-and not covered; design idempotent or `when:`-guarded steps for those.
+branch).
+
+Side effects *outside* the workspace — a pushed branch, an opened PR — are persisted per step
+(`StepState.side_effects`) and reconstructed into the resumed run's summary, so a crash never
+silently drops them. The built-in side-effecting actions are also **idempotent across the
+action's non-atomic boundary**: `github.open_pr` queries for an existing open PR on the head
+branch and reattaches to it rather than re-creating (so a resume that already opened the PR
+doesn't fail or duplicate), and `git.push` of already-pushed commits is a no-op. The residual
+caveat is narrow: a *custom* action that creates an external resource non-idempotently, and a
+step that re-runs *after it committed* (the disengaged phase). Design those idempotent or
+`when:`-guarded. (Run-level dedup — `RunInput.idempotency_key`, "don't start a second run for
+the same key" — is a separate, still-reserved concern.)
 
 ## Security & trust boundaries
 
@@ -323,8 +333,9 @@ drain). The whole workspace is clippy-pedantic clean with `-D warnings` and `uns
 
 **Open refinements:** dollar-cost reporting for codex/copilot (token usage is already parsed;
 neither CLI reports a dollar figure); provider routing/fallback (`retry.on_fallback_provider`
-parses today but is inert); and engine-level idempotency keys (`RunInput.idempotency_key` is
-declared but not yet acted on).
+parses today but is inert); and **run-level** idempotency (`RunInput.idempotency_key` — "don't
+start a second run for the same key" — is declared but not yet acted on; note this is distinct
+from *side-effect* idempotency on resume, which the built-in actions now handle, above).
 
 [`RunInput`]: https://docs.rs/odin-core/latest/odin_core/api/struct.RunInput.html
 [`RunSummary`]: https://docs.rs/odin-core/latest/odin_core/api/struct.RunSummary.html

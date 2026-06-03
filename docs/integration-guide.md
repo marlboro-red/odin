@@ -120,7 +120,7 @@ let input = RunInput::manual().with_trigger("github_webhook", serde_json::json!(
 | `trigger` | which trigger this run corresponds to (default `"manual"`). |
 | `params` | typed inputs, validated/coerced against the workflow's param schema. |
 | `trigger_payload` | free-form event body, surfaced as `trigger.*` in templates. |
-| `idempotency_key` | reserved (declared; not yet acted on by the engine). |
+| `idempotency_key` | reserved for **run-level** dedup ("don't start a second run for this key"); not yet acted on. (Distinct from *side-effect* idempotency on resume, which the built-in actions already handle.) |
 
 **`RunSummary`** is the result — pure data, no engine internals or trait objects, safe to
 serialize over any transport:
@@ -263,7 +263,8 @@ pub trait Action: Send + Sync {
 returns an `ActionOutcome`. Build it with `ActionOutcome::success().with_output(k, v)` /
 `.with_side_effect(e)`; a `SideEffect` (constructed via `SideEffect::pull_request`/`comment`/
 `commit`/`push`/`artifact`) records an outward effect in the run summary. Built-ins:
-`shell.exec`, `git.commit`, `git.push`, `github.open_pr`.
+`shell.exec`, `git.commit`, `git.push`, `github.open_pr` (the last is idempotent — it
+reattaches to an existing open PR on the head branch instead of duplicating).
 
 ### `Trigger` — a source of run-starting events
 
@@ -398,7 +399,12 @@ Recovery is per-run (one run's failure doesn't abort the others). A run whose wo
 is gone is failed cleanly; a run targeting a workflow you no longer pass is skipped. For
 durable runs the engine also snapshots the workspace off-branch and restores it on resume so
 an interrupted step re-applies from a clean tree — see the
-[architecture notes](architecture.md).
+[architecture notes](architecture.md). Each step's **side effects** are persisted
+(`StepState.side_effects`) and reconstructed into the resumed summary, so a crash never drops a
+PR/commit/push from the record; and the built-in side-effecting actions are idempotent across
+their non-atomic boundary (`github.open_pr` reattaches to an existing open PR rather than
+duplicating; `git.push` of pushed commits is a no-op). A **custom** `Action` that creates an
+external resource should do the same (query-before-create) to be resume-safe.
 
 ---
 

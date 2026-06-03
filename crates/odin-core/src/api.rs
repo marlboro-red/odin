@@ -32,9 +32,11 @@ pub struct RunInput {
     /// Param values, by name. Validated & coerced against the workflow's param schema.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub params: IndexMap<String, Value>,
-    /// Reserved: an optional caller-supplied idempotency key. Declared for
-    /// forward-compatibility but **not yet acted on** by the engine — every run currently gets
-    /// a fresh id, regardless of this value.
+    /// Reserved: an optional caller-supplied **run-level** idempotency key — intended to make
+    /// "don't start a second run for this key" enforceable. Declared for forward-compatibility
+    /// but **not yet acted on** by the engine (every run currently gets a fresh id, regardless).
+    /// This is distinct from *side-effect* idempotency on resume — the built-in actions already
+    /// reattach to existing external resources rather than duplicating them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
 }

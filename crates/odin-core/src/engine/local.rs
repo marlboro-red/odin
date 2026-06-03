@@ -265,6 +265,7 @@ impl LocalEngine {
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                side_effects: Vec::new(),
                 error: None,
             },
         );
@@ -990,6 +991,10 @@ impl LocalEngine {
             if matches!(st.status, StepStatus::Passed | StepStatus::Skipped) {
                 settled.insert(id.clone());
                 results.insert(id.clone(), step_result(id, st));
+                // Carry forward side effects already recorded by finished steps; they won't
+                // re-run, so without this a resumed run's summary would drop every PR/commit/
+                // push from before the crash.
+                side_effects.extend(st.side_effects.iter().cloned());
             }
         }
         let mut started: HashSet<StepId> = settled.clone();
@@ -1072,6 +1077,9 @@ impl LocalEngine {
                 usage: outcome.usage,
                 gates: outcome.gates.clone(),
                 judge_score: outcome.judge_score,
+                // Persist this step's side effects so a later resume can reconstruct the run's
+                // full set without re-running the step (see the resume seed below).
+                side_effects: outcome.side_effects.clone(),
                 error: outcome.error.clone(),
             };
             state.steps.insert(id.clone(), step_state.clone());
@@ -2079,6 +2087,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                side_effects: Vec::new(),
                 error: None,
             },
         );
@@ -2168,6 +2177,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                side_effects: Vec::new(),
                 error: None,
             },
         );
@@ -2220,6 +2230,77 @@ steps:
     }
 
     #[tokio::test]
+    async fn resume_reconstructs_persisted_side_effects_in_the_summary() {
+        // A side effect recorded by a step that FINISHED before the crash must still appear in
+        // the resumed run's summary — that step isn't re-run, so the effect comes from the
+        // persisted StepState.side_effects, not from re-execution.
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: se\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: first, provider: echo, prompt: hi}\n  - {id: rest, run: \"true\", depends_on: [first]}\n",
+        );
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: wf.workspace.clone(),
+            })
+            .await
+            .unwrap();
+        let mut steps = IndexMap::new();
+        steps.insert(
+            StepId::new("first"),
+            StepState {
+                status: StepStatus::Passed,
+                attempts: 1,
+                exit_code: Some(0),
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: vec![SideEffect::commit("abc123", Some("main".to_owned()))],
+                error: None,
+            },
+        );
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: Some(handle),
+            base_commit: None,
+            snapshot: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summaries[0].error
+        );
+        assert!(
+            summaries[0]
+                .side_effects
+                .iter()
+                .any(|s| matches!(s, SideEffect::Commit { .. })),
+            "the pre-crash side effect must be reconstructed from persisted state: {:?}",
+            summaries[0].side_effects
+        );
+    }
+
+    #[tokio::test]
     async fn resume_restores_workdir_so_an_appending_step_is_not_double_applied() {
         let repo = init_repo().await;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -2265,6 +2346,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                side_effects: Vec::new(),
                 error: None,
             },
         );
@@ -2347,6 +2429,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                side_effects: Vec::new(),
                 error: None,
             },
         );
@@ -2461,6 +2544,7 @@ steps:
                 usage: None,
                 gates: IndexMap::new(),
                 judge_score: None,
+                side_effects: Vec::new(),
                 error: None,
             },
         );
@@ -2529,6 +2613,7 @@ steps:
                     usage: None,
                     gates: IndexMap::new(),
                     judge_score: None,
+                    side_effects: Vec::new(),
                     error: None,
                 },
             );
