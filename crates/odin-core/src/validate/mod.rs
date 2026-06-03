@@ -82,6 +82,7 @@ pub fn validate(wf: &Workflow, known: &KnownNames<'_>) -> ValidationReport {
     rules::triggers(wf, &mut d);
     rules::params(wf, &mut d);
     rules::retry_fallback(wf, &mut d);
+    rules::approval_durable(wf, &mut d);
     rules::schema(wf, &mut d);
 
     #[cfg(feature = "templating")]

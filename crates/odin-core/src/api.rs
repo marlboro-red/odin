@@ -136,6 +136,10 @@ pub enum RunStatus {
     Pending,
     /// Executing.
     Running,
+    /// Paused at a human-in-the-loop `approval` gate, awaiting a decision. Not terminal and
+    /// not "incomplete" for crash-resume — it stays put until approved/rejected, which flips
+    /// it back to `Running` to resume.
+    AwaitingApproval,
     /// Completed successfully.
     Succeeded,
     /// Failed terminally.
@@ -164,6 +168,8 @@ pub enum StepStatus {
     Pending,
     /// Currently executing.
     Running,
+    /// An `approval` gate that has been reached but not yet decided (the run is paused here).
+    AwaitingApproval,
     /// Completed successfully (gates/judge passed).
     Passed,
     /// Failed terminally.
@@ -178,6 +184,33 @@ impl StepStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Passed | Self::Failed | Self::Skipped)
     }
+}
+
+/// A recorded human decision on an [`approval`](crate::ir::ApprovalStep) gate.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ApprovalDecision {
+    /// Approve (proceed) or reject (fail the gate, carrying `note` as feedback).
+    pub decision: Decision,
+    /// Who decided (free-form; not authenticated — the audit trail, not access control).
+    pub approver: String,
+    /// When the decision was recorded.
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// The reviewer's note — required context on a reject (the feedback to act on), optional
+    /// on an approve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// An approve-or-reject decision on an approval gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Decision {
+    /// Proceed: the gate passes and downstream steps run.
+    Approved,
+    /// Reject: the gate fails (its `note` becomes the feedback).
+    Rejected,
 }
 
 /// A structured, externally-visible effect a run had on the outside world.

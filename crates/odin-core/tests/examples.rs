@@ -74,6 +74,7 @@ fn fix_flaky_exercises_every_step_kind_and_trigger() {
             StepKind::Provider(_) => "provider",
             StepKind::Action(_) => "action",
             StepKind::Run(_) => "run",
+            StepKind::Approval(_) => "approval",
         })
         .collect();
     assert!(kinds.contains(&"provider"));

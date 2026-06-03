@@ -1,0 +1,54 @@
+# A human-in-the-loop gate: an agent prepares a change, then the run PAUSES for a person to
+# approve before anything is pushed. This is what the `approval` step kind unlocks — running
+# agents unattended while keeping a human in control of the risky, outward-facing action.
+#
+#   odin validate examples/gated-deploy.yaml
+#
+# To exercise it (needs the claude CLI + a git remote for the push), run it — the run pauses at
+# `gate` (status `awaiting-approval`); `odin list` shows it. Then resume with a decision:
+#   odin approve <run-id> --workflow examples/gated-deploy.yaml --by you --note "lgtm"
+#   odin reject  <run-id> --workflow examples/gated-deploy.yaml --by you --note "fix the tests"
+# A reject fails the gate, carrying the note as `steps.gate.outputs.feedback`, and skips the push.
+
+schema_version: "1.0"
+name: gated-deploy
+version: "1.0.0"
+description: An agent prepares a change; a human approves the gate before it is pushed.
+durable: true # required for an approval gate (ODIN032) — a pause is resumed from the store
+
+workspace:
+  type: worktree
+
+steps:
+  # An agent implements the change in the worktree; its diff is the implicit DIFF artifact.
+  - id: implement
+    provider: claude
+    prompt: |
+      Make the change described below, editing the working tree.
+      {{ params.task | default("Tidy the README.") }}
+
+  # A second agent reviews the diff so the human approver has a summary to act on.
+  - id: review
+    provider: claude
+    depends_on: [implement]
+    prompt: |
+      Summarize this diff in 3 bullet points and flag any risk:
+      {{ artifacts.DIFF }}
+
+  # The human-in-the-loop gate: the run pauses here until someone approves or rejects.
+  - id: gate
+    approval:
+      message: "Review the diff and the summary above, then approve to push."
+    depends_on: [review]
+
+  # Only runs once the gate is approved.
+  - id: push
+    action: git.push
+    with:
+      remote: origin
+    depends_on: [gate]
+
+params:
+  task:
+    type: string
+    description: What the agent should implement.

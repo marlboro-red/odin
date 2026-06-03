@@ -82,6 +82,8 @@ pub enum StepKind {
     Action(ActionStep),
     /// Shell out to an external command (code hook, any language).
     Run(RunStep),
+    /// A human-in-the-loop gate: the run **pauses** here until a person approves or rejects it.
+    Approval(ApprovalStep),
 }
 
 impl StepKind {
@@ -94,21 +96,27 @@ impl StepKind {
         action: Option<String>,
         with: Option<IndexMap<String, Value>>,
         run: Option<String>,
+        approval: Option<ApprovalStep>,
     ) -> Result<Self, String> {
-        let count = [provider.is_some(), action.is_some(), run.is_some()]
-            .into_iter()
-            .filter(|b| *b)
-            .count();
+        let count = [
+            provider.is_some(),
+            action.is_some(),
+            run.is_some(),
+            approval.is_some(),
+        ]
+        .into_iter()
+        .filter(|b| *b)
+        .count();
         if count == 0 {
             return Err(
-                "step must declare exactly one of `provider:`, `action:`, or `run:` \
-                 (found none)"
+                "step must declare exactly one of `provider:`, `action:`, `run:`, or \
+                 `approval:` (found none)"
                     .to_owned(),
             );
         }
         if count > 1 {
             return Err(
-                "step declares more than one of `provider:`, `action:`, `run:` — \
+                "step declares more than one of `provider:`, `action:`, `run:`, `approval:` — \
                  choose exactly one"
                     .to_owned(),
             );
@@ -131,8 +139,16 @@ impl StepKind {
                 action,
                 with: with.unwrap_or_default(),
             }))
+        } else if let Some(approval) = approval {
+            if prompt.is_some() || prompt_file.is_some() {
+                return Err("`prompt`/`prompt_file` are only valid on `provider:` steps".to_owned());
+            }
+            if with.is_some() {
+                return Err("`with:` is only valid on `action:` steps".to_owned());
+            }
+            Ok(StepKind::Approval(approval))
         } else {
-            let run = run.expect("count == 1 and neither provider nor action implies run");
+            let run = run.expect("count == 1 and only run remains");
             if prompt.is_some() || prompt_file.is_some() {
                 return Err("`prompt`/`prompt_file` are only valid on `provider:` steps".to_owned());
             }
@@ -174,6 +190,19 @@ pub struct RunStep {
     pub run: String,
 }
 
+/// Human-in-the-loop approval gate. The run pauses at this step (status `AwaitingApproval`)
+/// until a person approves it (the gate passes and downstream proceeds) or rejects it (the
+/// gate fails, carrying the reviewer's note as feedback) — via `odin approve`/`odin reject`
+/// or the daemon's `POST /approve`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ApprovalStep {
+    /// Message shown to the approver (e.g. "Review the diff before opening the PR").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 impl Serialize for StepKind {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
@@ -197,6 +226,9 @@ impl Serialize for StepKind {
             StepKind::Run(r) => {
                 m.serialize_entry("run", &r.run)?;
             }
+            StepKind::Approval(a) => {
+                m.serialize_entry("approval", a)?;
+            }
         }
         m.end()
     }
@@ -219,6 +251,8 @@ struct StepRaw {
     with: Option<IndexMap<String, Value>>,
     #[serde(default)]
     run: Option<String>,
+    #[serde(default)]
+    approval: Option<ApprovalStep>,
     #[serde(default)]
     artifacts: Artifacts,
     #[serde(default)]
@@ -248,6 +282,7 @@ impl<'de> Deserialize<'de> for Step {
             r.action,
             r.with,
             r.run,
+            r.approval,
         )
         .map_err(|msg| D::Error::custom(format!("step \"{}\": {msg}", r.id)))?;
         Ok(Step {

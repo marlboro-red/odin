@@ -174,6 +174,31 @@ Events are `run_started`, `step_started`, `gate_result`, `judge_result`, `step_f
 
 ---
 
+## Approving a paused run
+
+A workflow with an [`approval` gate](workflow-reference.md#approval-step) pauses with status
+`awaiting-approval` (visible in `odin list`). Resume it with a decision:
+
+```sh
+odin approve <RUN_ID> --workflow <FILE> --by alice --note "lgtm"
+odin reject  <RUN_ID> --workflow <FILE> --by bob   --note "fix the failing test"
+```
+
+| Flag | Meaning |
+|------|---------|
+| `<RUN_ID>` | The paused run's id. |
+| `--workflow <FILE>` | The workflow file the run was started from (needed to resume). |
+| `--by <NAME>` | Who is deciding (recorded for the audit trail; default `cli`). |
+| `--note <TEXT>` | Free-text note. **Required** on `reject` — it's the feedback, surfaced as `steps.<gate>.outputs.feedback`. |
+| `--repo` / `--db` | Database location (as above). |
+
+**Approve** resumes the run (it continues to completion, or pauses again at a later gate).
+**Reject** fails the gate (downstream skips) and the run ends `failed`, carrying the note.
+The resumed run summary is printed. **Exit:** `0` succeeded or paused again; `1` failed
+(incl. a reject); `2` unknown run / not awaiting / store error.
+
+---
+
 ## JSON shapes
 
 `--json` output is stable, serializable data with no engine internals:

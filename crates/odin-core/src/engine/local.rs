@@ -51,7 +51,9 @@ use serde_json::{Value, json};
 use tracing::Instrument as _;
 
 use super::Engine;
-use crate::api::{RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus};
+use crate::api::{
+    ApprovalDecision, Decision, RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus,
+};
 use crate::context::render::{build_context, eval_when, render_template};
 use crate::error::{Error, Result};
 use crate::ids::{RunId, StepId};
@@ -137,6 +139,20 @@ struct ExecResult {
     side_effects: Vec<SideEffect>,
     usage: Usage,
     diff: Option<String>,
+    /// `Some(step)` if the run PAUSED at an undecided approval gate rather than completing —
+    /// the run is left `AwaitingApproval`, its workspace kept, to resume on a decision.
+    suspended: Option<StepId>,
+}
+
+/// Boxes a step future so the scheduler's `FuturesUnordered` can hold both real step runs and
+/// the immediately-ready outcomes of synchronously-resolved approval gates.
+type StepFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = (StepId, StepOutcome)> + Send + 'a>>;
+
+fn boxed<'a>(
+    f: impl std::future::Future<Output = (StepId, StepOutcome)> + Send + 'a,
+) -> StepFuture<'a> {
+    Box::pin(f)
 }
 
 impl LocalEngine {
@@ -303,6 +319,41 @@ impl LocalEngine {
         self.checkpoint(workflow.durable, state).await
     }
 
+    /// Marks an approval gate `AwaitingApproval` (recording the message for `odin list`/the
+    /// approver) and flips the RUN to `AwaitingApproval`, then checkpoints — persisting the
+    /// pause so a crash leaves the run correctly parked (not auto-resumed) until a decision.
+    /// (A workflow with an approval step is required to be `durable` — ODIN032 — since a pause
+    /// is unresumable without persistence; so this checkpoint always writes.)
+    async fn mark_awaiting(
+        &self,
+        workflow: &Workflow,
+        state: &mut RunState,
+        id: &StepId,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let mut outputs = IndexMap::new();
+        if let Some(m) = message {
+            outputs.insert("message".to_owned(), Value::String(m.to_owned()));
+        }
+        state.steps.insert(
+            id.clone(),
+            StepState {
+                status: StepStatus::AwaitingApproval,
+                attempts: 0,
+                exit_code: None,
+                outputs,
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: Vec::new(),
+                error: None,
+            },
+        );
+        state.status = RunStatus::AwaitingApproval;
+        state.updated_at = Utc::now();
+        self.checkpoint(workflow.durable, state).await
+    }
+
     /// Resolves declared params (input value or default), erroring on a missing required
     /// one, and passes through any extra provided params.
     fn resolve_params(workflow: &Workflow, input: &RunInput) -> Result<IndexMap<String, Value>> {
@@ -462,6 +513,11 @@ impl LocalEngine {
                     },
                     Err(e) => StepOutcome::failed(format!("action error: {e}")),
                 }
+            }
+            // Approval gates are resolved synchronously by the scheduler (`execute`), which has
+            // the run's recorded decisions; they never reach `dispatch`.
+            StepKind::Approval(_) => {
+                StepOutcome::failed("internal: an approval gate was dispatched".to_owned())
             }
         }
     }
@@ -1033,10 +1089,13 @@ impl LocalEngine {
         // alongside another step. `scratch` steps run in isolated worktrees, so any number
         // may run concurrently (bounded by `max_parallel`).
         let mut exclusive_running = false;
+        // Set when an undecided approval gate is reached: stop scheduling new steps, drain
+        // in-flight, then return suspended (the run pauses, keeping its workspace).
+        let mut suspended_gate: Option<StepId> = None;
 
         loop {
             // Fill the ready-set up to the concurrency limit, honoring the exclusivity rule.
-            while in_flight.len() < max_parallel && !exclusive_running {
+            while in_flight.len() < max_parallel && !exclusive_running && suspended_gate.is_none() {
                 let Some(step) = order
                     .iter()
                     .filter_map(|id| by_id.get(id.as_str()).copied())
@@ -1057,6 +1116,31 @@ impl LocalEngine {
                         Some(StepStatus::Passed)
                     )
                 });
+
+                // An approval gate is resolved by the scheduler (it holds the recorded
+                // decisions), never dispatched: approve → pass, reject → fail (with feedback),
+                // and an *undecided* gate PAUSES the whole run here.
+                if let StepKind::Approval(appr) = &step.kind {
+                    let id = step.id.clone();
+                    started.insert(id.clone());
+                    if !deps_passed {
+                        let mut o = skipped_outcome();
+                        o.error = Some("an upstream dependency did not pass".to_owned());
+                        in_flight.push(boxed(std::future::ready((id, o))));
+                    } else if let Some(decision) = state.approvals.get(&id).cloned() {
+                        let o = match decision.decision {
+                            Decision::Approved => StepOutcome::gate_approved(&decision),
+                            Decision::Rejected => StepOutcome::gate_rejected(&decision),
+                        };
+                        in_flight.push(boxed(std::future::ready((id, o))));
+                    } else {
+                        self.mark_awaiting(workflow, state, &id, appr.message.as_deref())
+                            .await?;
+                        suspended_gate = Some(id);
+                    }
+                    continue;
+                }
+
                 let timeout = step
                     .timeout
                     .or(workflow.defaults.timeout)
@@ -1076,7 +1160,7 @@ impl LocalEngine {
                 if exclusive {
                     exclusive_running = true;
                 }
-                in_flight.push(self.run_one(
+                in_flight.push(boxed(self.run_one(
                     run_id,
                     step,
                     ctx,
@@ -1084,7 +1168,7 @@ impl LocalEngine {
                     timeout,
                     deps_passed,
                     cancel,
-                ));
+                )));
                 if exclusive {
                     break; // nothing else starts beside it
                 }
@@ -1182,6 +1266,7 @@ impl LocalEngine {
             side_effects,
             usage,
             diff,
+            suspended: suspended_gate,
         })
     }
 
@@ -1330,6 +1415,30 @@ impl LocalEngine {
         .await;
     }
 
+    /// Builds the summary for a run that PAUSED at an approval gate (status `AwaitingApproval`,
+    /// `finished_at` unset). Steps + side effects are reconstructed from persisted `state` so the
+    /// paused gate itself (which produced no execution outcome) is included.
+    fn suspended_summary(
+        run_id: RunId,
+        workflow: &Workflow,
+        exec: &ExecResult,
+        started_at: chrono::DateTime<Utc>,
+        steps: &IndexMap<StepId, StepState>,
+    ) -> RunSummary {
+        RunSummary {
+            run_id,
+            workflow: workflow.name.clone(),
+            status: RunStatus::AwaitingApproval,
+            steps: steps.iter().map(|(id, st)| step_result(id, st)).collect(),
+            usage: exec.usage,
+            side_effects: collect_side_effects(steps),
+            diff: exec.diff.clone(),
+            error: None,
+            started_at,
+            finished_at: None,
+        }
+    }
+
     fn summarize(
         run_id: RunId,
         workflow: &Workflow,
@@ -1410,6 +1519,7 @@ impl LocalEngine {
 
 #[async_trait]
 impl Engine for LocalEngine {
+    #[allow(clippy::too_many_lines)]
     async fn run(&self, workflow: &Workflow, input: RunInput) -> Result<RunSummary> {
         let report = crate::validate::validate(workflow, &self.registry.known_names());
         if report.has_errors() {
@@ -1440,6 +1550,7 @@ impl Engine for LocalEngine {
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input,
             workspace: Some(handle.clone()),
             base_commit: None,
@@ -1466,6 +1577,25 @@ impl Engine for LocalEngine {
             .execute(workflow, &mut state, &workdir, &params, &cancel)
             .instrument(run_span.clone())
             .await;
+        // Paused at an approval gate? Keep the workspace and snapshot ref (the run resumes on a
+        // decision) and return AwaitingApproval — do NOT reclaim resources or mark terminal.
+        let exec = match exec {
+            Ok(r) if r.suspended.is_some() => {
+                let gate = r.suspended.clone();
+                state.status = RunStatus::AwaitingApproval;
+                state.updated_at = Utc::now();
+                self.checkpoint(workflow.durable, &state).await?;
+                tracing::info!(parent: &run_span, run_id = %run_id, gate = ?gate, "run paused for approval");
+                return Ok(Self::suspended_summary(
+                    run_id,
+                    workflow,
+                    &r,
+                    started_at,
+                    &state.steps,
+                ));
+            }
+            other => other,
+        };
         // The run is terminal now — drop the snapshot ref so its commits can be collected.
         // Fully unconditional: durable runs snapshot per step, AND a retrying step snapshots
         // even in a NON-durable run (for per-retry workdir restore), so either kind can leave
@@ -1483,6 +1613,7 @@ impl Engine for LocalEngine {
                     side_effects: collect_side_effects(&state.steps),
                     usage: Usage::default(),
                     diff: None,
+                    suspended: None,
                 },
                 Some(e.to_string()),
             ),
@@ -1557,33 +1688,54 @@ impl Engine for LocalEngine {
                             .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
                             .instrument(run_span)
                             .await;
-                        // Reclaim the run's snapshot refs unconditionally (matches run() and the
-                        // unserved-workflow path above): a retrying step snapshots even in a
-                        // non-durable run, and the durable flag may have been flipped since the
-                        // run was persisted — so either kind can leave a per-run or retry ref.
-                        // `delete_snapshot_ref` is a no-op when none was created.
-                        self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
-                            .await;
-                        let workspace = self.make_workspace(&workflow.workspace);
-                        self.release_workspace(&workspace, handle).await;
                         match exec {
-                            Ok(result) => {
-                                // `summarize` derives the run-level error from the first failed
-                                // step's recorded reason (single source of truth).
-                                let (status, summary) = Self::summarize(
-                                    state.run_id,
-                                    workflow,
-                                    result,
-                                    None,
-                                    started_at,
-                                );
-                                state.status = status;
-                                state.error = summary.error.clone();
+                            // Paused again at an approval gate — keep the workspace + ref; the
+                            // run stays AwaitingApproval until the next decision.
+                            Ok(r) if r.suspended.is_some() => {
+                                let gate = r.suspended.clone();
+                                state.status = RunStatus::AwaitingApproval;
                                 state.updated_at = Utc::now();
                                 self.checkpoint(workflow.durable, &state).await?;
-                                summary
+                                tracing::info!(run_id = %state.run_id, gate = ?gate, "resumed run paused for approval");
+                                Self::suspended_summary(
+                                    state.run_id,
+                                    workflow,
+                                    &r,
+                                    started_at,
+                                    &state.steps,
+                                )
                             }
-                            Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
+                            terminal => {
+                                // Reclaim the run's snapshot refs unconditionally (matches run()
+                                // and the unserved-workflow path): a retrying step snapshots even
+                                // in a non-durable run, and the durable flag may have flipped, so
+                                // either can leave a ref. `delete_snapshot_ref` no-ops if none.
+                                self.delete_snapshot_ref(&handle.path, state.run_id, &cancel)
+                                    .await;
+                                let workspace = self.make_workspace(&workflow.workspace);
+                                self.release_workspace(&workspace, handle).await;
+                                match terminal {
+                                    Ok(result) => {
+                                        // `summarize` derives the run-level error from the first
+                                        // failed step's recorded reason (single source of truth).
+                                        let (status, summary) = Self::summarize(
+                                            state.run_id,
+                                            workflow,
+                                            result,
+                                            None,
+                                            started_at,
+                                        );
+                                        state.status = status;
+                                        state.error = summary.error.clone();
+                                        state.updated_at = Utc::now();
+                                        self.checkpoint(workflow.durable, &state).await?;
+                                        summary
+                                    }
+                                    Err(e) => {
+                                        self.fail_run(workflow, &mut state, &e.to_string()).await?
+                                    }
+                                }
+                            }
                         }
                     }
                     Err(e) => self.fail_run(workflow, &mut state, &e.to_string()).await?,
@@ -1633,6 +1785,57 @@ impl Engine for LocalEngine {
             finished_at: Some(state.updated_at),
         }))
     }
+
+    async fn submit_approval(
+        &self,
+        run_id: RunId,
+        decision: Decision,
+        approver: String,
+        note: Option<String>,
+        workflows: &[Workflow],
+    ) -> Result<Option<RunSummary>> {
+        let Some(store) = self.store.clone() else {
+            return Err(Error::Input(
+                "approvals require a durable store; none is configured".to_owned(),
+            ));
+        };
+        let Some(mut state) = store.load_run(run_id).await? else {
+            return Ok(None);
+        };
+        if state.status != RunStatus::AwaitingApproval {
+            return Err(Error::Input(format!(
+                "run {run_id} is not awaiting approval (status is {:?})",
+                state.status
+            )));
+        }
+        // The gate parked at `AwaitingApproval` is the one this decision answers.
+        let Some(gate) = state
+            .steps
+            .iter()
+            .find(|(_, st)| st.status == StepStatus::AwaitingApproval)
+            .map(|(id, _)| id.clone())
+        else {
+            return Err(Error::Input(format!(
+                "run {run_id} has no pending approval gate"
+            )));
+        };
+        tracing::info!(run_id = %run_id, gate = %gate, decision = ?decision, %approver, "approval recorded");
+        state.approvals.insert(
+            gate,
+            ApprovalDecision {
+                decision,
+                approver,
+                at: Utc::now(),
+                note,
+            },
+        );
+        // Flip to Running so `resume_all` picks it up, then resume.
+        state.status = RunStatus::Running;
+        state.updated_at = Utc::now();
+        store.checkpoint(&state).await?;
+        let summaries = self.resume_all(workflows).await?;
+        Ok(summaries.into_iter().find(|s| s.run_id == run_id))
+    }
 }
 
 impl StepOutcome {
@@ -1640,6 +1843,41 @@ impl StepOutcome {
     fn skipped(mut self) -> Self {
         self.status = StepStatus::Skipped;
         self
+    }
+
+    /// Outcome for an approval gate that a human approved — the gate passes; the decision is
+    /// recorded in the gate's outputs for the audit trail.
+    fn gate_approved(d: &ApprovalDecision) -> Self {
+        let mut outputs = IndexMap::new();
+        outputs.insert("decision".to_owned(), Value::String("approved".to_owned()));
+        outputs.insert("approver".to_owned(), Value::String(d.approver.clone()));
+        if let Some(note) = &d.note {
+            outputs.insert("note".to_owned(), Value::String(note.clone()));
+        }
+        StepOutcome {
+            attempts: 1,
+            ..StepOutcome::passing(0, outputs, None)
+        }
+    }
+
+    /// Outcome for an approval gate that a human rejected — the gate FAILS, and the reviewer's
+    /// note is surfaced as `outputs.feedback` (the input to act on) and the failure reason.
+    fn gate_rejected(d: &ApprovalDecision) -> Self {
+        let note = d.note.clone().unwrap_or_default();
+        let reason = if note.is_empty() {
+            format!("rejected by {}", d.approver)
+        } else {
+            format!("rejected by {}: {note}", d.approver)
+        };
+        let mut outputs = IndexMap::new();
+        outputs.insert("decision".to_owned(), Value::String("rejected".to_owned()));
+        outputs.insert("approver".to_owned(), Value::String(d.approver.clone()));
+        outputs.insert("feedback".to_owned(), Value::String(note));
+        StepOutcome {
+            outputs,
+            attempts: 1,
+            ..StepOutcome::failed(reason)
+        }
     }
 }
 
@@ -2178,6 +2416,7 @@ steps:
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual().param("who", "resumed"),
             workspace: Some(handle),
             base_commit: None,
@@ -2268,6 +2507,7 @@ steps:
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: Some(handle),
             base_commit: None,
@@ -2351,6 +2591,7 @@ steps:
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: Some(handle),
             base_commit: None,
@@ -2437,6 +2678,7 @@ steps:
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: Some(handle),
             base_commit: Some(base),
@@ -2520,6 +2762,7 @@ steps:
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: Some(handle),
             base_commit: Some(base),
@@ -2635,6 +2878,7 @@ steps:
             steps,
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: Some(handle),
             base_commit: Some(base.clone()),
@@ -2710,6 +2954,7 @@ steps:
             steps,
             artifacts,
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual().param("who", "resumed"),
             workspace: Some(handle),
             base_commit: None,
@@ -2779,6 +3024,7 @@ steps:
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual().param("who", "x"),
             workspace: Some(crate::traits::WorkspaceHandle {
                 run_id,
@@ -2882,6 +3128,139 @@ steps:
             "reloaded summary must reconstruct the Commit side-effect: {:?}",
             reloaded.side_effects
         );
+    }
+
+    const APPROVAL_WF: &str = "name: appr\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: plan, run: \"echo planned > plan.txt\"}\n  - id: gate\n    approval: { message: \"ok to proceed?\" }\n    depends_on: [plan]\n  - {id: ship, run: \"echo shipped > ship.txt\", depends_on: [gate]}\n";
+
+    fn step_status(s: &RunSummary, id: &str) -> Option<StepStatus> {
+        s.steps
+            .iter()
+            .find(|x| x.id.as_str() == id)
+            .map(|x| x.status)
+    }
+
+    #[tokio::test]
+    async fn approval_gate_pauses_then_resumes_on_approve() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(APPROVAL_WF);
+
+        // First run: stops AT the gate, downstream not yet run.
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            s1.status,
+            RunStatus::AwaitingApproval,
+            "the run must pause at the gate"
+        );
+        assert_eq!(step_status(&s1, "plan"), Some(StepStatus::Passed));
+        assert_eq!(step_status(&s1, "gate"), Some(StepStatus::AwaitingApproval));
+        assert_eq!(
+            step_status(&s1, "ship"),
+            None,
+            "downstream must not run while paused"
+        );
+
+        // Approve → resumes → ship runs → Succeeded.
+        let s2 = eng
+            .submit_approval(
+                s1.run_id,
+                Decision::Approved,
+                "alice".to_owned(),
+                None,
+                std::slice::from_ref(&wf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2.status, RunStatus::Succeeded, "error: {:?}", s2.error);
+        assert_eq!(step_status(&s2, "gate"), Some(StepStatus::Passed));
+        assert_eq!(step_status(&s2, "ship"), Some(StepStatus::Passed));
+    }
+
+    #[tokio::test]
+    async fn approval_gate_reject_fails_with_feedback_and_skips_downstream() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+
+        let s2 = eng
+            .submit_approval(
+                s1.run_id,
+                Decision::Rejected,
+                "bob".to_owned(),
+                Some("needs tests".to_owned()),
+                std::slice::from_ref(&wf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2.status, RunStatus::Failed);
+        let gate = s2.steps.iter().find(|x| x.id.as_str() == "gate").unwrap();
+        assert_eq!(gate.status, StepStatus::Failed);
+        assert!(
+            gate.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("rejected by bob"),
+            "reason carries the rejector: {:?}",
+            gate.error
+        );
+        assert_eq!(
+            gate.outputs.get("feedback").and_then(|v| v.as_str()),
+            Some("needs tests"),
+            "the reviewer's note is surfaced as feedback"
+        );
+        assert_eq!(
+            step_status(&s2, "ship"),
+            Some(StepStatus::Skipped),
+            "downstream skips after a rejected gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_gate_survives_a_restart_then_resumes() {
+        let repo = init_repo().await;
+        let db = tempfile::tempdir().unwrap();
+        let path = db.path().join("state.db");
+        let wf = parse(APPROVAL_WF);
+
+        let run_id = {
+            let eng = engine(repo.path(), Arc::new(SqliteStore::open(&path).unwrap()));
+            let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+            assert_eq!(s1.status, RunStatus::AwaitingApproval);
+            s1.run_id
+        }; // engine + store dropped — simulates a daemon restart while paused.
+
+        let eng = engine(repo.path(), Arc::new(SqliteStore::open(&path).unwrap()));
+        // A paused run must NOT be auto-resumed by crash recovery...
+        assert!(
+            eng.resume_all(std::slice::from_ref(&wf))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a run parked at an approval gate is not crash-resumed"
+        );
+        // ...only once a decision is recorded.
+        let s2 = eng
+            .submit_approval(
+                run_id,
+                Decision::Approved,
+                "alice".to_owned(),
+                None,
+                std::slice::from_ref(&wf),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(s2.status, RunStatus::Succeeded, "error: {:?}", s2.error);
     }
 
     /// A provider that always replies with a fixed string (a stand-in judge/agent).

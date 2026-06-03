@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::api::{RunInput, RunSummary};
+use crate::api::{Decision, RunInput, RunSummary};
 use crate::error::Result;
 use crate::ids::RunId;
 use crate::ir::Workflow;
@@ -42,6 +42,23 @@ pub trait Engine: Send + Sync {
     /// # Errors
     /// Returns an [`crate::error::Error`] if the store read fails.
     async fn summary(&self, run_id: RunId) -> Result<Option<RunSummary>>;
+
+    /// Records a human `decision` on the run's pending [`approval`](crate::ir::ApprovalStep)
+    /// gate, then resumes the run — returning its resulting summary (terminal, or paused again
+    /// at a later gate). `Ok(None)` if the run id is unknown. `workflows` must include the run's
+    /// own workflow definition (needed to resume).
+    ///
+    /// # Errors
+    /// Returns [`crate::error::Error::Input`] if the run is not awaiting approval, or another
+    /// [`crate::error::Error`] if the store, resume, or a plugin fails.
+    async fn submit_approval(
+        &self,
+        run_id: RunId,
+        decision: Decision,
+        approver: String,
+        note: Option<String>,
+        workflows: &[Workflow],
+    ) -> Result<Option<RunSummary>>;
 }
 
 /// Wires a [`Registry`] of plugins, a repository root, and a [`Store`] into an engine.

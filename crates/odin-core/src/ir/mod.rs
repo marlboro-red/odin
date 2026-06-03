@@ -15,7 +15,8 @@ pub mod workspace;
 pub use duration::HumanDuration;
 pub use params::{ParamSpec, ParamType};
 pub use step::{
-    ActionStep, Artifacts, Backoff, JudgeSpec, ProviderStep, RetrySpec, RunStep, Step, StepKind,
+    ActionStep, ApprovalStep, Artifacts, Backoff, JudgeSpec, ProviderStep, RetrySpec, RunStep,
+    Step, StepKind,
 };
 pub use trigger::{CronDecl, GithubWebhookDecl, TriggerDecl};
 pub use workflow::{

@@ -178,23 +178,25 @@ impl Store for SqliteStore {
     }
 
     async fn load_incomplete(&self) -> Result<Vec<RunState>, StoreError> {
-        // Derive the terminal strings via status_str so the filter can't drift from the
-        // serde representation of RunStatus. (Keep this list in sync with is_terminal.)
-        let terminal = [
+        // Crash-resumable runs only: terminal states are excluded, and so is `AwaitingApproval`
+        // — a run paused at an approval gate is deliberately parked, not crashed, and must NOT
+        // be auto-resumed; recording a decision flips it back to `Running` to be picked up.
+        // (Derive the strings via status_str so the filter can't drift from the serde repr.)
+        let parked = [
             RunStatus::Succeeded,
             RunStatus::Failed,
             RunStatus::Cancelled,
+            RunStatus::AwaitingApproval,
         ]
         .map(status_str);
         let conn = self.conn.lock().await;
         let mut stmt = db(conn.prepare(
-            "SELECT state FROM runs WHERE status NOT IN (?1, ?2, ?3) ORDER BY updated_at",
+            "SELECT state FROM runs WHERE status NOT IN (?1, ?2, ?3, ?4) ORDER BY updated_at",
         ))?;
-        let rows = db(
-            stmt.query_map(params![terminal[0], terminal[1], terminal[2]], |row| {
+        let rows = db(stmt
+            .query_map(params![parked[0], parked[1], parked[2], parked[3]], |row| {
                 row.get::<_, String>(0)
-            }),
-        )?;
+            }))?;
         let mut out = Vec::new();
         for row in rows {
             out.push(serde_json::from_str(&db(row)?)?);
@@ -259,6 +261,7 @@ mod tests {
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: None,
             base_commit: None,
