@@ -73,6 +73,76 @@ pub trait Store: Send + Sync {
     async fn metrics(&self) -> Result<StoreMetrics, StoreError> {
         Ok(StoreMetrics::default())
     }
+
+    /// Deletes **terminal** runs (and their events) matching `policy`, returning what would be /
+    /// was removed. Non-terminal runs (`pending`/`running`/`awaiting_approval`) are NEVER
+    /// touched — they are mid-flight or awaiting a human decision. With `dry_run`, selects the
+    /// eligible runs and reports them but deletes nothing. Defaults to a no-op, so retention is
+    /// an optional capability.
+    ///
+    /// An implementation MUST keep the metrics counter sound under deletion (so a pruned run
+    /// still counts toward `odin_runs_total`); the SQLite store folds the pruned counts into a
+    /// persistent tally before deleting. The returned [`PruneReport::run_ids`] let the caller
+    /// reclaim each run's external state (e.g. git snapshot refs).
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backend read/write fails.
+    async fn prune(&self, policy: &PrunePolicy, dry_run: bool) -> Result<PruneReport, StoreError> {
+        let _ = (policy, dry_run);
+        Ok(PruneReport::default())
+    }
+}
+
+/// A retention policy for [`Store::prune`]. A run is eligible only if it is **terminal** AND
+/// satisfies every limit that is set (the limits are AND-combined — the conservative reading).
+/// The [`Default`] is a no-op (`max_age`/`keep_last` both `None`): a misconfigured policy
+/// deletes nothing.
+#[derive(Clone, Debug, Default)]
+pub struct PrunePolicy {
+    /// Prune terminal runs last updated longer ago than this. `None` = no age limit.
+    pub max_age: Option<chrono::Duration>,
+    /// Keep at most this many terminal runs **per workflow** (newest by `updated_at`); prune the
+    /// rest. `None` = no count limit.
+    pub keep_last: Option<u32>,
+    /// Restrict pruning to this one workflow; `None` prunes across all workflows.
+    pub workflow: Option<WorkflowId>,
+}
+
+impl PrunePolicy {
+    /// Whether the policy has no age or count limit set — in which case [`Store::prune`] deletes
+    /// nothing (callers should refuse such a policy rather than silently no-op).
+    #[must_use]
+    pub fn is_noop(&self) -> bool {
+        self.max_age.is_none() && self.keep_last.is_none()
+    }
+}
+
+/// What a [`Store::prune`] removed (or, under `dry_run`, would remove).
+#[derive(Clone, Debug, Default, Serialize)]
+#[non_exhaustive]
+pub struct PruneReport {
+    /// Number of `runs` rows deleted (or eligible, under `dry_run`).
+    pub runs_pruned: u64,
+    /// Number of `events` rows deleted (or eligible, under `dry_run`).
+    pub events_pruned: u64,
+    /// Per-(workflow, status) breakdown of what was pruned, for logging/JSON.
+    pub per_workflow: Vec<PrunedCount>,
+    /// The pruned run ids, so the caller can reclaim each run's external state (snapshot refs).
+    pub run_ids: Vec<RunId>,
+    /// Whether this was a dry run (nothing was actually deleted).
+    pub dry_run: bool,
+}
+
+/// One line of a [`PruneReport`]: how many runs of a (workflow, status) were pruned.
+#[derive(Clone, Debug, Serialize)]
+#[non_exhaustive]
+pub struct PrunedCount {
+    /// The workflow name.
+    pub workflow: String,
+    /// The terminal run status (lowercase serde string).
+    pub status: String,
+    /// How many runs of this (workflow, status) were pruned.
+    pub count: u64,
 }
 
 /// A cheap aggregate snapshot of run state for operational metrics (e.g. a Prometheus

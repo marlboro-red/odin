@@ -14,7 +14,7 @@ impl HumanDuration {
     /// Parses a human duration string, returning a human-readable error on failure.
     ///
     /// # Errors
-    /// Returns `Err` if there is no leading number, the unit is not `s`/`m`/`h`, or the
+    /// Returns `Err` if there is no leading number, the unit is not `s`/`m`/`h`/`d`/`w`, or the
     /// value overflows `u64` seconds.
     pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
@@ -29,9 +29,11 @@ impl HumanDuration {
             "" | "s" => Some(n),
             "m" => n.checked_mul(60),
             "h" => n.checked_mul(3600),
+            "d" => n.checked_mul(86_400),
+            "w" => n.checked_mul(604_800),
             other => {
                 return Err(format!(
-                    "invalid duration unit {other:?} in {s:?} (use s, m, or h)"
+                    "invalid duration unit {other:?} in {s:?} (use s, m, h, d, or w)"
                 ));
             }
         }
@@ -87,12 +89,23 @@ mod tests {
             HumanDuration::parse("  10m ").unwrap().0,
             Duration::from_secs(600)
         );
+        assert_eq!(
+            HumanDuration::parse("10d").unwrap().0,
+            Duration::from_secs(864_000)
+        );
+        assert_eq!(
+            HumanDuration::parse("2w").unwrap().0,
+            Duration::from_secs(1_209_600)
+        );
     }
 
     #[test]
     fn rejects_bad_input() {
         assert!(HumanDuration::parse("abc").is_err());
-        assert!(HumanDuration::parse("10d").is_err());
+        assert!(
+            HumanDuration::parse("10y").is_err(),
+            "years are not a supported unit"
+        );
         assert!(HumanDuration::parse("").is_err());
     }
 

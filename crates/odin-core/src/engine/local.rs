@@ -62,8 +62,8 @@ use crate::ir::{Backoff, JudgeSpec, Step, StepKind, Workflow, WorkspaceConfig};
 use crate::provider::process::{ProcessOptions, run_process};
 use crate::registry::Registry;
 use crate::traits::{
-    AcquireCtx, ActionCtx, CancelToken, InvocationCtx, RunEvent, RunState, StepState, Store,
-    Workspace, WorkspaceHandle,
+    AcquireCtx, ActionCtx, CancelToken, InvocationCtx, PrunePolicy, PruneReport, RunEvent,
+    RunState, StepState, Store, Workspace, WorkspaceHandle,
 };
 use crate::usage::Usage;
 use crate::workspace::{SlotPoolWorkspace, WorktreeWorkspace};
@@ -1877,6 +1877,30 @@ impl Engine for LocalEngine {
         let rerun = self.run(workflow, input).await?;
         Ok(Some(RerunOutcome { rejected, rerun }))
     }
+
+    async fn prune(&self, policy: &PrunePolicy, dry_run: bool) -> Result<PruneReport> {
+        let Some(store) = &self.store else {
+            return Ok(PruneReport::default());
+        };
+        let report = store.prune(policy, dry_run).await?;
+        // Reclaim each pruned run's leftover snapshot refs from the shared repo (best-effort,
+        // never fails the prune). Terminal runs normally drop these on completion; this sweeps
+        // any historical leftover so deleting the DB row doesn't orphan a dangling-commit ref.
+        if !dry_run && !report.run_ids.is_empty() {
+            let cancel = CancelToken::new();
+            for run_id in &report.run_ids {
+                self.delete_snapshot_ref(&self.repo_root, *run_id, &cancel)
+                    .await;
+            }
+        }
+        tracing::info!(
+            runs_pruned = report.runs_pruned,
+            events_pruned = report.events_pruned,
+            dry_run = report.dry_run,
+            "prune complete"
+        );
+        Ok(report)
+    }
 }
 
 impl LocalEngine {
@@ -3551,6 +3575,76 @@ steps:
         // The reject must NOT have fired — the run is still awaiting and can be decided normally.
         let still = eng.summary(s1.run_id).await.unwrap().unwrap();
         assert_eq!(still.status, RunStatus::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn prune_removes_the_run_and_reclaims_its_snapshot_ref() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+
+        // A terminal run persisted in the store, with a leftover snapshot ref in the shared repo
+        // (the historical flag-flip leak this also sweeps).
+        let mut state = RunState {
+            run_id: RunId::new(),
+            workflow: crate::ids::WorkflowId::new("pw"),
+            schema_major: 1,
+            status: RunStatus::Succeeded,
+            error: None,
+            steps: IndexMap::new(),
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: None,
+            base_commit: None,
+            snapshot: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        state.updated_at = Utc::now();
+        let run_id = state.run_id;
+        store.checkpoint(&state).await.unwrap();
+        let snapshot_ref = format!("refs/odin/run/{run_id}");
+        assert!(
+            git_in(repo.path(), &["update-ref", &snapshot_ref, "HEAD"]),
+            "seed the leftover ref"
+        );
+
+        let report = eng
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(0),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 1);
+        assert!(report.run_ids.contains(&run_id));
+        assert!(
+            store.load_run(run_id).await.unwrap().is_none(),
+            "run removed from store"
+        );
+        assert!(
+            !git_in(
+                repo.path(),
+                &["show-ref", "--verify", "--quiet", &snapshot_ref]
+            ),
+            "the snapshot ref was reclaimed"
+        );
+    }
+
+    /// Runs `git -C <repo> <args>` for a test, returning whether it succeeded.
+    fn git_in(repo: &Path, args: &[&str]) -> bool {
+        let mut full = vec!["-C", repo.to_str().unwrap()];
+        full.extend_from_slice(args);
+        std::process::Command::new("git")
+            .args(&full)
+            .status()
+            .unwrap()
+            .success()
     }
 
     /// A provider that always replies with a fixed string (a stand-in judge/agent).

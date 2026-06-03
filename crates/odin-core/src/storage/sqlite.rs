@@ -8,13 +8,17 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use rusqlite::{Connection, params};
+use chrono::Utc;
+use indexmap::IndexMap;
+use rusqlite::{Connection, params, params_from_iter};
 use tokio::sync::Mutex;
 
 use crate::api::RunStatus;
 use crate::error::StoreError;
 use crate::ids::RunId;
-use crate::traits::{RunEvent, RunState, RunStatusCount, Store, StoreMetrics};
+use crate::traits::{
+    PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState, RunStatusCount, Store, StoreMetrics,
+};
 
 /// The baseline schema (migration to v1). Idempotent (`IF NOT EXISTS`), so it also adopts a
 /// pre-versioning database that already has the tables.
@@ -42,11 +46,27 @@ CREATE TABLE IF NOT EXISTS events (
 const SCHEMA_V2_METRICS_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS runs_workflow_status ON runs(workflow, status);";
 
+/// A persistent tally of pruned terminal runs per `(workflow, status)`. Retention deletes
+/// `runs` rows, which would make the `odin_runs_total` counter (a live `COUNT(*)`) DECREASE —
+/// invalid for a Prometheus counter. `prune` instead UPSERTs the about-to-be-deleted counts
+/// here *before* deleting, so `metrics()` can report `live COUNT(*) + pruned tally`: a finished
+/// run adds to the live count, a pruned run moves that unit live→tally, the sum never falls.
+/// It holds only terminal statuses (the prune predicate guarantees it), so the non-terminal
+/// gauges are unaffected.
+const SCHEMA_V3_PRUNED_COUNTS: &str = "
+CREATE TABLE IF NOT EXISTS pruned_counts (
+    workflow TEXT NOT NULL,
+    status   TEXT NOT NULL,
+    pruned   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workflow, status)
+);
+";
+
 /// Ordered migrations tracked by SQLite's `PRAGMA user_version`. The entry at index `i`
 /// upgrades the database from version `i` to `i + 1` (so `MIGRATIONS.len()` is the current
 /// version). **Append** new migrations; never edit or reorder a released one — an in-place
 /// edit would not re-run on a database already at that version.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2_METRICS_INDEX];
+const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2_METRICS_INDEX, SCHEMA_V3_PRUNED_COUNTS];
 
 /// A durable run store backed by a SQLite database.
 pub struct SqliteStore {
@@ -249,12 +269,18 @@ impl Store for SqliteStore {
     }
 
     async fn metrics(&self) -> Result<StoreMetrics, StoreError> {
-        // One indexed aggregate, no JSON blobs parsed: the `workflow` and `status` columns are
-        // denormalized, so the counts are SQLite's to compute.
+        // Fold the persistent pruned tally into the live counts so a pruned terminal run still
+        // counts toward `odin_runs_total` (which must not decrease). `pruned_counts` holds only
+        // terminal statuses, so the non-terminal gauges read `live + 0`. Both inputs are indexed
+        // aggregates / a tiny keyed table — no JSON blobs parsed.
         let conn = self.conn.lock().await;
-        let mut stmt =
-            db(conn
-                .prepare("SELECT workflow, status, COUNT(*) FROM runs GROUP BY workflow, status"))?;
+        let mut stmt = db(conn.prepare(
+            "SELECT workflow, status, SUM(c) FROM (
+                 SELECT workflow, status, COUNT(*) AS c FROM runs GROUP BY workflow, status
+                 UNION ALL
+                 SELECT workflow, status, pruned AS c FROM pruned_counts
+             ) GROUP BY workflow, status",
+        ))?;
         let rows = db(stmt.query_map([], |row| {
             Ok(RunStatusCount {
                 workflow: row.get::<_, String>(0)?,
@@ -268,6 +294,165 @@ impl Store for SqliteStore {
         }
         Ok(StoreMetrics { runs })
     }
+
+    async fn prune(&self, policy: &PrunePolicy, dry_run: bool) -> Result<PruneReport, StoreError> {
+        // A no-op policy must delete nothing (callers should reject one, but defend here too).
+        if policy.is_noop() {
+            return Ok(PruneReport {
+                dry_run,
+                ..PruneReport::default()
+            });
+        }
+        let conn = self.conn.lock().await;
+        prune_locked(&conn, policy, dry_run)
+    }
+}
+
+/// The terminal run statuses as their stored `status` strings, derived from
+/// [`RunStatus::is_terminal`] so the prune predicate can never drift from the enum. The ONLY
+/// statuses a run may be pruned in.
+fn terminal_statuses() -> Vec<String> {
+    [
+        RunStatus::Succeeded,
+        RunStatus::Failed,
+        RunStatus::Cancelled,
+        RunStatus::Pending,
+        RunStatus::Running,
+        RunStatus::AwaitingApproval,
+    ]
+    .into_iter()
+    .filter(|s| s.is_terminal())
+    .map(status_str)
+    .collect()
+}
+
+/// Selects the eligible terminal run ids for `policy`, then (unless `dry_run`) folds their
+/// counts into `pruned_counts` and deletes their `runs` + `events` rows — all in one
+/// transaction so a crash can't strand events or double-count the tally. Runs under the held
+/// connection lock.
+fn prune_locked(
+    conn: &Connection,
+    policy: &PrunePolicy,
+    dry_run: bool,
+) -> Result<PruneReport, StoreError> {
+    let terminal = terminal_statuses();
+    let in_terminal = placeholders(terminal.len());
+
+    // Assemble the WHERE clause and its positional binds together so they stay in lockstep. The
+    // `status IN (terminal…)` predicate leads EVERY query/branch, so a non-terminal run is
+    // structurally unselectable (the safety invariant).
+    let mut conds = vec![format!("status IN ({in_terminal})")];
+    let mut binds: Vec<String> = terminal.clone();
+    if let Some(workflow) = &policy.workflow {
+        conds.push("workflow = ?".to_owned());
+        binds.push(workflow.as_str().to_owned());
+    }
+    if let Some(max_age) = policy.max_age {
+        // `updated_at` (a terminal run's completion time) is the indexed column; compare RFC3339
+        // strings, which sort chronologically since we always write a `+00:00` offset.
+        conds.push("updated_at < ?".to_owned());
+        binds.push((Utc::now() - max_age).to_rfc3339());
+    }
+    if let Some(keep_last) = policy.keep_last {
+        // Keep the newest `keep_last` terminal runs PER workflow; the rest are eligible. The
+        // subquery is itself terminal-filtered, so a non-terminal run never occupies a kept slot.
+        conds.push(format!(
+            "run_id IN (SELECT run_id FROM runs r2 WHERE r2.status IN ({in_terminal}) \
+             AND r2.workflow = runs.workflow \
+             ORDER BY r2.updated_at DESC, r2.run_id DESC LIMIT -1 OFFSET ?)"
+        ));
+        binds.extend(terminal.iter().cloned());
+        binds.push(keep_last.to_string());
+    }
+    let where_clause = conds.join(" AND ");
+
+    // 1. Select the eligible (run_id, workflow, status). One pass; the JSON blob is never parsed.
+    let select = format!("SELECT run_id, workflow, status FROM runs WHERE {where_clause}");
+    let mut stmt = db(conn.prepare(&select))?;
+    let eligible: Vec<(String, String, String)> = db(db(stmt
+        .query_map(params_from_iter(&binds), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }))?
+    .collect::<rusqlite::Result<Vec<_>>>())?;
+
+    // Aggregate per (workflow, status) for the report and the tally upsert.
+    let mut per: IndexMap<(String, String), u64> = IndexMap::new();
+    let mut run_ids = Vec::with_capacity(eligible.len());
+    for (id, workflow, status) in &eligible {
+        *per.entry((workflow.clone(), status.clone())).or_default() += 1;
+        if let Ok(uuid) = uuid::Uuid::parse_str(id) {
+            run_ids.push(RunId(uuid));
+        }
+    }
+    let per_workflow: Vec<PrunedCount> = per
+        .iter()
+        .map(|((workflow, status), count)| PrunedCount {
+            workflow: workflow.clone(),
+            status: status.clone(),
+            count: *count,
+        })
+        .collect();
+    let runs_pruned = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
+
+    if dry_run || eligible.is_empty() {
+        return Ok(PruneReport {
+            runs_pruned,
+            events_pruned: 0,
+            per_workflow,
+            run_ids,
+            dry_run,
+        });
+    }
+
+    // 2. Delete (and tally) atomically. The eligible ids drive both deletes.
+    let ids: Vec<&String> = eligible.iter().map(|(id, _, _)| id).collect();
+    let id_ph = placeholders(ids.len());
+    db(conn.execute_batch("BEGIN"))?;
+    let applied = (|| -> rusqlite::Result<usize> {
+        // Fold counts into the persistent tally BEFORE deleting, so `live + pruned` is preserved.
+        for ((workflow, status), count) in &per {
+            conn.execute(
+                "INSERT INTO pruned_counts(workflow, status, pruned) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workflow, status) DO UPDATE SET pruned = pruned + ?3",
+                params![workflow, status, i64::try_from(*count).unwrap_or(i64::MAX)],
+            )?;
+        }
+        let events_pruned = conn.execute(
+            &format!("DELETE FROM events WHERE run_id IN ({id_ph})"),
+            params_from_iter(&ids),
+        )?;
+        // Re-apply the terminal predicate on the runs delete (defence in depth: a row that
+        // flipped non-terminal between the SELECT and now is left alone).
+        let run_binds = ids.iter().map(|s| (*s).clone()).chain(terminal.clone());
+        conn.execute(
+            &format!("DELETE FROM runs WHERE run_id IN ({id_ph}) AND status IN ({in_terminal})"),
+            params_from_iter(run_binds),
+        )?;
+        Ok(events_pruned)
+    })();
+    let events_pruned = match applied {
+        Ok(n) => {
+            db(conn.execute_batch("COMMIT"))?;
+            u64::try_from(n).unwrap_or(u64::MAX)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(StoreError::Backend(format!("prune failed: {e}")));
+        }
+    };
+
+    Ok(PruneReport {
+        runs_pruned,
+        events_pruned,
+        per_workflow,
+        run_ids,
+        dry_run: false,
+    })
+}
+
+/// `?,?,…` — `n` SQL placeholders for an `IN (...)` clause.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",")
 }
 
 #[cfg(test)]
@@ -429,5 +614,302 @@ mod tests {
             .query_row("PRAGMA synchronous", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sync, 1, "1 == NORMAL, the WAL-recommended default");
+    }
+
+    // ---- retention / prune ----
+
+    use crate::traits::PrunePolicy;
+    use chrono::Duration;
+
+    fn at(workflow: &str, status: RunStatus, updated: chrono::DateTime<Utc>) -> RunState {
+        let mut s = run_state(status);
+        s.workflow = WorkflowId::new(workflow);
+        s.updated_at = updated;
+        s
+    }
+
+    /// The terminal-status string set the prune predicate is built from must be EXACTLY the
+    /// terminal `RunStatus` variants — guards against the safety predicate drifting.
+    #[test]
+    fn terminal_status_set_is_exactly_the_terminal_variants() {
+        let mut set = super::terminal_statuses();
+        set.sort();
+        assert_eq!(set, ["cancelled", "failed", "succeeded"]);
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_only_terminal_runs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut seeded: Vec<(RunStatus, RunId)> = Vec::new();
+        for st in [
+            RunStatus::Pending,
+            RunStatus::Running,
+            RunStatus::AwaitingApproval,
+            RunStatus::Succeeded,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            let s = at("w", st, now);
+            seeded.push((st, s.run_id));
+            store.checkpoint(&s).await.unwrap();
+        }
+        // The most aggressive count policy (keep 0 per workflow) — age-independent.
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(0),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.runs_pruned, 3,
+            "only the 3 terminal runs are prunable"
+        );
+
+        for (st, id) in &seeded {
+            let present = store.load_run(*id).await.unwrap().is_some();
+            assert_eq!(
+                present,
+                !st.is_terminal(),
+                "{st:?} should {} pruning",
+                if st.is_terminal() {
+                    "NOT survive"
+                } else {
+                    "survive"
+                }
+            );
+        }
+        // load_incomplete is unchanged (pending+running still there; awaiting parked as before).
+        assert_eq!(store.load_incomplete().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn prune_never_touches_an_old_awaiting_approval_gate() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let ancient = at(
+            "w",
+            RunStatus::AwaitingApproval,
+            Utc::now() - Duration::days(365),
+        );
+        let id = ancient.run_id;
+        store.checkpoint(&ancient).await.unwrap();
+        // A year-old paused gate is FAR past any age limit — but it must never be pruned.
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    max_age: Some(Duration::days(1)),
+                    keep_last: Some(0),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 0);
+        assert!(
+            store.load_run(id).await.unwrap().is_some(),
+            "the indefinite-wait gate survives"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_keep_last_keeps_the_newest_per_workflow() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        let mut newest = Vec::new();
+        for i in 0..5 {
+            let s = at("a", RunStatus::Succeeded, now - Duration::minutes(i));
+            if i < 2 {
+                newest.push(s.run_id); // i=0,1 are the two most recent
+            }
+            store.checkpoint(&s).await.unwrap();
+        }
+        store
+            .checkpoint(&at("b", RunStatus::Succeeded, now))
+            .await
+            .unwrap();
+
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(2),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.runs_pruned, 3,
+            "a: 5 → keep 2, prune 3; b: 1 → keep all"
+        );
+        for id in &newest {
+            assert!(
+                store.load_run(*id).await.unwrap().is_some(),
+                "newest-2 of a survive"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_odin_runs_total_monotonic_via_the_tally() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        for i in 0..3 {
+            store
+                .checkpoint(&at("a", RunStatus::Succeeded, now - Duration::minutes(i)))
+                .await
+                .unwrap();
+        }
+        let total = |m: &crate::traits::StoreMetrics| {
+            m.runs
+                .iter()
+                .find(|r| r.workflow == "a" && r.status == "succeeded")
+                .map_or(0, |r| r.count)
+        };
+        assert_eq!(total(&store.metrics().await.unwrap()), 3);
+
+        // Prune 2 of the 3 — the counter must NOT drop (live 1 + pruned tally 2 == 3).
+        store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(1),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            total(&store.metrics().await.unwrap()),
+            3,
+            "odin_runs_total must stay monotonic across a prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_removes_events_and_dry_run_changes_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let run = at("w", RunStatus::Succeeded, Utc::now());
+        let id = run.run_id;
+        store.checkpoint(&run).await.unwrap();
+        store
+            .append_event(id, &RunEvent::RunStarted { at: Utc::now() })
+            .await
+            .unwrap();
+        store
+            .append_event(
+                id,
+                &RunEvent::RunFinished {
+                    status: RunStatus::Succeeded,
+                    at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let survivor = at("w", RunStatus::Running, Utc::now());
+        store.checkpoint(&survivor).await.unwrap();
+        store
+            .append_event(survivor.run_id, &RunEvent::RunStarted { at: Utc::now() })
+            .await
+            .unwrap();
+
+        // Dry run: reports the eligible run but deletes nothing.
+        let dry = store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(0),
+                    ..PrunePolicy::default()
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dry.runs_pruned, 1);
+        assert!(dry.dry_run);
+        assert!(
+            store.load_run(id).await.unwrap().is_some(),
+            "dry run deletes nothing"
+        );
+        assert_eq!(store.events(id).await.unwrap().len(), 2);
+
+        // Real prune: the terminal run + its events go; the running run + its event remain.
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(0),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 1);
+        assert_eq!(report.events_pruned, 2);
+        assert!(store.load_run(id).await.unwrap().is_none());
+        assert_eq!(
+            store.events(id).await.unwrap().len(),
+            0,
+            "events of a pruned run are gone"
+        );
+        assert_eq!(
+            store.events(survivor.run_id).await.unwrap().len(),
+            1,
+            "events of a survivor remain"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_age_based_prunes_old_keeps_recent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let old = at("w", RunStatus::Failed, Utc::now() - Duration::days(90));
+        let recent = at("w", RunStatus::Failed, Utc::now() - Duration::hours(1));
+        store.checkpoint(&old).await.unwrap();
+        store.checkpoint(&recent).await.unwrap();
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    max_age: Some(Duration::days(30)),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 1);
+        assert!(
+            store.load_run(old.run_id).await.unwrap().is_none(),
+            "90d-old run pruned"
+        );
+        assert!(
+            store.load_run(recent.run_id).await.unwrap().is_some(),
+            "1h-old run kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_with_a_noop_policy_deletes_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .checkpoint(&at("w", RunStatus::Succeeded, Utc::now()))
+            .await
+            .unwrap();
+        let report = store.prune(&PrunePolicy::default(), false).await.unwrap();
+        assert_eq!(report.runs_pruned, 0);
+        assert_eq!(
+            store
+                .metrics()
+                .await
+                .unwrap()
+                .runs
+                .iter()
+                .map(|r| r.count)
+                .sum::<u64>(),
+            1
+        );
     }
 }

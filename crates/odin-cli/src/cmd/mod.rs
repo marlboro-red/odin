@@ -2,5 +2,6 @@
 
 pub(crate) mod approval;
 pub(crate) mod inspect;
+pub(crate) mod prune;
 pub(crate) mod run;
 pub(crate) mod validate;

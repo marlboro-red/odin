@@ -127,8 +127,9 @@ pub use traits::{Action, Provider, Store, Trigger, Workspace};
 // `odin_core::` and `odin_core::traits::`).
 #[cfg(feature = "runtime")]
 pub use traits::{
-    AcquireCtx, ActionCtx, ActionOutcome, CancelToken, InvocationCtx, InvocationOutcome, RunEvent,
-    RunState, RunStatusCount, StepState, StoreMetrics, TriggerEvent, WorkspaceHandle,
+    AcquireCtx, ActionCtx, ActionOutcome, CancelToken, InvocationCtx, InvocationOutcome,
+    PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState, RunStatusCount, StepState,
+    StoreMetrics, TriggerEvent, WorkspaceHandle,
 };
 #[cfg(feature = "runtime")]
 pub use workspace::{SlotPoolWorkspace, WorktreeWorkspace};
