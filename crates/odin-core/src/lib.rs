@@ -93,14 +93,16 @@ pub mod traits;
 #[cfg(feature = "runtime")]
 pub mod workspace;
 
-pub use api::{RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus};
+pub use api::{
+    ApprovalDecision, Decision, RunInput, RunStatus, RunSummary, SideEffect, StepResult, StepStatus,
+};
 pub use error::{
     ActionError, Error, ProviderError, Result, StoreError, TriggerError, WorkspaceError,
 };
 pub use ids::{ArtifactName, GateName, ParamName, ProviderRef, RunId, StepId, WorkflowId};
 pub use ir::{
-    Backoff, ParamSpec, ParamType, ResetMode, RetrySpec, SchemaVersion, Step, StepKind, Workflow,
-    WorkspaceConfig,
+    ApprovalStep, Backoff, ParamSpec, ParamType, ResetMode, RetrySpec, SchemaVersion, Step,
+    StepKind, Workflow, WorkspaceConfig,
 };
 pub use usage::Usage;
 pub use validate::{

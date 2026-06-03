@@ -106,6 +106,9 @@ pub enum DiagCode {
     /// `run:` step or a gate); a webhook-supplied payload reaches `sh -c` unescaped, an
     /// injection risk. Map the fields you trust into typed `params` instead (warning).
     TriggerIntoShell,
+    /// ODIN032 — a workflow with an `approval` step must be `durable: true`; a paused gate is
+    /// unresumable without persistence.
+    ApprovalRequiresDurable,
 }
 
 impl DiagCode {
@@ -144,6 +147,7 @@ impl DiagCode {
             DiagCode::DynamicTemplateRef => "ODIN029",
             DiagCode::ParamDefaultType => "ODIN030",
             DiagCode::TriggerIntoShell => "ODIN031",
+            DiagCode::ApprovalRequiresDurable => "ODIN032",
         }
     }
 
@@ -343,13 +347,14 @@ mod tests {
             DiagCode::DynamicTemplateRef,
             DiagCode::ParamDefaultType,
             DiagCode::TriggerIntoShell,
+            DiagCode::ApprovalRequiresDurable,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 31);
+        assert_eq!(seen.len(), 32);
     }
 
     #[test]

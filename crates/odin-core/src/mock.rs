@@ -182,6 +182,7 @@ mod tests {
             steps: IndexMap::new(),
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
             input: RunInput::manual(),
             workspace: None,
             base_commit: None,

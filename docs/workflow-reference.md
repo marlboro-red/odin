@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN031`).
+(`ODIN001`–`ODIN032`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -84,16 +84,17 @@ defaults:
 
 ## Steps
 
-A step is exactly one of three **kinds**, chosen by which key it carries:
+A step is exactly one of four **kinds**, chosen by which key it carries:
 
 | Kind | Key | Body runs |
 |------|-----|-----------|
 | **provider** | `provider:` | a coding-agent CLI (`claude` / `codex` / `copilot`, or your own) with a rendered prompt |
 | **run** | `run:` | a shell command line in the step's working directory |
 | **action** | `action:` | a registered named side-effect (e.g. `github.open_pr`) |
+| **approval** | `approval:` | nothing — it **pauses** the run for a human to approve or reject ([below](#approval-step)) |
 
 Declaring zero or more than one kind is a **parse error**, as is putting a provider-only key
-(`prompt`/`prompt_file`) on a `run`/`action` step, or `with:` on a non-action step.
+(`prompt`/`prompt_file`) on a `run`/`action`/`approval` step, or `with:` on a non-action step.
 
 ### Common step fields (all kinds)
 
@@ -141,6 +142,29 @@ the step's working directory.
 ```
 
 Built-in actions: `shell.exec`, `git.commit`, `git.push`, `github.open_pr`.
+
+### Approval step
+
+A **human-in-the-loop gate**: the run *pauses* here (status `awaiting-approval`) until a person
+approves or rejects it — letting you run agents unattended while keeping a human in control of
+the risky, outward-facing step.
+
+```yaml
+- id: gate
+  approval:
+    message: "Review the diff, then approve to push."   # shown to the approver (optional, templated)
+  depends_on: [review]
+- id: push
+  action: git.push                                       # only runs once the gate is approved
+  depends_on: [gate]
+```
+
+The workflow must be `durable: true` ([ODIN032](#odin032)) — a pause is resumed from the store.
+Decide it with `odin approve`/`odin reject` (see the [CLI reference](cli.md)) or the daemon's
+`POST /approve`. **Approve** → the gate passes and downstream proceeds. **Reject** → the gate
+*fails* (downstream skips), and the reviewer's note is surfaced as `steps.<gate>.outputs.feedback`
+— the input to act on for a re-run. A paused run is **not** crash-resumed; it waits indefinitely
+for a decision.
 
 ### Gates
 
@@ -347,7 +371,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN031`)
+## Diagnostics catalogue (`ODIN001`–`ODIN032`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -385,6 +409,7 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin029"></a>ODIN029 | **warning** | A template accesses a checked root (`params`/`steps`/`artifacts`) with **subscript** syntax (`steps["a"]`); only dot notation is statically checked, so the reference escapes the unknown-ref / upstream checks. |
 | <a id="odin030"></a>ODIN030 | error | A param's `default` value does not match its declared `type`. |
 | <a id="odin031"></a>ODIN031 | **warning** | An untrusted `trigger.*` value is interpolated into a shell command — a `run:` step, a gate, or `shell.exec`'s `command` — so a webhook payload reaches `sh -c` unescaped (injection risk). Map the fields you trust into typed `params`.¹ |
+| <a id="odin032"></a>ODIN032 | error | A workflow with an `approval` gate is not `durable` — a paused gate is persisted and resumed from the store, so it can't be approved without durability. |
 
 ¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 

@@ -100,6 +100,45 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Approve a run paused at an `approval` gate and resume it.
+    Approve(ApprovalCmd),
+    /// Reject a run paused at an `approval` gate (failing the gate with `--note` feedback).
+    Reject(ApprovalCmd),
+}
+
+/// Shared arguments for `approve` / `reject`.
+#[derive(clap::Args)]
+struct ApprovalCmd {
+    /// The run id (UUID) of the paused run.
+    run_id: String,
+    /// The workflow file the run was started from (needed to resume).
+    #[arg(long)]
+    workflow: PathBuf,
+    /// Who is approving/rejecting (recorded for the audit trail).
+    #[arg(long, default_value = "cli")]
+    by: String,
+    /// A note: the feedback to act on. **Required** when rejecting.
+    #[arg(long)]
+    note: Option<String>,
+    /// The git repository whose `.odin/state.db` to use. Defaults to the current dir.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Path to the run-state SQLite database. Overrides `--repo`.
+    #[arg(long)]
+    db: Option<PathBuf>,
+}
+
+impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
+    fn from(c: ApprovalCmd) -> Self {
+        Self {
+            run_id: c.run_id,
+            workflow: c.workflow,
+            by: c.by,
+            note: c.note,
+            repo: c.repo,
+            db: c.db,
+        }
+    }
 }
 
 /// Maps a command result to a process exit code, printing any error.
@@ -170,5 +209,7 @@ fn main() -> ExitCode {
             db,
             json,
         } => finish(cmd::inspect::logs(&run_id, repo, db, json)),
+        Command::Approve(c) => finish(cmd::approval::approve(c.into())),
+        Command::Reject(c) => finish(cmd::approval::reject(c.into())),
     }
 }

@@ -31,6 +31,7 @@ fn status_str(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Pending => "pending",
         RunStatus::Running => "running",
+        RunStatus::AwaitingApproval => "awaiting-approval",
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",

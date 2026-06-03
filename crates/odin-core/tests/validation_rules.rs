@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN031`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN032`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -328,6 +328,22 @@ fn odin031_does_not_fire_for_trigger_in_a_prompt() {
         "name: x\nsteps:\n  - {id: a, provider: claude, prompt: \"{{ trigger.issue.title }}\"}\n",
     );
     assert!(!r.contains(DiagCode::TriggerIntoShell), "got:\n{r}");
+}
+
+#[test]
+fn odin032_approval_step_requires_durable() {
+    // A pausable approval gate is unresumable without persistence → must be durable.
+    // (`durable` defaults to true, so the mistake is explicitly setting it false.)
+    assert_fires(
+        "name: x\ndurable: false\nsteps:\n  - {id: g, approval: {message: ok?}}\n",
+        DiagCode::ApprovalRequiresDurable,
+    );
+}
+
+#[test]
+fn odin032_does_not_fire_for_a_durable_approval_workflow() {
+    let r = report("name: x\ndurable: true\nsteps:\n  - {id: g, approval: {message: ok?}}\n");
+    assert!(!r.contains(DiagCode::ApprovalRequiresDurable), "got:\n{r}");
 }
 
 #[test]

@@ -431,6 +431,27 @@ pub(crate) fn retry_fallback(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     }
 }
 
+/// ODIN032 — a workflow with an `approval` gate must be `durable`: a paused gate is persisted
+/// and resumed from the store, so without durability the run could never be approved/resumed.
+pub(crate) fn approval_durable(wf: &Workflow, d: &mut Vec<Diagnostic>) {
+    if wf.durable {
+        return;
+    }
+    for (i, s) in wf.steps.iter().enumerate() {
+        if matches!(s.kind, StepKind::Approval(_)) {
+            d.push(Diagnostic::new(
+                DiagCode::ApprovalRequiresDurable,
+                format!("{}.approval", step_ptr(i)),
+                format!(
+                    "step {:?} is an approval gate, so the workflow must set `durable: true` \
+                     (a paused gate can't be resumed without persistence)",
+                    s.id.as_str()
+                ),
+            ));
+        }
+    }
+}
+
 /// ODIN026 — warn when the workflow targets a newer schema minor than this engine.
 pub(crate) fn schema(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     if wf.schema_version.minor > crate::ir::CURRENT_SCHEMA_MINOR {

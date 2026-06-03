@@ -74,10 +74,10 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
             } else {
                 print_summary(&summary);
             }
-            Ok(if summary.status == RunStatus::Succeeded {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
+            // A run paused for approval isn't a failure — it's awaiting input.
+            Ok(match summary.status {
+                RunStatus::Succeeded | RunStatus::AwaitingApproval => ExitCode::SUCCESS,
+                _ => ExitCode::from(1),
             })
         }
         Err(Error::Validation(report)) => {
@@ -108,15 +108,17 @@ fn glyph(status: StepStatus) -> char {
         StepStatus::Passed => '✓',
         StepStatus::Failed => '✗',
         StepStatus::Skipped => '⊘',
+        StepStatus::AwaitingApproval => '⏸',
         _ => '·',
     }
 }
 
-fn print_summary(summary: &RunSummary) {
-    let status = if summary.status == RunStatus::Succeeded {
-        "succeeded"
-    } else {
-        "failed"
+pub(crate) fn print_summary(summary: &RunSummary) {
+    let status = match summary.status {
+        RunStatus::Succeeded => "succeeded",
+        RunStatus::AwaitingApproval => "awaiting approval",
+        RunStatus::Cancelled => "cancelled",
+        _ => "failed",
     };
     println!("Run {} — {status}", summary.run_id);
     for step in &summary.steps {
@@ -129,6 +131,16 @@ fn print_summary(summary: &RunSummary) {
             if let Some(reason) = step.error.as_deref().and_then(|e| e.lines().next()) {
                 println!("      ↳ {reason}");
             }
+        }
+        // For a paused gate, show its message and how to act on it.
+        if step.status == StepStatus::AwaitingApproval {
+            if let Some(msg) = step.outputs.get("message").and_then(|v| v.as_str()) {
+                println!("      ↳ {msg}");
+            }
+            println!(
+                "      ↳ approve: `odin approve {} --workflow <file> --by <you>`",
+                summary.run_id
+            );
         }
     }
     println!(

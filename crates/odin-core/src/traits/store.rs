@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::WorkspaceHandle;
-use crate::api::{RunInput, RunStatus, SideEffect, StepStatus};
+use crate::api::{ApprovalDecision, RunInput, RunStatus, SideEffect, StepStatus};
 use crate::error::StoreError;
 use crate::ids::{ArtifactName, RunId, StepId, WorkflowId};
 use crate::usage::Usage;
@@ -89,6 +89,11 @@ pub struct RunState {
     pub provider_versions: IndexMap<String, String>,
     /// The inputs the run started with (deterministic resume & audit).
     pub input: RunInput,
+    /// Human decisions recorded for `approval` gates, keyed by step id. Consulted when the
+    /// engine reaches a gate on resume: an approved gate proceeds, a rejected one fails
+    /// (carrying the note as feedback). Empty until a gate is decided.
+    #[serde(default)]
+    pub approvals: IndexMap<StepId, ApprovalDecision>,
     /// Workspace lease in use, to reattach on resume.
     pub workspace: Option<WorkspaceHandle>,
     /// The commit the run's workspace started at; `DIFF` and snapshots are taken against it.

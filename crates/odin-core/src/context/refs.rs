@@ -157,6 +157,18 @@ fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
             }
         }
         StepKind::Run(r) => push(r.run.clone(), format!("{}.run", step_ptr(i)), false, true),
+        StepKind::Approval(a) => {
+            // The approver message is templated (it can surface `{{ steps… }}` context to the
+            // human) but is shown in a UI, never a shell — so it is not an injection sink.
+            if let Some(msg) = &a.message {
+                push(
+                    msg.clone(),
+                    format!("{}.approval.message", step_ptr(i)),
+                    false,
+                    false,
+                );
+            }
+        }
     }
     for (name, cmd) in &s.gates {
         push(
