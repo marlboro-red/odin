@@ -330,6 +330,7 @@ fn terminal_statuses() -> Vec<String> {
 /// counts into `pruned_counts` and deletes their `runs` + `events` rows — all in one
 /// transaction so a crash can't strand events or double-count the tally. Runs under the held
 /// connection lock.
+#[allow(clippy::too_many_lines)]
 fn prune_locked(
     conn: &Connection,
     policy: &PrunePolicy,
@@ -349,9 +350,17 @@ fn prune_locked(
     }
     if let Some(max_age) = policy.max_age {
         // `updated_at` (a terminal run's completion time) is the indexed column; compare RFC3339
-        // strings, which sort chronologically since we always write a `+00:00` offset.
-        conds.push("updated_at < ?".to_owned());
-        binds.push((Utc::now() - max_age).to_rfc3339());
+        // strings, which sort chronologically since we always write a `+00:00` offset. Use the
+        // CHECKED subtraction: an absurdly large `max_age` (past chrono's representable range)
+        // would otherwise panic. An un-representable cutoff means "older than ~infinity ago" =
+        // nothing qualifies, so the age limit matches no rows (a false predicate).
+        match Utc::now().checked_sub_signed(max_age) {
+            Some(cutoff) => {
+                conds.push("updated_at < ?".to_owned());
+                binds.push(cutoff.to_rfc3339());
+            }
+            None => conds.push("0 = 1".to_owned()),
+        }
     }
     if let Some(keep_last) = policy.keep_last {
         // Keep the newest `keep_last` terminal runs PER workflow; the rest are eligible. The
@@ -417,16 +426,21 @@ fn prune_locked(
                 params![workflow, status, i64::try_from(*count).unwrap_or(i64::MAX)],
             )?;
         }
+        // BOTH deletes re-apply the terminal predicate (defence in depth: a selected row that
+        // flipped non-terminal between the SELECT and now is left untouched — both its row AND
+        // its events — so a surviving run never loses its audit log). `terminal` is permanent
+        // today, so this is belt-and-suspenders, but it keeps the two deletes provably symmetric.
+        let with_terminal = || ids.iter().map(|s| (*s).clone()).chain(terminal.clone());
         let events_pruned = conn.execute(
-            &format!("DELETE FROM events WHERE run_id IN ({id_ph})"),
-            params_from_iter(&ids),
+            &format!(
+                "DELETE FROM events WHERE run_id IN \
+                 (SELECT run_id FROM runs WHERE run_id IN ({id_ph}) AND status IN ({in_terminal}))"
+            ),
+            params_from_iter(with_terminal()),
         )?;
-        // Re-apply the terminal predicate on the runs delete (defence in depth: a row that
-        // flipped non-terminal between the SELECT and now is left alone).
-        let run_binds = ids.iter().map(|s| (*s).clone()).chain(terminal.clone());
         conn.execute(
             &format!("DELETE FROM runs WHERE run_id IN ({id_ph}) AND status IN ({in_terminal})"),
-            params_from_iter(run_binds),
+            params_from_iter(with_terminal()),
         )?;
         Ok(events_pruned)
     })();
@@ -911,5 +925,167 @@ mod tests {
                 .sum::<u64>(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn prune_workflow_filter_scopes_to_one_workflow() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        for _ in 0..2 {
+            store
+                .checkpoint(&at("a", RunStatus::Succeeded, now))
+                .await
+                .unwrap();
+            store
+                .checkpoint(&at("b", RunStatus::Succeeded, now))
+                .await
+                .unwrap();
+        }
+        // Prune all of workflow "a" only; "b" is untouched.
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(0),
+                    workflow: Some(WorkflowId::new("a")),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 2);
+        assert!(report.per_workflow.iter().all(|c| c.workflow == "a"));
+        let live: u64 = store
+            .metrics()
+            .await
+            .unwrap()
+            .runs
+            .iter()
+            .filter(|r| r.workflow == "b")
+            .map(|r| r.count)
+            .sum();
+        // "b" still has 2 runs live (and the counter for "a" is preserved via the tally).
+        assert_eq!(
+            store
+                .recent(10)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.workflow.as_str() == "b")
+                .count(),
+            2
+        );
+        assert_eq!(live, 2);
+    }
+
+    #[tokio::test]
+    async fn prune_age_and_count_combined_select_the_intersection() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        // 5 runs of ages 100d,80d,60d,2d,1d. max_age=30d marks {100,80,60} old; keep_last=2
+        // keeps the newest two {1d,2d}. AND ⇒ prune only runs that are BOTH old AND outside the
+        // newest 2 ⇒ {100d,80d,60d} (3). The 2d/1d are recent AND kept; 60d is old AND not kept.
+        let ages = [100, 80, 60, 2, 1];
+        let mut survivors = Vec::new();
+        for d in ages {
+            let s = at("w", RunStatus::Succeeded, now - Duration::days(d));
+            if d <= 2 {
+                survivors.push(s.run_id);
+            }
+            store.checkpoint(&s).await.unwrap();
+        }
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    max_age: Some(Duration::days(30)),
+                    keep_last: Some(2),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report.runs_pruned, 3,
+            "only the 3 runs that are BOTH old and unkept"
+        );
+        for id in &survivors {
+            assert!(store.load_run(*id).await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn prune_does_not_panic_on_an_absurd_age_and_prunes_nothing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store
+            .checkpoint(&at("w", RunStatus::Succeeded, Utc::now()))
+            .await
+            .unwrap();
+        // A max_age past chrono's representable range: the checked cutoff is None ⇒ nothing is
+        // "that old" ⇒ prune nothing, no panic.
+        let huge = Duration::weeks(520_000 * 52); // ~520k years
+        let report = store
+            .prune(
+                &PrunePolicy {
+                    max_age: Some(huge),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 0);
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_v2_database_to_v3_without_data_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        // Create a current DB, seed a run, then simulate a pre-v3 database (drop the v3 table and
+        // roll user_version back to 2).
+        let store = SqliteStore::open(&path).unwrap();
+        let run = run_state(RunStatus::Succeeded);
+        let id = run.run_id;
+        store.checkpoint(&run).await.unwrap();
+        drop(store);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch("DROP TABLE pruned_counts;").unwrap();
+            conn.pragma_update(None, "user_version", 2_i64).unwrap();
+        }
+        // Reopen: the v2→v3 migration must re-create pruned_counts and keep the existing run.
+        let store = SqliteStore::open(&path).unwrap();
+        let v: i64 = {
+            let conn = store.conn.lock().await;
+            conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(v, i64::try_from(super::MIGRATIONS.len()).unwrap());
+        assert!(
+            store.load_run(id).await.unwrap().is_some(),
+            "the run survived the upgrade"
+        );
+        // pruned_counts exists again, so metrics + prune work (don't error on the missing table).
+        assert_eq!(
+            store
+                .metrics()
+                .await
+                .unwrap()
+                .runs
+                .iter()
+                .map(|r| r.count)
+                .sum::<u64>(),
+            1
+        );
+        store
+            .prune(
+                &PrunePolicy {
+                    keep_last: Some(0),
+                    ..PrunePolicy::default()
+                },
+                false,
+            )
+            .await
+            .unwrap();
     }
 }
