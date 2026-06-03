@@ -2,7 +2,7 @@
 //! counterpart to the web dashboard. `--watch` live-refreshes; `--json` emits the same
 //! [`RunView`] shape as the daemon's `/api/runs`.
 
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -60,7 +60,9 @@ async fn load(store: &SqliteStore, limit: usize) -> anyhow::Result<Vec<RunView>>
 async fn watch(store: &SqliteStore, limit: usize) -> anyhow::Result<()> {
     loop {
         let views = load(store, limit).await?;
-        print!("\x1b[2J\x1b[H"); // clear screen + cursor home
+        if std::io::stdout().is_terminal() {
+            print!("\x1b[2J\x1b[H"); // clear screen + cursor home (only on a real terminal)
+        }
         render(&views);
         println!("\n(watching — ctrl-c to exit)");
         std::io::stdout().flush().ok();
