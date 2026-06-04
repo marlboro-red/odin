@@ -7,6 +7,10 @@ const ISSUE_TO_PR: &str = include_str!("../../../examples/issue-to-pr.yaml");
 const FIX_FLAKY: &str = include_str!("../../../examples/fix-flaky-test.yaml");
 const NIGHTLY: &str = include_str!("../../../examples/nightly-maintenance.yaml");
 const MULTI_AGENT: &str = include_str!("../../../examples/multi-agent-eval.yaml");
+const GATED_DEPLOY: &str = include_str!("../../../examples/gated-deploy.yaml");
+const ITERATE: &str = include_str!("../../../examples/iterate.yaml");
+const SELF_CORRECT: &str = include_str!("../../../examples/self-correct.yaml");
+const TRIAGE: &str = include_str!("../../../examples/triage.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -133,4 +137,64 @@ fn fix_flaky_round_trip_preserves_rich_content() {
     assert_eq!(report.warning_count(), 2);
     assert!(report.contains(DiagCode::InertFallbackProvider));
     assert!(report.contains(DiagCode::SlotPoolNotDurable));
+}
+
+/// Parses, validates clean, and confirms the headline feature of each remaining shipped example,
+/// so a stale or broken example file fails CI rather than misleading a reader.
+#[test]
+fn gated_deploy_validates_and_gates_on_approval() {
+    use odin_core::StepKind;
+    let wf = Workflow::from_yaml_str(GATED_DEPLOY).expect("parses");
+    assert!(
+        validate_source(GATED_DEPLOY, &wf, &KnownNames::builtin()).is_empty(),
+        "gated-deploy should validate clean"
+    );
+    assert!(wf.durable, "an approval workflow must be durable (ODIN032)");
+    assert!(
+        wf.steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Approval(_))),
+        "gated-deploy must demonstrate an approval gate"
+    );
+}
+
+#[test]
+fn iterate_validates_and_has_a_loop() {
+    use odin_core::StepKind;
+    let wf = Workflow::from_yaml_str(ITERATE).expect("parses");
+    assert!(
+        validate_source(ITERATE, &wf, &KnownNames::builtin()).is_empty(),
+        "iterate should validate clean"
+    );
+    assert!(
+        wf.steps.iter().any(|s| matches!(s.kind, StepKind::Loop(_))),
+        "iterate must demonstrate a loop"
+    );
+}
+
+#[test]
+fn self_correct_validates_and_retries_with_feedback() {
+    let wf = Workflow::from_yaml_str(SELF_CORRECT).expect("parses");
+    assert!(
+        validate_source(SELF_CORRECT, &wf, &KnownNames::builtin()).is_empty(),
+        "self-correct should validate clean"
+    );
+    assert!(
+        wf.steps.iter().any(|s| s.retry.max > 0),
+        "self-correct must demonstrate a retrying step"
+    );
+}
+
+#[test]
+fn triage_validates_and_branches_on_a_case() {
+    use odin_core::StepKind;
+    let wf = Workflow::from_yaml_str(TRIAGE).expect("parses");
+    assert!(
+        validate_source(TRIAGE, &wf, &KnownNames::builtin()).is_empty(),
+        "triage should validate clean"
+    );
+    assert!(
+        wf.steps.iter().any(|s| matches!(s.kind, StepKind::Case(_))),
+        "triage must demonstrate a case selector"
+    );
 }

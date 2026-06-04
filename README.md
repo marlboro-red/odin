@@ -84,8 +84,12 @@ The snippet above is **abridged** — the full file adds `git.commit` + `git.pus
 `open_pr`. See [`examples/`](examples/) for the fully-annotated workflows:
 [`issue-to-pr.yaml`](examples/issue-to-pr.yaml) (the canonical flow, six steps),
 [`fix-flaky-test.yaml`](examples/fix-flaky-test.yaml) (a kitchen-sink of step/trigger kinds),
-[`nightly-maintenance.yaml`](examples/nightly-maintenance.yaml) (cron-served), and
-[`multi-agent-eval.yaml`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out).
+[`nightly-maintenance.yaml`](examples/nightly-maintenance.yaml) (cron-served),
+[`multi-agent-eval.yaml`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out),
+[`gated-deploy.yaml`](examples/gated-deploy.yaml) (a human `approval:` gate),
+[`self-correct.yaml`](examples/self-correct.yaml) (single-step `retry` with feedback),
+[`iterate.yaml`](examples/iterate.yaml) (a multi-step `loop:` until a check passes), and
+[`triage.yaml`](examples/triage.yaml) (`case:` branching with a merge-back).
 
 ## Why "library-first"?
 
