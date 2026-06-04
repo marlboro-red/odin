@@ -287,8 +287,12 @@ pub async fn run_process(
     // the stdout/stderr fd open, and `read_to_end` would otherwise block forever —
     // defeating the very timeout/cancel that just fired.
     let killed = timed_out || cancelled;
-    let stdout = collect(out_task, killed).await;
-    let stderr = collect(err_task, killed).await;
+    // Drain both pipes concurrently. After a kill a surviving grandchild (e.g. a `sleep`
+    // forked by `sh -c`, immune to the parent's kill on platforms without process-group
+    // teardown) can hold either fd open for the full `KILL_DRAIN_GRACE`; draining
+    // sequentially would pay that grace twice (~4s), so the call would linger for two grace
+    // windows instead of one after the timeout/cancel already fired.
+    let (stdout, stderr) = tokio::join!(collect(out_task, killed), collect(err_task, killed));
     let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
 
     Ok(ProcessOutput {

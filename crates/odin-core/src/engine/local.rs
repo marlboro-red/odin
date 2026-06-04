@@ -2765,21 +2765,25 @@ steps:
 
     #[tokio::test]
     async fn an_action_honors_the_step_timeout() {
-        // Before the fix the action arm dropped the timeout and ran the full sleep (~5s); now the
-        // step timeout reaches the subprocess and kills it.
+        // Before the fix the action arm dropped the timeout and ran the command to completion;
+        // now the step timeout reaches the subprocess and kills it. The command sleeps 10s under a
+        // 1s timeout: honored, it returns at ~1s + the bounded kill-drain grace (a `sh`-forked
+        // grandchild can hold the pipe up to `KILL_DRAIN_GRACE`); not honored, it runs the full
+        // 10s. The wide gap keeps the `< 6s` bound robust on slow CI runners (incl. Windows, which
+        // has no process-group teardown) while still failing loudly if the timeout is ignored.
         let repo = init_repo().await;
         let eng = engine(
             repo.path(),
             Arc::new(SqliteStore::open_in_memory().unwrap()),
         );
         let wf = parse(
-            "name: w\nworkspace: { type: worktree }\nsteps:\n  - {id: s, action: shell.exec, with: {command: \"sleep 5\"}, timeout: \"1s\"}\n",
+            "name: w\nworkspace: { type: worktree }\nsteps:\n  - {id: s, action: shell.exec, with: {command: \"sleep 10\"}, timeout: \"1s\"}\n",
         );
         let start = std::time::Instant::now();
         let s = eng.run(&wf, RunInput::manual()).await.unwrap();
         assert_eq!(s.status, RunStatus::Failed);
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
+            start.elapsed() < std::time::Duration::from_secs(6),
             "the action timeout was not honored (took {:?})",
             start.elapsed()
         );
