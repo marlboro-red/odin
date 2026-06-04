@@ -325,6 +325,11 @@ retry:
   on_fallback_provider: codex # parsed + validated, but INERT in v1 (ODIN023)
 ```
 
+A step with no `retry:` of its own inherits the workflow [`defaults.retry`](#defaults); a step that
+sets one overrides the default wholesale. (Because `retry: { max: 0 }` is indistinguishable from
+"unset", a step can't *explicitly* opt out of a default — give it any non-default `retry:` to take
+control.)
+
 A plain `retry` re-runs the step *blind* — the next attempt sees exactly the same prompt as
 the first. Set **`feedback`** to close the loop into an **implement → verify → redo** cycle:
 each attempt after the first re-renders the step's prompt with the prior failure available under
