@@ -183,6 +183,10 @@ fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
                 }
             }
         }
+        // The loop body's `until` guard and inner-step templates are checked against a scoped
+        // context (inner ids + the loop node's outer upstreams); that scoped checking lands with
+        // loop execution. Until then a loop step contributes no top-level template refs.
+        StepKind::Loop(_) => {}
     }
     for (name, cmd) in &s.gates {
         push(

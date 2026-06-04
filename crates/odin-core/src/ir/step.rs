@@ -1,8 +1,8 @@
 //! Steps and the exactly-one-of-kind discriminated union.
 //!
 //! A step is one node in the workflow DAG. Its *kind* — provider invocation, built-in
-//! action, shell `run:` hook, human `approval:` gate, or `case:` branch selector — is an
-//! exactly-one-of choice. We deserialize a `Step`
+//! action, shell `run:` hook, human `approval:` gate, `case:` branch selector, or multi-step
+//! `loop:` — is an exactly-one-of choice. We deserialize a `Step`
 //! through a private, `deny_unknown_fields` raw struct and then resolve the kind by
 //! hand, so that:
 //!
@@ -88,6 +88,8 @@ pub enum StepKind {
     /// Conditional branching: a *selector* that records which of N labeled branches to take. The
     /// branch *bodies* are ordinary downstream steps the author gates on `outputs.selected`.
     Case(CaseStep),
+    /// A multi-step loop: iterate the body until a verification `until` condition holds.
+    Loop(LoopStep),
 }
 
 impl StepKind {
@@ -103,6 +105,7 @@ impl StepKind {
         run: Option<String>,
         approval: Option<ApprovalStep>,
         case: Option<CaseStep>,
+        loop_: Option<LoopStep>,
     ) -> Result<Self, String> {
         let count = [
             provider.is_some(),
@@ -110,6 +113,7 @@ impl StepKind {
             run.is_some(),
             approval.is_some(),
             case.is_some(),
+            loop_.is_some(),
         ]
         .into_iter()
         .filter(|b| *b)
@@ -117,14 +121,14 @@ impl StepKind {
         if count == 0 {
             return Err(
                 "step must declare exactly one of `provider:`, `action:`, `run:`, `approval:`, \
-                 or `case:` (found none)"
+                 `case:`, or `loop:` (found none)"
                     .to_owned(),
             );
         }
         if count > 1 {
             return Err(
                 "step declares more than one of `provider:`, `action:`, `run:`, `approval:`, \
-                 `case:` — choose exactly one"
+                 `case:`, `loop:` — choose exactly one"
                     .to_owned(),
             );
         }
@@ -137,6 +141,16 @@ impl StepKind {
                 return Err("`with:` is only valid on `action:` steps".to_owned());
             }
             return Ok(StepKind::Case(case));
+        }
+
+        if let Some(loop_) = loop_ {
+            if prompt.is_some() || prompt_file.is_some() {
+                return Err("`prompt`/`prompt_file` are only valid on `provider:` steps".to_owned());
+            }
+            if with.is_some() {
+                return Err("`with:` is only valid on `action:` steps".to_owned());
+            }
+            return Ok(StepKind::Loop(loop_));
         }
 
         if let Some(provider) = provider {
@@ -249,6 +263,30 @@ pub struct CaseBranch {
     pub when: Option<String>,
 }
 
+/// A multi-step **loop**: iterate the body `steps` as a unit until the `until` condition holds
+/// (or `max` iterations elapse).
+///
+/// The body runs **at least once** (do-while): `until` is evaluated *after* each iteration, so it
+/// can reference an inner step's status (e.g. `until: "steps.test.status == 'passed'"`). Workdir
+/// edits **accumulate** across iterations (iteration N+1 sees N's edits) — unlike single-step
+/// [`RetrySpec`], which rewinds between attempts. Inner step ids are local to the body, must be
+/// globally unique, and may not contain dots; the iteration exposes `loop.counter` (1-based) and
+/// `loop.feedback` (the prior iteration's failure) to templates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct LoopStep {
+    /// Minijinja boolean guard checked after each iteration; the loop stops once it is true. A
+    /// blank `until` is rejected (`ODIN037`).
+    pub until: String,
+    /// Hard cap on iterations — **required**, so a loop is always bounded (a missing cap is a parse
+    /// error). `0` is rejected (`ODIN038`).
+    pub max: u8,
+    /// The body steps, run in dependency order each iteration. Must be non-empty (`ODIN039`).
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
 impl Serialize for StepKind {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap as _;
@@ -278,6 +316,9 @@ impl Serialize for StepKind {
             StepKind::Approval(a) => {
                 m.serialize_entry("approval", a)?;
             }
+            StepKind::Loop(l) => {
+                m.serialize_entry("loop", l)?;
+            }
         }
         m.end()
     }
@@ -304,6 +345,8 @@ struct StepRaw {
     approval: Option<ApprovalStep>,
     #[serde(default)]
     case: Option<CaseStep>,
+    #[serde(default, rename = "loop")]
+    loop_: Option<LoopStep>,
     #[serde(default)]
     artifacts: Artifacts,
     #[serde(default)]
@@ -335,6 +378,7 @@ impl<'de> Deserialize<'de> for Step {
             r.run,
             r.approval,
             r.case,
+            r.loop_,
         )
         .map_err(|msg| D::Error::custom(format!("step \"{}\": {msg}", r.id)))?;
         Ok(Step {
@@ -521,6 +565,76 @@ mod tests {
         let twice = serde_yaml_ng::to_string(&parse(&once).unwrap()).unwrap();
         assert_eq!(once, twice, "case serialization should be idempotent");
         assert!(once.contains("case:") && once.contains("label: bug"));
+    }
+
+    #[test]
+    fn loop_step_parses_with_until_max_and_inner_steps() {
+        let s = parse(
+            "id: fix\nloop:\n  until: \"steps.test.status == 'passed'\"\n  max: 5\n  steps:\n    - {id: edit, run: ./edit}\n    - {id: test, run: ./test}\n",
+        )
+        .unwrap();
+        let StepKind::Loop(l) = s.kind else {
+            panic!("expected a loop step");
+        };
+        assert_eq!(l.until, "steps.test.status == 'passed'");
+        assert_eq!(l.max, 5);
+        assert_eq!(l.steps.len(), 2);
+        assert_eq!(l.steps[0].id.as_str(), "edit");
+        // Inner steps reuse the full Step deserialize (exactly-one-of-kind, etc.).
+        assert!(matches!(l.steps[1].kind, StepKind::Run(_)));
+    }
+
+    #[test]
+    fn loop_step_round_trips_through_yaml() {
+        let yaml = "id: fix\nloop:\n  until: \"steps.test.status == 'passed'\"\n  max: 3\n  steps:\n    - {id: edit, run: ./edit}\n";
+        let once = serde_yaml_ng::to_string(&parse(yaml).unwrap()).unwrap();
+        let twice = serde_yaml_ng::to_string(&parse(&once).unwrap()).unwrap();
+        assert_eq!(once, twice, "loop serialization should be idempotent");
+        assert!(once.contains("loop:") && once.contains("max: 3"));
+    }
+
+    #[test]
+    fn loop_requires_a_max_cap() {
+        // `max` is non-Option, so a missing cap is a parse error (a loop is always bounded).
+        let err = parse("id: x\nloop:\n  until: \"a\"\n  steps:\n    - {id: e, run: ./e}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max"), "got: {err}");
+    }
+
+    #[test]
+    fn loop_requires_an_until() {
+        // `until` is required at parse (a loop must declare its exit condition).
+        let err = parse("id: x\nloop:\n  max: 2\n  steps:\n    - {id: e, run: ./e}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("until"), "got: {err}");
+    }
+
+    #[test]
+    fn loop_max_beyond_u8_is_a_parse_error() {
+        // `max: u8` caps a loop at 255 iterations; a larger value fails at parse, not silently.
+        let err =
+            parse("id: x\nloop:\n  until: \"a\"\n  max: 999\n  steps:\n    - {id: e, run: ./e}\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("max") || err.contains("u8"), "got: {err}");
+    }
+
+    #[test]
+    fn loop_with_another_kind_is_more_than_one_error() {
+        let err = parse("id: x\nrun: ./go\nloop: {until: a, max: 1, steps: []}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than one"), "got: {err}");
+    }
+
+    #[test]
+    fn loop_rejects_provider_only_fields() {
+        let err = parse("id: x\nprompt: hi\nloop: {until: a, max: 1, steps: []}\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prompt"), "got: {err}");
     }
 
     #[test]

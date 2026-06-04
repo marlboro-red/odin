@@ -104,8 +104,8 @@ pub use error::{
 };
 pub use ids::{ArtifactName, GateName, ParamName, ProviderRef, RunId, StepId, WorkflowId};
 pub use ir::{
-    ApprovalStep, Backoff, CaseBranch, CaseStep, FeedbackMode, ParamSpec, ParamType, ResetMode,
-    RetrySpec, SchemaVersion, Step, StepKind, Workflow, WorkspaceConfig,
+    ApprovalStep, Backoff, CaseBranch, CaseStep, FeedbackMode, LoopStep, ParamSpec, ParamType,
+    ResetMode, RetrySpec, SchemaVersion, Step, StepKind, Workflow, WorkspaceConfig,
 };
 pub use usage::Usage;
 pub use validate::{
