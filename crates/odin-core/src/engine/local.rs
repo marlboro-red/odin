@@ -2676,6 +2676,34 @@ steps:
     depends_on: [edit]
 "#;
 
+    /// A deliberately portable end-to-end canary: a single `echo` `run:` step — no path
+    /// interpolation, no fragile shell syntax. Runs wherever a POSIX shell resolves (Unix `sh`,
+    /// Git Bash on Windows), so the Windows CI lane uses it to prove the full
+    /// workflow → engine → shell → git path works there.
+    #[tokio::test]
+    async fn smoke_a_run_step_executes_cross_platform() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: smoke\nworkspace: { type: worktree }\nsteps:\n  - {id: hello, run: \"echo hello\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let hello = s.steps.iter().find(|x| x.id.as_str() == "hello").unwrap();
+        assert_eq!(hello.status, StepStatus::Passed);
+        assert!(
+            hello
+                .outputs
+                .get("stdout")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("hello")
+        );
+    }
+
     #[tokio::test]
     async fn runs_a_workflow_end_to_end() {
         let repo = init_repo().await;
@@ -4112,6 +4140,9 @@ steps:
         // every body run; seeded with 2 lines as if iterations 1-2 ran before the crash.
         let logfile = std::env::temp_dir().join(format!("odin-loop-log-{}", uuid::Uuid::new_v4()));
         std::fs::write(&logfile, "L\nL\n").unwrap();
+        // Forward slashes so the absolute path is a literal in the shell `run:` command — a
+        // backslash is an escape in `sh` (and Windows accepts `/` in paths). No-op on Unix.
+        let logfile_arg = logfile.to_string_lossy().replace('\\', "/");
 
         // Crash state: `fix` is Running with 2 iterations completed; the snapshot is the base
         // commit itself (a valid commit → restore is a no-op, but `start` is set to 2 so the loop
@@ -4150,7 +4181,7 @@ steps:
             artifacts: IndexMap::new(),
             provider_versions: IndexMap::new(),
             approvals: IndexMap::new(),
-            input: RunInput::manual().param("logfile", logfile.to_str().unwrap()),
+            input: RunInput::manual().param("logfile", logfile_arg.as_str()),
             workspace: Some(handle),
             base_commit: Some(base),
             snapshot: None,
