@@ -1,0 +1,62 @@
+# A multi-step self-correcting loop: edit → test → (read failure) → edit again, until the test
+# passes or the iteration cap is hit. This is the multi-step sibling of the single-step
+# feedback-retry in `self-correct.yaml` — use a `loop:` when one round needs more than one step.
+#
+#   odin validate examples/iterate.yaml
+#
+# How the loop works here:
+#   - The `loop:` block runs its body steps each iteration; after the body, `until` is checked
+#     (do-while — the body always runs at least once). When `until` holds, the loop passes; when
+#     `max` iterations elapse without it, the loop fails and its dependents skip.
+#   - `loop.counter` is the 1-based iteration; `loop.feedback` carries the PRIOR iteration's failure
+#     (here the failing `cargo test` output), so the agent can read what broke and fix it.
+#   - Workdir edits ACCUMULATE across iterations (unlike retry, which rewinds), so each round
+#     builds on the last. On a durable run, a crash mid-loop resumes from the last completed
+#     iteration rather than re-running the whole thing.
+#   - The body is a self-contained sub-DAG: `test` depends on `edit` (a sibling); inner ids are
+#     globally unique. `report` runs after the loop, reading its aggregate `outputs`.
+#
+# This is a VALIDATION showcase, not runnable as-is: the `provider:` step needs the real claude
+# CLI and the gate commands assume a Cargo project at --repo. For an end-to-end run, start from
+# the README quickstart.
+
+schema_version: "1.0"
+name: iterate
+version: "1.0.0"
+description: Iterate edit → test until the test passes, feeding each failure back to the agent.
+durable: true
+workspace:
+  type: worktree
+
+params:
+  task:
+    type: string
+    default: "Make the failing `clamp` test pass."
+    description: What to make pass.
+
+steps:
+  - id: fix
+    loop:
+      until: "steps.test.status == 'passed'"
+      max: 5
+      steps:
+        - id: edit
+          provider: claude
+          prompt: |
+            {{ params.task }}
+            {% if loop.counter > 1 %}
+
+            Attempt {{ loop.counter }}. The previous attempt's test run failed with:
+
+                {{ loop.feedback }}
+
+            Read it carefully and fix the specific failure before anything else.
+            {% endif %}
+        - id: test
+          run: "cargo test --quiet"
+          depends_on: [edit]
+
+  # Runs after the loop settles, reading its aggregate outputs (count + whether it converged).
+  - id: report
+    run: "echo 'fix converged={{ steps.fix.outputs.converged }} after {{ steps.fix.outputs.iterations }} iteration(s)'"
+    depends_on: [fix]

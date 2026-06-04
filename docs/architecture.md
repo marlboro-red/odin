@@ -169,6 +169,7 @@ error, never a silent empty string).
 | `artifacts.<NAME>` | a step, iff `<NAME>` ∈ its `requires` (or `DIFF`) | `<NAME>` checked |
 | `run.<…>` | everywhere | root only |
 | `retry.attempt` / `retry.feedback` | everywhere (per-attempt; see [retry feedback](workflow-reference.md#retry)) | root only |
+| `loop.counter` / `loop.feedback` | inside a `loop:` body (per-iteration; see [loop step](workflow-reference.md#loop-step)) | root only |
 
 The dependency-awareness means a `steps.x` reference is only legal if `x` is reachable
 through `depends_on`, which stays correct as the DAG fans out.
@@ -217,11 +218,17 @@ do not.
 | ODIN034 | error | two branches of one `case:` share a `label` |
 | ODIN035 | error | a `case:` branch has an empty `label` |
 | ODIN036 | warning | a `case:` selector carries inert `gates:`/`judge:` (a failing gate would break its merge-back) |
+| ODIN037 | error | a `loop:` step has a blank `until` |
+| ODIN038 | error | a `loop:` step's `max` is 0 |
+| ODIN039 | error | a `loop:` step declares no body `steps` |
+| ODIN040 | error | a `loop:` body nests another `loop:` (unsupported in v1) |
+| ODIN041 | error | a `loop:` body contains an `approval:` gate (unsupported in v1) |
+| ODIN042 | warning | a `loop:` node carries its own inert `gates:`/`judge:`/`scratch:` |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
 nested fields, invalid durations, and a step with zero or more than one kind. The full
 per-field catalogue with exact trigger conditions is in the
-[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin036).
+[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin042).
 
 ## Concurrency
 
@@ -332,7 +339,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Status
 
-**Implemented & tested:** the workflow IR; the validator (36 diagnostics); the
+**Implemented & tested:** the workflow IR; the validator (42 diagnostics); the
 templating/context model; the five integration traits + registry; the SQLite `Store`; the
 worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
 (subprocess management, version/health checks, token-usage parsing); the built-in `Action`s

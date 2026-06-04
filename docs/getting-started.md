@@ -119,10 +119,13 @@ verification and dedup, and the fail-closed security model.
 | [`fix-flaky-test.yaml`](../examples/fix-flaky-test.yaml) | A kitchen-sink exercising all three step kinds, all three trigger kinds, a slot-pool workspace, `prompt_file`, and a fan-in DAG — with one intentional warning. |
 | [`nightly-maintenance.yaml`](../examples/nightly-maintenance.yaml) | A param-less, cron-served workflow for the daemon (refresh deps → verify → summarize → open PR). |
 | [`multi-agent-eval.yaml`](../examples/multi-agent-eval.yaml) | `max_parallel` + isolated `scratch:` steps: fan a task out to three agents concurrently, then judge the candidate diffs. |
+| [`triage.yaml`](../examples/triage.yaml) | **Branching** with `case:`: classify an issue, then take exactly one labeled branch's steps, with a merge-back. |
+| [`self-correct.yaml`](../examples/self-correct.yaml) | **Single-step self-correct**: `retry` with `feedback`, re-prompting one step with the prior failure (gates as the verifier). |
+| [`iterate.yaml`](../examples/iterate.yaml) | **Multi-step loop** with `loop:`: iterate edit → test until the test passes, feeding each failure back as `loop.feedback`. |
 
 ## Where next
 
-- [Workflow reference](workflow-reference.md) — every field and all 36 diagnostics.
+- [Workflow reference](workflow-reference.md) — every field and all 42 diagnostics.
 - [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references.
 - [Integration guide](integration-guide.md) — embed `odin-core`, plug in custom
   providers/actions/workspaces/triggers.
