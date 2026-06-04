@@ -24,7 +24,10 @@ use odin_core::{RunInput, WorkflowId};
 /// free of daylight-saving gaps/repeats, matching hosted cron (e.g. GitHub Actions). A
 /// `"0 3 * * *"` schedule therefore fires at 03:00 UTC.
 pub struct CronTrigger {
-    schedule: Schedule,
+    /// One or two schedules (see [`parse_5field`]). A standard expression is one schedule; an
+    /// expression that restricts **both** day-of-month and day-of-week becomes two — the POSIX
+    /// "fire when either matches" rule, modeled as the union of the two next-fire times.
+    schedules: Vec<Schedule>,
     workflow: WorkflowId,
     source: String,
 }
@@ -37,10 +40,10 @@ impl CronTrigger {
     /// Returns a [`TriggerError`] if `expr` is not a valid 5-field cron expression.
     pub fn new(expr: impl AsRef<str>, workflow: WorkflowId) -> Result<Self, TriggerError> {
         let expr = expr.as_ref();
-        let schedule = parse_5field(expr)
+        let schedules = parse_5field(expr)
             .map_err(|e| TriggerError::Source(format!("invalid cron {expr:?}: {e}")))?;
         Ok(Self {
-            schedule,
+            schedules,
             workflow,
             source: format!("cron:{expr}"),
         })
@@ -48,13 +51,19 @@ impl CronTrigger {
 
     /// The next instant this schedule fires strictly after `after`, or `None` if the
     /// schedule has no future occurrence. Pure — the scheduling logic, free of any sleep.
+    ///
+    /// When the expression restricts both day-of-month and day-of-week, this is the **earliest**
+    /// of the two sub-schedules' next fires — the POSIX OR semantics.
     #[must_use]
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
-        self.schedule.after(&after).next()
+        self.schedules
+            .iter()
+            .filter_map(|s| s.after(&after).next())
+            .min()
     }
 }
 
-/// Parses a standard 5-field cron expression into a [`Schedule`], bridging two gaps
+/// Parses a standard 5-field cron expression into one or two [`Schedule`]s, bridging three gaps
 /// between POSIX cron and the `cron` crate's Quartz dialect:
 ///
 /// 1. **Seconds.** The crate expects a leading seconds field (6–7 fields); standard cron
@@ -63,17 +72,33 @@ impl CronTrigger {
 ///    Saturday; the crate uses Quartz numbering (`1` = Sunday … `7` = Saturday) and
 ///    rejects `0`. We rewrite the numeric day-of-week field into the crate's Quartz domain
 ///    ([`normalize_dow`]) — `0 3 * * 1` then means **Monday**, as the IR documents.
-fn parse_5field(expr: &str) -> Result<Schedule, String> {
+/// 3. **Day-of-month / day-of-week OR.** When **both** the day-of-month and day-of-week fields
+///    are restricted (neither `*`/`?`), POSIX cron fires when **either** matches, but the crate's
+///    Quartz dialect ANDs them — so `0 9 1 * 1` would fire only on a 1st-of-the-month that is also
+///    a Monday (≈ once a year) instead of "the 1st **or** any Monday". We model the OR as the
+///    union of two schedules — one with day-of-week wild, one with day-of-month wild — and take
+///    the earliest next fire across them (see [`CronTrigger::next_after`]). When at most one of the
+///    two day fields is restricted, the single Quartz schedule already matches POSIX.
+fn parse_5field(expr: &str) -> Result<Vec<Schedule>, String> {
     let fields = expr.split_whitespace().collect::<Vec<_>>();
     if fields.len() != 5 {
         return Err(format!("expected 5 fields, found {}", fields.len()));
     }
+    let dom = fields[2];
     let dow = normalize_dow(fields[4]);
-    let normalized = format!(
-        "0 {} {} {} {} {dow}",
-        fields[0], fields[1], fields[2], fields[3]
-    );
-    Schedule::from_str(&normalized).map_err(|e| e.to_string())
+    let build = |dom: &str, dow: &str| -> Result<Schedule, String> {
+        let normalized = format!("0 {} {} {dom} {} {dow}", fields[0], fields[1], fields[3]);
+        Schedule::from_str(&normalized).map_err(|e| e.to_string())
+    };
+
+    // `?` is the Quartz "no specific value" placeholder; treat it like `*` (unrestricted).
+    let restricted = |field: &str| field != "*" && field != "?";
+    if restricted(dom) && restricted(&dow) {
+        // Both day fields are restricted → POSIX OR: day-of-month alone, plus day-of-week alone.
+        Ok(vec![build(dom, "*")?, build("*", &dow)?])
+    } else {
+        Ok(vec![build(dom, &dow)?])
+    }
 }
 
 /// Rewrites a POSIX day-of-week field into the `cron` crate's Quartz numeric domain
@@ -240,6 +265,27 @@ mod tests {
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let next = trigger.next_after(base).unwrap();
         assert_eq!(next, Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn day_of_month_and_day_of_week_use_posix_or_not_quartz_and() {
+        // `0 9 1 * 1` = 09:00 on the 1st OR on a Monday (POSIX OR). The cron crate's Quartz dialect
+        // would AND them — firing only on a 1st-of-month that is also a Monday (≈ yearly).
+        let t = CronTrigger::new("0 9 1 * 1", wf()).unwrap();
+        // From Wed 2026-06-03, the next Monday (06-08) precedes the next 1st (07-01).
+        let from_wed = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        assert_eq!(
+            t.next_after(from_wed).unwrap(),
+            Utc.with_ymd_and_hms(2026, 6, 8, 9, 0, 0).unwrap(),
+            "the nearer Monday must win"
+        );
+        // From Mon 2026-06-29, the next 1st (07-01) precedes the next Monday (07-06).
+        let from_mon = Utc.with_ymd_and_hms(2026, 6, 29, 12, 0, 0).unwrap();
+        assert_eq!(
+            t.next_after(from_mon).unwrap(),
+            Utc.with_ymd_and_hms(2026, 7, 1, 9, 0, 0).unwrap(),
+            "the nearer 1st-of-month must win"
+        );
     }
 
     #[test]

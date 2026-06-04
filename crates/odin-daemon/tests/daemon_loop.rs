@@ -222,6 +222,34 @@ async fn a_burst_of_events_all_run_and_drain_on_shutdown() {
     assert!(runs.iter().all(|r| r.status == RunStatus::Succeeded));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_events_are_drained_when_shutdown_is_already_requested() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let (engine, store) = engine_with_store(repo.path());
+
+    // Three events are already queued on the trigger (the webhook analogue: deliveries 202-acked
+    // into the channel but not yet consumed). Shutdown is requested BEFORE the loop starts, so the
+    // biased `select!` takes the shutdown branch on the very first poll. Without the drain those
+    // queued events would be silently dropped; with it, they are pulled and run.
+    let daemon = Daemon::new(engine, [tick_workflow("tick")]).with_trigger(ScriptTrigger::new([
+        event_for("tick"),
+        event_for("tick"),
+        event_for("tick"),
+    ]));
+    let shutdown = daemon.cancellation_token();
+    shutdown.cancel(); // request shutdown up front
+    daemon.run().await.unwrap();
+
+    let runs = store.recent(20).await.unwrap();
+    assert_eq!(
+        runs.len(),
+        3,
+        "all queued events must drain and run despite the early shutdown"
+    );
+    assert!(runs.iter().all(|r| r.status == RunStatus::Succeeded));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn max_concurrent_runs_is_clamped_to_at_least_one() {
     let repo = tempfile::tempdir().unwrap();

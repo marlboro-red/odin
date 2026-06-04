@@ -22,6 +22,12 @@ struct PruneSchedule {
 /// fast-firing cron won't spawn unbounded concurrent runs).
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 4;
 
+/// On shutdown, how long to wait for an already-queued trigger event before concluding the queue
+/// is drained. A webhook channel hands back its buffered (202-acked) events well within this
+/// window, then blocks — ending the drain; a cron trigger's `next_event` sleeps to its next tick,
+/// so it always times out here and contributes nothing.
+const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Owns an [`Engine`] and the workflows it can run, and drives a set of long-lived
 /// [`Trigger`]s. On [`run`](Daemon::run) it first resumes any incomplete runs (crash
 /// recovery), then services every trigger concurrently, dispatching a run per event —
@@ -214,37 +220,55 @@ impl Daemon {
                 // In-flight dispatches for this trigger, so a burst runs concurrently and
                 // shutdown can drain them.
                 let mut dispatches = tokio::task::JoinSet::new();
+                // Spawns a run for one event, holding a concurrency permit for the whole run.
+                let spawn_dispatch = |dispatches: &mut tokio::task::JoinSet<()>,
+                                      event: TriggerEvent| {
+                    let engine = Arc::clone(&engine);
+                    let workflows = Arc::clone(&workflows);
+                    let permits = Arc::clone(&permits);
+                    let kind = kind.clone();
+                    dispatches.spawn(async move {
+                        // Acquire a slot first; the permit is held for the whole run. Acquire only
+                        // fails if the semaphore was closed — unreachable while this task holds an
+                        // `Arc<Semaphore>`, but log rather than drop the event silently if a future
+                        // change ever closes it.
+                        let Ok(_permit) = permits.acquire_owned().await else {
+                            tracing::error!(
+                                %kind,
+                                "dispatch slot unavailable (semaphore closed); event dropped"
+                            );
+                            return;
+                        };
+                        dispatch(engine.as_ref(), &workflows, event).await;
+                    });
+                };
                 loop {
                     // Wait for the next event, but bail the instant shutdown is requested.
                     // `next_event` is cancel-safe, so dropping its future here is fine.
                     let event = tokio::select! {
                         biased;
-                        () = shutdown.cancelled() => break,
+                        () = shutdown.cancelled() => {
+                            // Drain events already queued (e.g. webhook deliveries that were
+                            // 202-acked but not yet consumed) before stopping, so an accepted event
+                            // is never silently dropped. Pull only what is immediately available:
+                            // a webhook channel returns its buffered events at once and then blocks
+                            // (the `DRAIN_GRACE` timeout ends the drain); a cron trigger's
+                            // `next_event` sleeps to its next tick, so it times out contributing
+                            // nothing.
+                            while let Ok(Ok(Some(event))) =
+                                tokio::time::timeout(DRAIN_GRACE, trigger.next_event()).await
+                            {
+                                while dispatches.try_join_next().is_some() {}
+                                spawn_dispatch(&mut dispatches, event);
+                            }
+                            break;
+                        }
                         event = trigger.next_event() => event,
                     };
                     // Reap finished dispatches so the set doesn't grow without bound.
                     while dispatches.try_join_next().is_some() {}
                     match event {
-                        Ok(Some(event)) => {
-                            let engine = Arc::clone(&engine);
-                            let workflows = Arc::clone(&workflows);
-                            let permits = Arc::clone(&permits);
-                            let kind = kind.clone();
-                            dispatches.spawn(async move {
-                                // Acquire a slot first; the permit is held for the whole run.
-                                // Acquire only fails if the semaphore was closed — unreachable
-                                // while this task holds an `Arc<Semaphore>`, but log rather than
-                                // drop the event silently if a future change ever closes it.
-                                let Ok(_permit) = permits.acquire_owned().await else {
-                                    tracing::error!(
-                                        %kind,
-                                        "dispatch slot unavailable (semaphore closed); event dropped"
-                                    );
-                                    return;
-                                };
-                                dispatch(engine.as_ref(), &workflows, event).await;
-                            });
-                        }
+                        Ok(Some(event)) => spawn_dispatch(&mut dispatches, event),
                         Ok(None) => break,
                         Err(e) => {
                             tracing::error!(%kind, error = %e, "trigger stopped");

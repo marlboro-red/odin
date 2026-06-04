@@ -83,6 +83,10 @@ triggers:
   6/7-field Quartz form is rejected.
 - **POSIX day-of-week**: `0`/`7` = Sunday, `1` = Monday … `6` = Saturday. (`0 3 * * 1` means
   Monday.) Ranges, lists, and steps work (`1-5`, `1,3,5`, `*/2`).
+- **POSIX day-of-month / day-of-week OR**: when **both** the day-of-month and day-of-week fields
+  are restricted (neither is `*`), the schedule fires when **either** matches — `0 9 1 * 1` is
+  "09:00 on the 1st **or** any Monday", not "the 1st **and** a Monday". (When only one day field
+  is restricted, it behaves as written.)
 - **UTC**: schedules evaluate in UTC, not server-local time — deterministic and DST-safe,
   matching hosted cron (GitHub Actions). `0 3 * * *` fires at 03:00 UTC.
 
