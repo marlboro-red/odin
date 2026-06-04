@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN042`).
+(`ODIN001`–`ODIN044`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -102,7 +102,7 @@ Declaring zero or more than one kind is a **parse error**, as is putting a provi
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `id` | string | — (**required**) | Stable id, unique within the workflow. Must start with a letter or `_`, then letters/digits/`_`/`-` ([ODIN002](#odin002)–[ODIN004](#odin004)). |
+| `id` | string | — (**required**) | Stable id, unique within the workflow. Must start with a letter or `_`, then letters/digits/`_` (no hyphens — the id is used as a dotted template path segment, `steps.<id>.…`) ([ODIN002](#odin002)–[ODIN004](#odin004)). |
 | `depends_on` | list of step ids | `[]` | Steps that must finish before this one. Defines the DAG edges. |
 | `when` | string | — | A minijinja boolean expression; the step is **skipped** when it renders false. |
 | `gates` | map name → shell command | `{}` | After the body, every gate command must exit `0` or the step **fails**. Order preserved. |
@@ -542,7 +542,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN042`)
+## Diagnostics catalogue (`ODIN001`–`ODIN044`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -552,7 +552,7 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin001"></a>ODIN001 | error | The workflow has no steps. |
 | <a id="odin002"></a>ODIN002 | error | A step id is empty (or whitespace-only). |
 | <a id="odin003"></a>ODIN003 | error | Two steps share the same id. |
-| <a id="odin004"></a>ODIN004 | error | A step id isn't a valid identifier (start with a letter or `_`; then letters/digits/`_`/`-`). |
+| <a id="odin004"></a>ODIN004 | error | A step id isn't a valid identifier / template path segment (start with a letter or `_`; then letters/digits/`_`; no hyphens). |
 | <a id="odin005"></a>ODIN005 | error | A `provider`, `judge.provider`, or `retry.on_fallback_provider` names an unregistered provider (with a "did you mean"). |
 | <a id="odin006"></a>ODIN006 | error | A provider step has neither `prompt` nor `prompt_file`. |
 | <a id="odin007"></a>ODIN007 | error | A step lists the same `produces` artifact twice. |
@@ -591,9 +591,12 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin040"></a>ODIN040 | error | A `loop:` body nests another `loop:` — unsupported (v1). |
 | <a id="odin041"></a>ODIN041 | error | A `loop:` body contains an `approval:` gate — unsupported (v1). |
 | <a id="odin042"></a>ODIN042 | **warning** | A `loop:` node carries its own `gates:`/`judge:`/`scratch:` — inert; a loop's verification is its `until` over the body. |
+| <a id="odin043"></a>ODIN043 | error | A `loop:` body step sets `scratch: true` — unsupported; the body runs sequentially on the shared workdir, so the step's edits would vanish into a throwaway worktree. |
+| <a id="odin044"></a>ODIN044 | **warning** | A `durable: true` workflow uses a `slot_pool` workspace — its lease state is in-memory and lost on restart, so a resumed run may race another for its slot; prefer `worktree`. |
 
 ¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 
 A workflow validates **cleanly** when it has zero diagnostics; it's still **runnable** with
 warnings (only errors block a run). See [`examples/fix-flaky-test.yaml`](../examples/fix-flaky-test.yaml)
-for a workflow that intentionally trips exactly one documented warning.
+for a workflow that intentionally trips two documented warnings ([ODIN023](#odin023) — an inert
+`on_fallback_provider`; and [ODIN044](#odin044) — pairing `durable` with a `slot_pool` workspace).

@@ -133,4 +133,41 @@ mod tests {
         let r = report("name: x\nsteps: []\n");
         assert!(r.contains(DiagCode::NoSteps));
     }
+
+    #[test]
+    fn a_case_nested_in_a_loop_body_is_validated() {
+        // ODIN033 (no branches) must fire for a `case:` inside a `loop:` body, not just at top
+        // level — `case_branches` now iterates `all_steps`.
+        let r = report(
+            "name: x\nsteps:\n  - id: lp\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: pick, case: {branches: []}}\n",
+        );
+        assert!(
+            r.contains(DiagCode::CaseNoBranches),
+            "a case in a loop body must be validated: {r}"
+        );
+    }
+
+    #[test]
+    fn a_loop_body_scratch_step_is_rejected() {
+        // ODIN043 — a scratch inner step is unsupported (the body runs sequentially on the shared
+        // workdir, so its edits would vanish into a throwaway worktree).
+        let r = report(
+            "name: x\nsteps:\n  - id: lp\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: edit, provider: claude, prompt: hi, scratch: true}\n",
+        );
+        assert!(r.contains(DiagCode::LoopBodyScratch), "{r}");
+    }
+
+    #[test]
+    fn durable_slot_pool_is_warned_but_runnable() {
+        // ODIN044 — durable + slot_pool is resume-fragile (in-memory lease state), so it warns but
+        // does not block: the workflow is still runnable.
+        let r = report(
+            "name: x\ndurable: true\nworkspace: {type: slot_pool, pool: 2}\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n",
+        );
+        assert!(r.contains(DiagCode::SlotPoolNotDurable), "{r}");
+        assert!(
+            !r.has_errors(),
+            "slot_pool + durable is a warning, not an error: {r}"
+        );
+    }
 }

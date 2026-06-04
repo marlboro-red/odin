@@ -37,7 +37,7 @@ odin validate examples/issue-to-pr.yaml
 
 A workflow is **valid** with zero errors; warnings are fine (the run still proceeds). See
 [`examples/fix-flaky-test.yaml`](../examples/fix-flaky-test.yaml), which exercises the whole
-IR and intentionally trips exactly one documented warning so you can see the warning path.
+IR and intentionally trips two documented warnings (ODIN023 and ODIN044) so you can see the warning path.
 
 ## 2. Run a workflow
 
@@ -125,7 +125,7 @@ verification and dedup, and the fail-closed security model.
 
 ## Where next
 
-- [Workflow reference](workflow-reference.md) — every field and all 42 diagnostics.
+- [Workflow reference](workflow-reference.md) — every field and all 44 diagnostics.
 - [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references.
 - [Integration guide](integration-guide.md) — embed `odin-core`, plug in custom
   providers/actions/workspaces/triggers.

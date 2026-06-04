@@ -224,6 +224,8 @@ do not.
 | ODIN040 | error | a `loop:` body nests another `loop:` (unsupported in v1) |
 | ODIN041 | error | a `loop:` body contains an `approval:` gate (unsupported in v1) |
 | ODIN042 | warning | a `loop:` node carries its own inert `gates:`/`judge:`/`scratch:` |
+| ODIN043 | error | a `loop:` body step sets `scratch: true` (unsupported; the body runs sequentially on the shared workdir) |
+| ODIN044 | warning | a `durable:` workflow uses a `slot_pool` workspace (in-memory lease state is lost on restart; prefer `worktree`) |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
 nested fields, invalid durations, and a step with zero or more than one kind. The full
@@ -339,7 +341,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Status
 
-**Implemented & tested:** the workflow IR; the validator (42 diagnostics); the
+**Implemented & tested:** the workflow IR; the validator (44 diagnostics); the
 templating/context model; the five integration traits + registry; the SQLite `Store`; the
 worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
 (subprocess management, version/health checks, token-usage parsing); the built-in `Action`s

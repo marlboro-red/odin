@@ -64,7 +64,7 @@ pub(crate) fn step_ids(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                 DiagCode::InvalidStepId,
                 format!("{ptr}.id"),
                 format!(
-                    "step id {id:?} is invalid: use letters/digits/_/- and start with a letter or _"
+                    "step id {id:?} is invalid: use letters/digits/_ and start with a letter or _"
                 ),
             ));
         }
@@ -383,6 +383,19 @@ pub(crate) fn workspace(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                 format!("workspace pool must be >= 1, got {}", p.pool),
             ));
         }
+        // ODIN044 — slot-pool lease state is in-memory and not durable across a process restart.
+        // A durable run resumed after a restart executes against its persisted slot path, but the
+        // fresh pool no longer knows that slot is leased — another run could claim and reset it.
+        // `worktree` keys its checkout per-run, so it survives a restart; prefer it here.
+        if wf.durable {
+            d.push(Diagnostic::new(
+                DiagCode::SlotPoolNotDurable,
+                "workspace",
+                "workflow is `durable` but uses a `slot_pool` workspace, whose lease state is \
+                 in-memory and lost on restart; a run resumed after a restart may race another for \
+                 its slot. Prefer `worktree` for durable runs that also need bounded concurrency",
+            ));
+        }
     }
 }
 
@@ -489,14 +502,16 @@ pub(crate) fn approval_durable(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 /// ODIN033/034/035 — a `case:` step must have ≥1 branch with a unique, non-empty label.
 /// ODIN036 — a selector carrying `gates:`/`judge:` (inert, and a failing gate would break it).
 pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
-    for (i, s) in wf.steps.iter().enumerate() {
+    // Iterate `all_steps` (not just top-level) so a `case:` nested in a `loop:` body is validated
+    // like any other — its branches live in the same flat namespace as the rest of the workflow.
+    for (ptr, s) in all_steps(wf) {
         let StepKind::Case(c) = &s.kind else {
             continue;
         };
         if !s.gates.is_empty() || s.judge.is_some() {
             d.push(Diagnostic::new(
                 DiagCode::CaseInertChecks,
-                step_ptr(i),
+                ptr.clone(),
                 format!(
                     "case step {:?} carries gates/judge; a selector produces no output to check, \
                      and a failing gate would flip it to failed and break a merge-back that \
@@ -508,7 +523,7 @@ pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
         if c.branches.is_empty() {
             d.push(Diagnostic::new(
                 DiagCode::CaseNoBranches,
-                format!("{}.case.branches", step_ptr(i)),
+                format!("{ptr}.case.branches"),
                 format!(
                     "case step {:?} declares no branches; give it at least one",
                     s.id.as_str()
@@ -517,11 +532,11 @@ pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
         }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (bi, b) in c.branches.iter().enumerate() {
-            let ptr = format!("{}.case.branches[{bi}].label", step_ptr(i));
+            let label_ptr = format!("{ptr}.case.branches[{bi}].label");
             if b.label.is_empty() {
                 d.push(Diagnostic::new(
                     DiagCode::CaseEmptyBranchLabel,
-                    ptr,
+                    label_ptr,
                     format!(
                         "case step {:?} has a branch with an empty label",
                         s.id.as_str()
@@ -530,7 +545,7 @@ pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
             } else if !seen.insert(b.label.as_str()) {
                 d.push(Diagnostic::new(
                     DiagCode::CaseDuplicateBranchLabel,
-                    ptr,
+                    label_ptr,
                     format!(
                         "case step {:?} has two branches labeled {:?}",
                         s.id.as_str(),
@@ -544,7 +559,7 @@ pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
             if seen.contains(el.as_str()) {
                 d.push(Diagnostic::new(
                     DiagCode::CaseDuplicateBranchLabel,
-                    format!("{}.case.else", step_ptr(i)),
+                    format!("{ptr}.case.else"),
                     format!(
                         "case step {:?}'s `else` label {:?} collides with a branch label",
                         s.id.as_str(),
@@ -579,6 +594,24 @@ pub(crate) fn loops(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                     s.id.as_str()
                 ),
             ));
+        }
+        // ODIN043 — a loop-body step must not be `scratch`: the body runs sequentially on the
+        // shared workdir, so a scratch inner step's edits would land in a throwaway worktree
+        // (invisible to later inner steps, the `until` check, and the per-iteration snapshot) and
+        // its worktrees would not be reclaimed by the run's scratch cleanup.
+        for (j, inner) in l.steps.iter().enumerate() {
+            if inner.scratch {
+                d.push(Diagnostic::new(
+                    DiagCode::LoopBodyScratch,
+                    format!("{ptr}.loop.steps[{j}].scratch"),
+                    format!(
+                        "loop-body step {:?} sets `scratch: true`, which is unsupported — a loop \
+                         body runs sequentially on the shared workdir; drop `scratch` so its edits \
+                         accumulate into the loop's workspace",
+                        inner.id.as_str()
+                    ),
+                ));
+            }
         }
         // ODIN037 — a blank `until` leaves the loop with no exit condition.
         if l.until.trim().is_empty() {
@@ -753,7 +786,10 @@ fn is_valid_id(s: &str) -> bool {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    // No hyphens: an id is used as a dotted template path segment (`steps.<id>.outputs.…`), and
+    // minijinja parses `a-b` as the subtraction `a - b`, so a hyphenated id could never be
+    // referenced — exactly what ODIN004 ("not a valid template path segment") exists to prevent.
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Month names the runtime cron parser (the `cron` crate) accepts.
@@ -896,7 +932,10 @@ mod tests {
     #[test]
     fn id_pattern() {
         assert!(is_valid_id("plan_1"));
-        assert!(is_valid_id("_x-y"));
+        assert!(is_valid_id("_x_y"));
+        // Hyphens are rejected: `steps.a-b.outputs` would parse as `a - b` in a template (ODIN004).
+        assert!(!is_valid_id("_x-y"));
+        assert!(!is_valid_id("a-b"));
         assert!(!is_valid_id("1plan"));
         assert!(!is_valid_id("fix it"));
         assert!(!is_valid_id(""));
