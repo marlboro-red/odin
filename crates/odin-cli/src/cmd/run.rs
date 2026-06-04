@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use odin_core::{
-    EngineBuilder, Error, RunInput, RunStatus, RunSummary, SqliteStore, StepStatus, Workflow,
+    EngineBuilder, Error, RunInput, RunStatus, RunSummary, SqliteStore, StepKind, StepStatus,
+    Workflow,
 };
 
 /// Parsed arguments for `odin run`.
@@ -38,6 +39,23 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
 
 async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode> {
     let repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+
+    // An `approval:` gate pauses the run and is resumed *from the store* on a decision; with
+    // `--no-store` the gate could never be approved, and the "run `odin approve …`" hint printed
+    // below would be unusable. Refuse up front rather than launch an unresumable run.
+    if args.no_store
+        && workflow
+            .steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Approval(_)))
+    {
+        anyhow::bail!(
+            "--no-store cannot be used with a workflow that has an `approval:` gate: a paused gate \
+             is persisted to (and resumed from) the store, so without one the run could never be \
+             approved. Drop --no-store, or remove the gate."
+        );
+    }
+
     let mut builder = EngineBuilder::new().repo(&repo);
 
     if !args.no_store {

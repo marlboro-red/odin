@@ -324,17 +324,31 @@ impl LocalEngine {
         Ok(())
     }
 
-    async fn emit(&self, run_id: RunId, event: RunEvent) {
+    /// Appends an audit event — but only for a **durable** run. A non-durable run is never
+    /// checkpointed (no `runs` row), so its events would be orphaned: invisible to `odin status`
+    /// and unreclaimable by `prune` (which deletes a run's events alongside its row), growing the
+    /// `events` table without bound. Gating here mirrors [`checkpoint`](Self::checkpoint).
+    async fn emit(&self, run_id: RunId, durable: bool, event: RunEvent) {
+        if !durable {
+            return;
+        }
         if let Some(store) = &self.store {
             let _ = store.append_event(run_id, &event).await;
         }
     }
 
-    /// Appends the gate/judge/finished audit events for a completed step.
-    async fn emit_step_events(&self, run_id: RunId, id: &StepId, outcome: &StepOutcome) {
+    /// Appends the gate/judge/finished audit events for a completed step (durable runs only).
+    async fn emit_step_events(
+        &self,
+        run_id: RunId,
+        durable: bool,
+        id: &StepId,
+        outcome: &StepOutcome,
+    ) {
         for (gate, passed) in &outcome.gates {
             self.emit(
                 run_id,
+                durable,
                 RunEvent::GateResult {
                     step: id.clone(),
                     gate: gate.clone(),
@@ -347,6 +361,7 @@ impl LocalEngine {
         if let Some(score) = outcome.judge_score {
             self.emit(
                 run_id,
+                durable,
                 RunEvent::JudgeResult {
                     step: id.clone(),
                     score,
@@ -358,6 +373,7 @@ impl LocalEngine {
         }
         self.emit(
             run_id,
+            durable,
             RunEvent::StepFinished {
                 step: id.clone(),
                 status: outcome.status,
@@ -774,6 +790,7 @@ impl LocalEngine {
     async fn decide_outcome(
         &self,
         run_id: RunId,
+        durable: bool,
         step: &Step,
         ctx: &minijinja::Value,
         workdir: &Path,
@@ -788,15 +805,33 @@ impl LocalEngine {
         match step.when.as_deref() {
             Some(expr) => match eval_when(expr, ctx) {
                 Ok(true) => {
-                    self.run_with_retry(run_id, step, ctx, workdir, timeout, default_retry, cancel)
-                        .await
+                    self.run_with_retry(
+                        run_id,
+                        durable,
+                        step,
+                        ctx,
+                        workdir,
+                        timeout,
+                        default_retry,
+                        cancel,
+                    )
+                    .await
                 }
                 Ok(false) => skipped_outcome(),
                 Err(e) => StepOutcome::failed(format!("when: {e}")),
             },
             None => {
-                self.run_with_retry(run_id, step, ctx, workdir, timeout, default_retry, cancel)
-                    .await
+                self.run_with_retry(
+                    run_id,
+                    durable,
+                    step,
+                    ctx,
+                    workdir,
+                    timeout,
+                    default_retry,
+                    cancel,
+                )
+                .await
             }
         }
     }
@@ -809,6 +844,7 @@ impl LocalEngine {
     async fn run_with_retry(
         &self,
         run_id: RunId,
+        durable: bool,
         step: &Step,
         ctx: &minijinja::Value,
         workdir: &Path,
@@ -856,6 +892,7 @@ impl LocalEngine {
             }
             self.emit(
                 run_id,
+                durable,
                 RunEvent::StepStarted {
                     step: step.id.clone(),
                     attempt: u8::try_from(attempt).unwrap_or(u8::MAX),
@@ -1282,6 +1319,7 @@ impl LocalEngine {
                         // the skip convention for regular steps.)
                         self.emit(
                             run_id,
+                            workflow.durable,
                             RunEvent::StepStarted {
                                 step: id.clone(),
                                 attempt: 1,
@@ -1316,6 +1354,7 @@ impl LocalEngine {
                         // loop's own inner steps emit their own paired events inside `run_loop`.
                         self.emit(
                             run_id,
+                            workflow.durable,
                             RunEvent::StepStarted {
                                 step: id.clone(),
                                 attempt: 1,
@@ -1366,6 +1405,7 @@ impl LocalEngine {
                 }
                 in_flight.push(boxed(self.run_one(
                     run_id,
+                    workflow.durable,
                     step,
                     ctx,
                     workdir,
@@ -1447,7 +1487,8 @@ impl LocalEngine {
             }
             state.updated_at = Utc::now();
             self.checkpoint(workflow.durable, state).await?;
-            self.emit_step_events(run_id, &id, &outcome).await;
+            self.emit_step_events(run_id, workflow.durable, &id, &outcome)
+                .await;
             results.insert(id.clone(), step_result(&id, &step_state));
         }
 
@@ -1473,6 +1514,7 @@ impl LocalEngine {
     async fn run_one(
         &self,
         run_id: RunId,
+        durable: bool,
         step: &Step,
         ctx: minijinja::Value,
         base_workdir: &Path,
@@ -1488,6 +1530,7 @@ impl LocalEngine {
             let outcome = self
                 .decide_outcome(
                     run_id,
+                    durable,
                     step,
                     &ctx,
                     base_workdir,
@@ -1507,6 +1550,7 @@ impl LocalEngine {
                 let mut outcome = self
                     .decide_outcome(
                         run_id,
+                        durable,
                         step,
                         &ctx,
                         &scratch,
@@ -1628,6 +1672,7 @@ impl LocalEngine {
                 let (_, o) = self
                     .run_one(
                         run_id,
+                        durable,
                         inner,
                         ctx,
                         workdir,
@@ -1640,7 +1685,7 @@ impl LocalEngine {
                 // Pair the StepStarted that `run_one` emitted (for an inner step that executed)
                 // with a StepFinished — plus any gate/judge results — so a loop body's inner steps
                 // produce the same audit trail as top-level steps.
-                self.emit_step_events(run_id, inner_id, &o).await;
+                self.emit_step_events(run_id, durable, inner_id, &o).await;
                 if let Some(u) = &o.usage {
                     usage.add(*u);
                 }
@@ -1956,8 +2001,12 @@ impl Engine for LocalEngine {
             self.release_workspace(&workspace, handle).await;
             return Err(e);
         }
-        self.emit(run_id, RunEvent::RunStarted { at: started_at })
-            .await;
+        self.emit(
+            run_id,
+            workflow.durable,
+            RunEvent::RunStarted { at: started_at },
+        )
+        .await;
 
         let run_span = tracing::info_span!(
             "run",
@@ -2021,6 +2070,7 @@ impl Engine for LocalEngine {
         self.checkpoint(workflow.durable, &state).await?;
         self.emit(
             run_id,
+            workflow.durable,
             RunEvent::RunFinished {
                 status,
                 at: Utc::now(),
@@ -2053,9 +2103,17 @@ impl Engine for LocalEngine {
         for state in store.load_incomplete().await? {
             let Some(workflow) = by_name.get(state.workflow.as_str()).copied() else {
                 // The run targets a workflow we no longer serve — best-effort reclaim its
-                // snapshot ref from the shared main repo (a no-op if none was created), so
-                // dangling commits aren't pinned forever even if the worktree is gone.
-                self.delete_snapshot_ref(&self.repo_root, state.run_id, &sweep_cancel)
+                // snapshot refs. A `slot_pool` run's refs live in the slot's *own* `.git`, not the
+                // main repo, so clean against the run's recorded workspace path when it still
+                // exists; fall back to `repo_root` (a `worktree` run's refs live in the shared
+                // `.git`, reachable from there, and a vanished slot took its refs with it).
+                let workdir = state
+                    .workspace
+                    .as_ref()
+                    .map(|h| h.path.clone())
+                    .filter(|p| p.exists())
+                    .unwrap_or_else(|| self.repo_root.clone());
+                self.delete_snapshot_ref(&workdir, state.run_id, &sweep_cancel)
                     .await;
                 continue;
             };
@@ -2243,14 +2301,23 @@ impl Engine for LocalEngine {
             return Ok(PruneReport::default());
         };
         let report = store.prune(policy, dry_run).await?;
-        // Reclaim each pruned run's leftover snapshot refs from the shared repo (best-effort,
-        // never fails the prune). Terminal runs normally drop these on completion; this sweeps
-        // any historical leftover so deleting the DB row doesn't orphan a dangling-commit ref.
+        // Reclaim each pruned run's leftover git refs from the shared repo (best-effort, never
+        // fails the prune). Two kinds: (1) snapshot refs — terminal runs normally drop these on
+        // completion, this sweeps any historical leftover; (2) the per-run `worktree` branch
+        // `refs/heads/odin/run/<id>`, which `WorktreeWorkspace::release` deliberately keeps (it may
+        // hold committed work to push/PR). Once the run record is pruned the branch is dead, so GC
+        // it here — otherwise these branches accumulate without bound for every run ever served.
         if !dry_run && !report.run_ids.is_empty() {
             let cancel = CancelToken::new();
             for run_id in &report.run_ids {
                 self.delete_snapshot_ref(&self.repo_root, *run_id, &cancel)
                     .await;
+                self.delete_ref(
+                    &self.repo_root,
+                    &format!("refs/heads/odin/run/{run_id}"),
+                    &cancel,
+                )
+                .await;
             }
         }
         tracing::info!(
@@ -4477,6 +4544,65 @@ steps:
         assert_eq!(s2.status, RunStatus::Succeeded, "error: {:?}", s2.error);
         assert_eq!(step_status(&s2, "gate"), Some(StepStatus::Passed));
         assert_eq!(step_status(&s2, "ship"), Some(StepStatus::Passed));
+    }
+
+    #[tokio::test]
+    async fn a_non_durable_run_emits_no_events() {
+        // A non-durable run is never checkpointed (no `runs` row), so emitting events would orphan
+        // them — invisible to `status` and unreclaimable by `prune`. `emit` is gated on durability.
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        // Explicitly non-durable (the default is durable), but a store IS present.
+        let wf = parse(
+            "name: w\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        assert!(
+            store.events(s.run_id).await.unwrap().is_empty(),
+            "a non-durable run must not write orphan events"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_gcs_the_per_run_worktree_branch() {
+        // `WorktreeWorkspace::release` keeps the `odin/run/<id>` branch (it may hold committed
+        // work to push/PR); once the run record is pruned the branch is dead and must be GC'd,
+        // else these branches accumulate without bound for every run ever served.
+        fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+            let out = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(["branch", "--list", branch])
+                .output()
+                .unwrap();
+            !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        }
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let branch = format!("odin/run/{}", s.run_id);
+        assert!(
+            branch_exists(repo.path(), &branch),
+            "the per-run branch should exist after the run (release keeps it)"
+        );
+        eng.prune(
+            &PrunePolicy {
+                keep_last: Some(0),
+                ..PrunePolicy::default()
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !branch_exists(repo.path(), &branch),
+            "prune must GC the dead per-run worktree branch"
+        );
     }
 
     #[tokio::test]

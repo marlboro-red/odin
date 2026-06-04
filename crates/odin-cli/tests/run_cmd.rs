@@ -64,6 +64,37 @@ fn run_executes_a_shell_only_workflow() {
 }
 
 #[test]
+fn run_refuses_no_store_on_an_approval_gated_workflow() {
+    // A gate is resumed from the store; `--no-store` would make it unapprovable and the printed
+    // `odin approve` hint unusable, so the CLI must refuse up front rather than launch the run.
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let wf = repo.path().join("wf.yaml");
+    std::fs::write(
+        &wf,
+        "name: gated\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: plan, run: \"true\"}\n  - id: gate\n    approval: { message: \"ok?\" }\n    depends_on: [plan]\n",
+    )
+    .unwrap();
+
+    let out = odin(&[
+        "run",
+        wf.to_str().unwrap(),
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--no-store",
+    ]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "must refuse --no-store on an approval-gated workflow"
+    );
+    assert!(
+        stderr.contains("--no-store") && stderr.contains("approval"),
+        "the error must explain the refusal: {stderr}"
+    );
+}
+
+#[test]
 fn run_exits_nonzero_on_failure() {
     let repo = tempfile::tempdir().unwrap();
     init_repo(repo.path());
