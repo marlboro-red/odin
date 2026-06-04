@@ -60,6 +60,25 @@ jobs:
             fi
           done
 
+  windows:
+    name: windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show && rustup component add clippy
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      # Compiles + lints odin-core on Windows — including the `#[cfg(windows)]` shell resolver that
+      # can't be built on the Unix dev box / Unix CI. The runner ships Git for Windows, so the
+      # resolver finds `sh`/`bash` and the shell-driven tests run through it.
+      - name: Clippy
+        run: cargo clippy -p odin-core --all-targets --all-features
+      # Run the odin-core suite on Windows: the shell resolver, byte-stable git (autocrlf override),
+      # process spawning, validation, and the portable engine smoke all execute here.
+      - name: Test
+        run: cargo test -p odin-core --all-features
+
   msrv:
     name: MSRV (1.85)
     runs-on: ubuntu-latest
