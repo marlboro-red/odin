@@ -879,7 +879,7 @@ impl LocalEngine {
             stdin: None,
         };
         let args = vec!["-c".to_owned(), command.to_owned()];
-        let out = run_process("sh", &args, &opts, cancel).await?;
+        let out = run_process(crate::provider::posix_shell()?, &args, &opts, cancel).await?;
         Ok((out.exit_code, out.stdout, out.stderr))
     }
 

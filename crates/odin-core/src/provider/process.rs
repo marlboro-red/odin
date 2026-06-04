@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -18,6 +19,116 @@ use tokio::process::Command;
 
 use crate::error::ProviderError;
 use crate::traits::CancelToken;
+
+/// The POSIX shell Odin runs `run:` / gate / `shell.exec` command strings through, resolved once
+/// and cached for the process.
+///
+/// Workflow command strings are POSIX-flavored by design (`&&`, `||`, `$(…)`, `[ … ]`, `>>`,
+/// `2>&1`), so Odin always runs them through a POSIX shell rather than translating to `cmd`/
+/// PowerShell. On Unix that shell is plain `sh` (always on `PATH`). On Windows — where `sh` is
+/// usually *not* on `PATH` even though Git for Windows ships `sh.exe` — it is resolved by probing
+/// `ODIN_SHELL`, then `sh`/`bash` on `PATH`, then Git-for-Windows install locations. A missing
+/// shell yields a [`ProviderError::ShellNotFound`] with an actionable
+/// message, so the first shell step fails clearly instead of with a cryptic `sh: not found`.
+///
+/// # Errors
+/// [`ProviderError::ShellNotFound`] if no POSIX shell can be resolved (Windows without Git for
+/// Windows and without `ODIN_SHELL` set).
+pub fn posix_shell() -> Result<&'static str, ProviderError> {
+    static SHELL: OnceLock<Option<String>> = OnceLock::new();
+    SHELL.get_or_init(resolve_shell).as_deref().ok_or_else(|| {
+        ProviderError::ShellNotFound(
+            "no POSIX shell for `run:`/gate/`shell.exec` commands — install Git for Windows (it \
+             ships sh.exe) or set ODIN_SHELL to a shell path"
+                .to_owned(),
+        )
+    })
+}
+
+/// Resolves the shell: an explicit `ODIN_SHELL` override wins, else the platform default.
+fn resolve_shell() -> Option<String> {
+    shell_from_override(std::env::var("ODIN_SHELL").ok().as_deref()).or_else(resolve_shell_platform)
+}
+
+/// Normalizes an `ODIN_SHELL` value: trimmed, with a blank treated as unset.
+fn shell_from_override(val: Option<&str>) -> Option<String> {
+    val.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// The `sh.exe` locations Git for Windows ships alongside `git.exe`. `git.exe` lives in
+/// `<root>\cmd` (the copy on `PATH`) or `<root>\bin`, and `sh.exe` is in `<root>\bin` and
+/// `<root>\usr\bin` — so going up two levels from `git.exe` and appending those is robust.
+/// (Compiled on Windows, where it's used, and in test builds, which cover it cross-platform.)
+#[cfg(any(windows, test))]
+fn sh_beside_git(git_exe: &std::path::Path) -> Vec<PathBuf> {
+    git_exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .map(|root| {
+            vec![
+                root.join("bin").join("sh.exe"),
+                root.join("usr").join("bin").join("sh.exe"),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+// Always `Some` on Unix, but the signature mirrors the Windows version (which can be `None`).
+#[cfg(not(windows))]
+#[allow(clippy::unnecessary_wraps)]
+fn resolve_shell_platform() -> Option<String> {
+    Some("sh".to_owned())
+}
+
+#[cfg(windows)]
+fn resolve_shell_platform() -> Option<String> {
+    // A shell already on PATH (Git Bash put on PATH, or any other sh/bash) wins.
+    for name in ["sh", "bash"] {
+        if which_on_path(name).is_some() {
+            return Some(name.to_owned());
+        }
+    }
+    // Otherwise probe the sh.exe Git for Windows ships — derived from `git` on PATH (the user is
+    // assumed to have git), then well-known install roots.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(git) = which_on_path("git") {
+        candidates.extend(sh_beside_git(&git));
+    }
+    for root in well_known_git_roots() {
+        candidates.push(root.join("bin").join("sh.exe"));
+        candidates.push(root.join("usr").join("bin").join("sh.exe"));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Finds `name.exe` on `PATH`, returning the first match.
+#[cfg(windows)]
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(format!("{name}.exe")))
+        .find(|exe| exe.is_file())
+}
+
+/// Well-known Git-for-Windows install roots (per-machine and per-user).
+#[cfg(windows)]
+fn well_known_git_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            roots.push(PathBuf::from(base).join("Git"));
+        }
+    }
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(base).join("Programs").join("Git"));
+    }
+    roots
+}
 
 /// Odin-internal secrets scrubbed from every spawned child's environment. Providers, actions,
 /// gates, and `run:` steps all spawn through [`run_process`], and an agent CLI (or any shell a
@@ -200,6 +311,44 @@ async fn collect(task: tokio::task::JoinHandle<Vec<u8>>, killed: bool) -> String
         task.await.unwrap_or_default()
     };
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod shell_resolution_tests {
+    #[test]
+    fn override_is_trimmed_and_blank_is_unset() {
+        use super::shell_from_override;
+        assert_eq!(shell_from_override(Some(" bash ")).as_deref(), Some("bash"));
+        assert_eq!(shell_from_override(Some("")), None);
+        assert_eq!(shell_from_override(Some("   ")), None);
+        assert_eq!(shell_from_override(None), None);
+    }
+
+    #[test]
+    fn sh_is_derived_beside_git() {
+        use super::sh_beside_git;
+        // `git.exe` on PATH lives in `<root>\cmd`; `sh.exe` ships in `<root>\bin` and
+        // `<root>\usr\bin`.
+        let cands = sh_beside_git(std::path::Path::new("C:/Program Files/Git/cmd/git.exe"));
+        let strs: Vec<String> = cands
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            strs.iter().any(|s| s.ends_with("Git/bin/sh.exe")),
+            "{strs:?}"
+        );
+        assert!(
+            strs.iter().any(|s| s.ends_with("Git/usr/bin/sh.exe")),
+            "{strs:?}"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_unix_shell_is_plain_sh() {
+        assert_eq!(super::resolve_shell_platform().as_deref(), Some("sh"));
+    }
 }
 
 #[cfg(all(test, unix))]

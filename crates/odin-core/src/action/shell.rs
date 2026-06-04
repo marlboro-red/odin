@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::error::ActionError;
 use crate::traits::{Action, ActionCtx, ActionOutcome};
 
-/// Runs a shell command (`with.command`) via `sh -c` in the run's workspace.
+/// Runs a shell command (`with.command`) via the resolved POSIX shell (`sh -c`) in the run's
+/// workspace. See [`crate::provider::posix_shell`].
 pub struct ShellExec;
 
 #[async_trait]
@@ -20,7 +21,9 @@ impl Action for ShellExec {
 
     async fn run(&self, ctx: ActionCtx) -> Result<ActionOutcome, ActionError> {
         let command = super::arg_str(&ctx.args, "command")?;
-        let out = super::exec("sh", &["-c", command], &ctx.workdir).await?;
+        let shell = crate::provider::posix_shell()
+            .map_err(|e| ActionError::Other(anyhow::anyhow!("{e}")))?;
+        let out = super::exec(shell, &["-c", command], &ctx.workdir).await?;
         let mut outputs = IndexMap::new();
         outputs.insert("stdout".to_owned(), Value::String(out.stdout));
         Ok(ActionOutcome {
