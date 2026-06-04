@@ -88,8 +88,10 @@ The snippet above is **abridged** — the full file adds `git.commit` + `git.pus
 [`multi-agent-eval.yaml`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out),
 [`gated-deploy.yaml`](examples/gated-deploy.yaml) (a human `approval:` gate),
 [`self-correct.yaml`](examples/self-correct.yaml) (single-step `retry` with feedback),
-[`iterate.yaml`](examples/iterate.yaml) (a multi-step `loop:` until a check passes), and
-[`triage.yaml`](examples/triage.yaml) (`case:` branching with a merge-back).
+[`iterate.yaml`](examples/iterate.yaml) (a multi-step `loop:` until a check passes),
+[`triage.yaml`](examples/triage.yaml) (`case:` branching with a merge-back),
+[`ship-release.yaml`](examples/ship-release.yaml) (a `slot_pool` with `reset: reclone`, a `bool` param, and `shell.exec`), and
+[`loop-with-case.yaml`](examples/loop-with-case.yaml) (a `case:` selector nested inside a `loop:`).
 
 ## Why "library-first"?
 

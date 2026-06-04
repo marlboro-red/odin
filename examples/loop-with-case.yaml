@@ -1,0 +1,49 @@
+# Showcase: a `case:` selector nested INSIDE a `loop:` body. Each iteration runs the tests,
+# classifies how they failed, and re-prompts the fixer with that classification — repeating until
+# the tests pass (or `max` iterations elapse). Combines two control-flow features: the multi-step
+# `loop:` (see `iterate.yaml`) and the `case:` branch selector (see `triage.yaml`).
+#
+# The loop body is a self-contained sub-DAG: `test` → `classify` (a case selector over `test`'s
+# result) → `repair` (re-prompts using the selected label and the iteration counter). Inner step
+# ids are globally unique and the case is validated like any top-level one (ODIN033–036).
+#
+# A VALIDATION showcase (running it needs a real repo + the `claude` CLI). Validates cleanly.
+#
+#   odin validate examples/loop-with-case.yaml
+
+schema_version: "1.0"
+name: loop-with-case
+description: Iterate fixes, branching each round on the kind of failure, until tests pass.
+durable: true # loops checkpoint per iteration, so a crash resumes mid-loop
+
+workspace:
+  type: worktree
+
+steps:
+  - id: fix
+    loop:
+      until: "steps.test.status == 'passed'"
+      max: 4
+      steps:
+        - id: test
+          run: "cargo test --quiet"
+
+        - id: classify
+          # The case records `outputs.selected`: the first branch whose `when:` holds, else `else`.
+          case:
+            branches:
+              - label: compile
+                when: "steps.test.exit_code != 0"
+            else: runtime
+          depends_on: [test]
+
+        - id: repair
+          provider: claude
+          prompt: |
+            The tests failed with a {{ steps.classify.outputs.selected }} problem (iteration
+            {{ loop.counter }}). Fix the most likely cause and stop.
+          depends_on: [classify]
+
+  - id: report
+    run: "echo 'converged after' {{ steps.fix.outputs.iterations }} 'iteration(s)'"
+    depends_on: [fix]

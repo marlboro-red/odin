@@ -11,6 +11,8 @@ const GATED_DEPLOY: &str = include_str!("../../../examples/gated-deploy.yaml");
 const ITERATE: &str = include_str!("../../../examples/iterate.yaml");
 const SELF_CORRECT: &str = include_str!("../../../examples/self-correct.yaml");
 const TRIAGE: &str = include_str!("../../../examples/triage.yaml");
+const SHIP_RELEASE: &str = include_str!("../../../examples/ship-release.yaml");
+const LOOP_WITH_CASE: &str = include_str!("../../../examples/loop-with-case.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -196,5 +198,43 @@ fn triage_validates_and_branches_on_a_case() {
     assert!(
         wf.steps.iter().any(|s| matches!(s.kind, StepKind::Case(_))),
         "triage must demonstrate a case selector"
+    );
+}
+
+#[test]
+fn ship_release_validates_and_uses_shell_exec() {
+    use odin_core::StepKind;
+    let wf = Workflow::from_yaml_str(SHIP_RELEASE).expect("parses");
+    assert!(
+        validate_source(SHIP_RELEASE, &wf, &KnownNames::builtin()).is_empty(),
+        "ship-release should validate clean"
+    );
+    assert!(
+        wf.steps
+            .iter()
+            .any(|s| matches!(&s.kind, StepKind::Action(a) if a.action == "shell.exec")),
+        "ship-release must demonstrate the shell.exec action"
+    );
+}
+
+#[test]
+fn loop_with_case_validates_and_nests_a_case_in_the_loop() {
+    use odin_core::StepKind;
+    let wf = Workflow::from_yaml_str(LOOP_WITH_CASE).expect("parses");
+    assert!(
+        validate_source(LOOP_WITH_CASE, &wf, &KnownNames::builtin()).is_empty(),
+        "loop-with-case should validate clean"
+    );
+    let body = wf
+        .steps
+        .iter()
+        .find_map(|s| match &s.kind {
+            StepKind::Loop(l) => Some(&l.steps),
+            _ => None,
+        })
+        .expect("loop-with-case must have a loop");
+    assert!(
+        body.iter().any(|s| matches!(s.kind, StepKind::Case(_))),
+        "the loop body must nest a case selector"
     );
 }
