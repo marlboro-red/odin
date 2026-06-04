@@ -4,12 +4,15 @@
 # prompt_file, requires/produces + the built-in DIFF, a gates map, a cross-provider
 # judge, retry with an (inert) fallback, timeouts, when-conditionals, and a fan-in DAG.
 #
-# It is intentionally NOT clean: it triggers exactly one warning so you can see the
+# It is intentionally NOT clean: it triggers exactly two warnings so you can see the
 # validator's warning path —
 #   ODIN023  (`on_fallback_provider` is parsed but inert in v1)
-# Remove the `on_fallback_provider` line for a diagnostic-free file. (Tip: if you add
-# `DIFF` to a step's `produces`, you'll see ODIN019 — DIFF is auto-captured, so listing
-# it is an error.)
+#   ODIN044  (`durable` + a `slot_pool` workspace: pool lease state is in-memory and lost on a
+#             restart, so a resumed run may race another for its slot — prefer `worktree` if you
+#             need durable crash-resume *and* bounded concurrency; here it's a deliberate showcase)
+# Remove the `on_fallback_provider` line (and switch to a `worktree` workspace) for a
+# diagnostic-free file. (Tip: if you add `DIFF` to a step's `produces`, you'll see ODIN019 — DIFF
+# is auto-captured, so listing it is an error.)
 #
 #   odin validate examples/fix-flaky-test.yaml
 #

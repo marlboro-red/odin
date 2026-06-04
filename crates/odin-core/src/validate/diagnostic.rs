@@ -134,6 +134,14 @@ pub enum DiagCode {
     /// ODIN042 — a `loop:` selector step carries `gates:`/`judge:`/`scratch:` of its own, which
     /// are inert — verification is the body's `until`, not gates on the loop node (warning).
     LoopInertChecks,
+    /// ODIN043 — a `loop:` body step sets `scratch: true`. Loop bodies run **sequentially** on the
+    /// shared workdir; a scratch inner step's edits would land in a throwaway worktree (invisible
+    /// to later inner steps, the `until` check, and the snapshot) and its worktrees would leak.
+    LoopBodyScratch,
+    /// ODIN044 — a `durable: true` workflow uses a `slot_pool` workspace. Pool lease state is
+    /// in-memory, so a run resumed after a restart may execute against a slot the fresh pool no
+    /// longer knows is leased; prefer `worktree` for durable + bounded concurrency (warning).
+    SlotPoolNotDurable,
 }
 
 impl DiagCode {
@@ -183,6 +191,8 @@ impl DiagCode {
             DiagCode::LoopNested => "ODIN040",
             DiagCode::LoopInnerApproval => "ODIN041",
             DiagCode::LoopInertChecks => "ODIN042",
+            DiagCode::LoopBodyScratch => "ODIN043",
+            DiagCode::SlotPoolNotDurable => "ODIN044",
         }
     }
 
@@ -201,7 +211,8 @@ impl DiagCode {
             | DiagCode::DynamicTemplateRef
             | DiagCode::TriggerIntoShell
             | DiagCode::CaseInertChecks
-            | DiagCode::LoopInertChecks => Severity::Warning,
+            | DiagCode::LoopInertChecks
+            | DiagCode::SlotPoolNotDurable => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -395,13 +406,15 @@ mod tests {
             DiagCode::LoopNested,
             DiagCode::LoopInnerApproval,
             DiagCode::LoopInertChecks,
+            DiagCode::LoopBodyScratch,
+            DiagCode::SlotPoolNotDurable,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 42);
+        assert_eq!(seen.len(), 44);
     }
 
     #[test]

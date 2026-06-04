@@ -1579,7 +1579,7 @@ impl EngineBuilder {
 | 1 | **ODIN001** | Error | `steps` is non-empty | `workflow has no steps` |
 | 2 | **ODIN002** | Error | Each `step.id` non-empty after trim | `step #{i} has an empty id` |
 | 3 | **ODIN003** | Error | `step.id` unique | `duplicate step id "build" (first at steps[1])` |
-| 4 | **ODIN004** | Error | `step.id` matches `^[A-Za-z_][A-Za-z0-9_-]*$` (valid template path segment) | `step id "fix it" is invalid: use letters/digits/_/- and start with a letter or _` |
+| 4 | **ODIN004** | Error | `step.id` matches `^[A-Za-z_][A-Za-z0-9_]*$` (valid template path segment; no hyphens — `a-b` parses as `a - b` in a template) | `step id "fix it" is invalid: use letters/digits/_ and start with a letter or _` |
 | 5 | **ODIN005** | Error | Every `ProviderRef` (`provider:`, `judge.provider`, `on_fallback_provider`) is a known provider | `step "fix": unknown provider "claud"` + help `known: claude, codex, copilot` + `did you mean "claude"?` (Levenshtein) |
 | 6 | **ODIN006** | Error | Provider step has at least one prompt source OR a documented continuation (else error) | `provider step "x" has no prompt; set prompt: or prompt_file:` |
 | 7 | **ODIN007** | Error | A step's `produces` has no duplicate names | `step "x" produces "REPORT" more than once` |

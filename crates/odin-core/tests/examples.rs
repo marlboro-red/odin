@@ -49,16 +49,19 @@ fn nightly_maintenance_is_clean_and_cron_triggered() {
 }
 
 #[test]
-fn fix_flaky_has_only_the_documented_warning() {
+fn fix_flaky_has_only_the_documented_warnings() {
     let wf = Workflow::from_yaml_str(FIX_FLAKY).expect("parses");
     let report = validate_source(FIX_FLAKY, &wf, &KnownNames::builtin());
     assert!(!report.has_errors(), "expected no errors, got:\n{report}");
+    // Two documented warnings: the inert `on_fallback_provider` (ODIN023) and, because the example
+    // pairs `durable` with a `slot_pool` workspace, the resume-fragility advisory (ODIN044).
     assert_eq!(
         report.warning_count(),
-        1,
-        "expected exactly one warning:\n{report}"
+        2,
+        "expected exactly two warnings:\n{report}"
     );
     assert!(report.contains(DiagCode::InertFallbackProvider));
+    assert!(report.contains(DiagCode::SlotPoolNotDurable));
 }
 
 #[test]
@@ -125,8 +128,9 @@ fn fix_flaky_round_trip_preserves_rich_content() {
     assert!((judge.threshold - 0.7).abs() < f32::EPSILON);
     assert!(again.steps.iter().any(|s| s.when.is_some()), "when dropped");
 
-    // And the reserialized form still validates to exactly the documented warning.
+    // And the reserialized form still validates to exactly the documented warnings.
     let report = validate_source(&reserialized, &again, &KnownNames::builtin());
-    assert_eq!(report.warning_count(), 1);
+    assert_eq!(report.warning_count(), 2);
     assert!(report.contains(DiagCode::InertFallbackProvider));
+    assert!(report.contains(DiagCode::SlotPoolNotDurable));
 }
