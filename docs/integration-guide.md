@@ -266,7 +266,7 @@ returns an `ActionOutcome`. Build it with `ActionOutcome::success().with_output(
 `shell.exec`, `git.commit`, `git.push`, `github.open_pr` (the last is idempotent — it
 reattaches to an existing open PR on the head branch instead of duplicating).
 
-### `Trigger` — a source of run-starting events
+### <a id="trigger"></a>`Trigger` — a source of run-starting events
 
 ```rust
 #[async_trait]
