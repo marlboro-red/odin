@@ -62,8 +62,8 @@ use crate::ir::{Backoff, FeedbackMode, JudgeSpec, Step, StepKind, Workflow, Work
 use crate::provider::process::{ProcessOptions, run_process};
 use crate::registry::Registry;
 use crate::traits::{
-    AcquireCtx, ActionCtx, CancelToken, InvocationCtx, PrunePolicy, PruneReport, RunEvent,
-    RunState, StepState, Store, Workspace, WorkspaceHandle,
+    AcquireCtx, ActionCtx, CancelToken, InvocationCtx, LoopProgress, PrunePolicy, PruneReport,
+    RunEvent, RunState, StepState, Store, Workspace, WorkspaceHandle,
 };
 use crate::usage::Usage;
 use crate::workspace::{SlotPoolWorkspace, WorktreeWorkspace};
@@ -1049,7 +1049,12 @@ impl LocalEngine {
     ///
     /// If `read-tree` fails (e.g. the snapshot commit was reaped), the restore is abandoned
     /// WITHOUT running `clean`, leaving the workspace untouched rather than half-reset.
-    async fn restore_workdir(&self, workdir: &Path, target: &str, cancel: &CancelToken) {
+    ///
+    /// Returns `true` iff the worktree was actually reset to `target`. A caller that advances
+    /// resume state on the assumption the restore happened (the loop re-entering at a later
+    /// iteration) MUST gate on this — otherwise a reaped snapshot would skip iterations whose work
+    /// is no longer present, re-entering against a tree that lacks it.
+    async fn restore_workdir(&self, workdir: &Path, target: &str, cancel: &CancelToken) -> bool {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             ..ProcessOptions::default()
@@ -1067,12 +1072,13 @@ impl LocalEngine {
             )
             .await;
         }
+        reset_ok
     }
 
     /// Drops the run's snapshot refs so their dangling commits become collectable: the durable
-    /// per-run ref, plus any per-step retry rewind refs (`refs/odin/retry/<id>/*`) a crash or
-    /// cancel mid-retry-loop left behind (the happy path drops each one when its step settles).
-    /// Best effort.
+    /// per-run ref, plus any per-step retry rewind refs (`refs/odin/retry/<id>/*`) and per-loop
+    /// iteration refs (`refs/odin/loop/<id>/*`) a crash or cancel left behind (the happy path drops
+    /// each one when its step settles). Best effort.
     async fn delete_snapshot_ref(&self, workdir: &Path, run_id: RunId, cancel: &CancelToken) {
         self.delete_ref(workdir, &format!("refs/odin/run/{run_id}"), cancel)
             .await;
@@ -1080,15 +1086,20 @@ impl LocalEngine {
             workdir: Some(workdir.to_path_buf()),
             ..ProcessOptions::default()
         };
-        // List the run's retry refs (a trailing `/` matches the whole hierarchy) and drop each.
-        let list = [
-            "for-each-ref".to_owned(),
-            "--format=%(refname)".to_owned(),
+        // List the run's transient refs (a trailing `/` matches the whole hierarchy) and drop each.
+        for prefix in [
             format!("refs/odin/retry/{run_id}/"),
-        ];
-        if let Ok(out) = run_process("git", &list, &opts, cancel).await {
-            for refname in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                self.delete_ref(workdir, refname, cancel).await;
+            format!("refs/odin/loop/{run_id}/"),
+        ] {
+            let list = [
+                "for-each-ref".to_owned(),
+                "--format=%(refname)".to_owned(),
+                prefix,
+            ];
+            if let Ok(out) = run_process("git", &list, &opts, cancel).await {
+                for refname in out.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    self.delete_ref(workdir, refname, cancel).await;
+                }
             }
         }
     }
@@ -1471,13 +1482,13 @@ impl LocalEngine {
     /// template context but never enter `state.steps` (which would collide and confuse resume); the
     /// loop appears to the rest of the run as a single step. Inner side effects and usage are folded
     /// up into the aggregate outcome.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_loop(
         &self,
         run_id: RunId,
         step: &Step,
         l: &crate::ir::LoopStep,
-        state: &RunState,
+        state: &mut RunState,
         workdir: &Path,
         params: &IndexMap<String, Value>,
         base_commit: Option<&str>,
@@ -1485,7 +1496,8 @@ impl LocalEngine {
         workflow: &Workflow,
         cancel: &CancelToken,
     ) -> Result<StepOutcome> {
-        let _ = step; // (the loop step's own id is folded by the caller; reserved for PR-3b resume)
+        let durable = workflow.durable;
+        let loop_ref = format!("refs/odin/loop/{run_id}/{}", step.id.as_str());
         let max = u32::from(l.max);
         let inner_order = crate::validate::graph::topo_order(&l.steps)
             .unwrap_or_else(|_| l.steps.iter().map(|s| s.id.clone()).collect());
@@ -1497,7 +1509,26 @@ impl LocalEngine {
         let mut side_effects: Vec<SideEffect> = Vec::new();
         let mut usage = Usage::default();
 
-        let mut iteration: u32 = 0;
+        // Resume: if a clean per-iteration snapshot survives, restore the workdir to it and
+        // re-enter at the next iteration (skipping the ones that already completed). Only while
+        // HEAD is still at base — once an inner step committed, rewinding would corrupt the run
+        // branch, so a committed loop restarts from iteration 1 (the documented degradation).
+        let mut start: u32 = 0;
+        if let Some(p) = state.loop_state.get(&step.id) {
+            if let Some(snap) = p.iteration_snapshot.clone() {
+                let at_base = base_commit.is_some()
+                    && self.git_head(workdir, cancel).await.as_deref() == base_commit;
+                // Advance `start` ONLY if the workdir was actually restored — a reaped snapshot
+                // (read-tree failed) leaves the tree without those iterations' work, so we must
+                // restart from iteration 1 rather than skip to a later one.
+                if at_base && self.restore_workdir(workdir, &snap, cancel).await {
+                    start = p.last_completed_iteration;
+                    feedback = p.feedback.clone().unwrap_or_default();
+                }
+            }
+        }
+
+        let mut iteration: u32 = start;
         let mut outcome = loop {
             iteration += 1;
             // Per-iteration inner states (transient): each inner step sees the outer run plus the
@@ -1582,6 +1613,32 @@ impl LocalEngine {
                         break o;
                     }
                     feedback = clip_tail(&last_failure.unwrap_or_default(), FEEDBACK_MAX);
+                    // Durable per-iteration checkpoint: snapshot the accumulated workdir (only
+                    // while HEAD is still at base — an inner commit disengages snapshots) and
+                    // record progress, so a crash before the next iteration resumes here.
+                    let snapshot = if durable {
+                        let at_base = base_commit.is_some()
+                            && self.git_head(workdir, cancel).await.as_deref() == base_commit;
+                        match base_commit.filter(|_| at_base) {
+                            Some(base) => {
+                                self.snapshot_to_ref(workdir, base, run_id, &loop_ref, cancel)
+                                    .await
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    state.loop_state.insert(
+                        step.id.clone(),
+                        LoopProgress {
+                            last_completed_iteration: iteration,
+                            iteration_snapshot: snapshot,
+                            feedback: Some(feedback.clone()),
+                        },
+                    );
+                    state.updated_at = Utc::now();
+                    self.checkpoint(durable, state).await?;
                 }
                 Err(e) => {
                     let mut o = StepOutcome::failed(format!("loop `until` evaluation failed: {e}"));
@@ -1590,6 +1647,12 @@ impl LocalEngine {
                 }
             }
         };
+        // The loop settled: clear its progress and drop the snapshot ref so its dangling commit is
+        // collectable. The caller's post-step block persists the cleared `loop_state`.
+        state.loop_state.shift_remove(&step.id);
+        if durable {
+            self.delete_ref(workdir, &loop_ref, cancel).await;
+        }
         outcome.usage = Some(usage);
         outcome.side_effects = side_effects;
         Ok(outcome)
@@ -1822,6 +1885,7 @@ impl Engine for LocalEngine {
             workspace: Some(handle.clone()),
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: started_at,
             updated_at: started_at,
         };
@@ -2914,6 +2978,7 @@ steps:
             workspace: Some(handle),
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3005,6 +3070,7 @@ steps:
             workspace: Some(handle),
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3089,6 +3155,7 @@ steps:
             workspace: Some(handle),
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3176,6 +3243,7 @@ steps:
             workspace: Some(handle),
             base_commit: Some(base),
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3260,6 +3328,7 @@ steps:
             workspace: Some(handle),
             base_commit: Some(base),
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3377,6 +3446,7 @@ steps:
             base_commit: Some(base.clone()),
             // STALE: points at the pre-commit base, but HEAD has advanced past it.
             snapshot: Some(base),
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3452,6 +3522,7 @@ steps:
             workspace: Some(handle),
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3527,6 +3598,7 @@ steps:
             }),
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -3960,6 +4032,137 @@ steps:
     }
 
     #[tokio::test]
+    async fn loop_clears_its_progress_when_it_settles() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        // A loop that takes a few iterations writes per-iteration loop_state, which must be cleared
+        // when it converges — otherwise a later, unrelated resume would see stale progress.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"loop.counter >= 3\"\n      max: 5\n      steps:\n        - {id: noop, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let persisted = store.load_run(s.run_id).await.unwrap().unwrap();
+        assert!(
+            persisted.loop_state.is_empty(),
+            "loop_state must be cleared once the loop settles: {:?}",
+            persisted.loop_state
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_resumes_from_the_last_completed_iteration() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nparams:\n  logfile: { type: string, required: true }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.check.status == 'passed'\"\n      max: 10\n      steps:\n        - {id: log, run: \"echo x >> {{ params.logfile }}\"}\n        - {id: check, run: \"[ {{ loop.counter }} -ge 4 ]\", depends_on: [log]}\n",
+        );
+
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: wf.workspace.clone(),
+            })
+            .await
+            .unwrap();
+        let wpath = handle.path.clone();
+        let base = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&wpath)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned();
+
+        // An external log (outside the worktree, so untouched by the snapshot/restore) records
+        // every body run; seeded with 2 lines as if iterations 1-2 ran before the crash.
+        let logfile = std::env::temp_dir().join(format!("odin-loop-log-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&logfile, "L\nL\n").unwrap();
+
+        // Crash state: `fix` is Running with 2 iterations completed; the snapshot is the base
+        // commit itself (a valid commit → restore is a no-op, but `start` is set to 2 so the loop
+        // re-enters at iteration 3).
+        let mut loop_state = IndexMap::new();
+        loop_state.insert(
+            StepId::new("fix"),
+            LoopProgress {
+                last_completed_iteration: 2,
+                iteration_snapshot: Some(base.clone()),
+                feedback: None,
+            },
+        );
+        let mut steps = IndexMap::new();
+        steps.insert(
+            StepId::new("fix"),
+            StepState {
+                status: StepStatus::Running,
+                attempts: 1,
+                exit_code: None,
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: Vec::new(),
+                error: None,
+            },
+        );
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
+            input: RunInput::manual().param("logfile", logfile.to_str().unwrap()),
+            workspace: Some(handle),
+            base_commit: Some(base),
+            snapshot: None,
+            loop_state,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        assert_eq!(
+            summaries[0].status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            summaries[0].error
+        );
+        let fix = summaries[0]
+            .steps
+            .iter()
+            .find(|x| x.id.as_str() == "fix")
+            .unwrap();
+        assert_eq!(
+            fix.outputs
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(4),
+            "the counter must continue from the resumed iteration"
+        );
+        let lines = std::fs::read_to_string(&logfile).unwrap().lines().count();
+        let _ = std::fs::remove_file(&logfile);
+        assert_eq!(
+            lines, 4,
+            "only iterations 3-4 should re-run (2 pre-crash + 2 = 4); a from-scratch restart \
+             would re-run all four and give 6"
+        );
+    }
+
+    #[tokio::test]
     async fn approval_gate_pauses_then_resumes_on_approve() {
         let repo = init_repo().await;
         let eng = engine(
@@ -4254,6 +4457,7 @@ steps:
             workspace: None,
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

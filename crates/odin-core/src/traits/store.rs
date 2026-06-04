@@ -225,6 +225,10 @@ pub struct RunState {
     /// restored to it so a step interrupted mid-edit re-runs from a clean state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<String>,
+    /// Per-iteration progress of any in-flight `loop:` steps, keyed by loop step id (see
+    /// [`LoopProgress`]). Empty unless a loop is mid-flight; cleared when each loop settles.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub loop_state: IndexMap<StepId, LoopProgress>,
     /// When the run was created.
     pub created_at: DateTime<Utc>,
     /// When the run state was last updated.
@@ -262,6 +266,24 @@ pub struct StepState {
     /// dependency failed). Persisted so a failed run is debuggable. `None` for a passed step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// Per-iteration durable progress of a running `loop:` step, so a crash mid-loop resumes from the
+/// last completed iteration rather than re-running the whole loop. Keyed by the loop step's id in
+/// [`RunState::loop_state`]; present only while the loop runs, cleared when it settles.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LoopProgress {
+    /// Iterations that fully completed (1-based count); resume re-enters at the next one.
+    pub last_completed_iteration: u32,
+    /// Off-branch snapshot of the workspace as of `last_completed_iteration`, anchored by
+    /// `refs/odin/loop/<run>/<loop-id>`. `None` when no clean snapshot exists (an inner step
+    /// committed, moving HEAD off base) — then resume restarts the loop from iteration 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iteration_snapshot: Option<String>,
+    /// The `loop.feedback` to seed the next iteration with (the prior iteration's failure).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<String>,
 }
 
 /// An immutable audit-log entry. Both the enum and each variant are `#[non_exhaustive]`,

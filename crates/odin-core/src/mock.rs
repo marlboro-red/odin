@@ -187,6 +187,7 @@ mod tests {
             workspace: None,
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

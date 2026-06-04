@@ -493,6 +493,7 @@ mod tests {
             workspace: None,
             base_commit: None,
             snapshot: None,
+            loop_state: IndexMap::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
