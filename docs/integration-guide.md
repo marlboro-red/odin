@@ -27,7 +27,9 @@ results.
 
 ```toml
 [dependencies]
-odin-core = "0.0.1"   # default features = ["full"]
+# Odin is not yet published to crates.io — the `odin-core` name there is an UNRELATED crate, so
+# `cargo add odin-core` would pull the wrong thing. Depend on git until it's published:
+odin-core = { git = "https://github.com/marlboro-red/odin" }   # omitting features → the `full` set
 ```
 
 `odin-core`'s public API is plain, serializable data plus five small object-safe traits.
@@ -46,7 +48,7 @@ Everything you need to embed Odin lives here.
 A parse-only embedder (a linter, an editor plugin) pulls in none of `tokio`:
 
 ```toml
-odin-core = { version = "0.0.1", default-features = false, features = ["ir", "templating"] }
+odin-core = { git = "https://github.com/marlboro-red/odin", default-features = false, features = ["ir", "templating"] }
 ```
 
 Note: the `Engine`/`EngineBuilder` require **both** `runtime` and `templating` (they're in
