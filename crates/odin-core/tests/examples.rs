@@ -13,6 +13,7 @@ const SELF_CORRECT: &str = include_str!("../../../examples/self-correct.yaml");
 const TRIAGE: &str = include_str!("../../../examples/triage.yaml");
 const SHIP_RELEASE: &str = include_str!("../../../examples/ship-release.yaml");
 const LOOP_WITH_CASE: &str = include_str!("../../../examples/loop-with-case.yaml");
+const ADVERSARIAL_REVIEW: &str = include_str!("../../../examples/adversarial-review.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -236,5 +237,39 @@ fn loop_with_case_validates_and_nests_a_case_in_the_loop() {
     assert!(
         body.iter().any(|s| matches!(s.kind, StepKind::Case(_))),
         "the loop body must nest a case selector"
+    );
+}
+
+#[test]
+fn adversarial_review_validates_and_fans_out_reviewers() {
+    use odin_core::StepKind;
+    // Odin reviewing its own PRs: webhook-triggered, three concurrent scratch reviewers, a
+    // cross-provider judge, and an approval gate before the comment is posted.
+    let wf = Workflow::from_yaml_str(ADVERSARIAL_REVIEW).expect("parses");
+    assert!(
+        validate_source(ADVERSARIAL_REVIEW, &wf, &KnownNames::builtin()).is_empty(),
+        "adversarial-review should validate clean"
+    );
+    assert!(
+        wf.triggers
+            .iter()
+            .any(|t| matches!(t, odin_core::ir::TriggerDecl::GithubWebhook(_))),
+        "must be webhook-triggered (the dogfood entry point)"
+    );
+    assert_eq!(
+        wf.steps.iter().filter(|s| s.scratch).count(),
+        3,
+        "three concurrent scratch reviewers"
+    );
+    assert_eq!(wf.max_parallel.map(std::num::NonZeroUsize::get), Some(3));
+    assert!(
+        wf.steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Approval(_))),
+        "an approval gate before posting"
+    );
+    assert!(
+        wf.steps.iter().any(|s| s.judge.is_some()),
+        "a cross-provider judge on the synthesis"
     );
 }
