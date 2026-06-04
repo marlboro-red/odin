@@ -16,7 +16,7 @@ pub use duration::HumanDuration;
 pub use params::{ParamSpec, ParamType};
 pub use step::{
     ActionStep, ApprovalStep, Artifacts, Backoff, CaseBranch, CaseStep, FeedbackMode, JudgeSpec,
-    ProviderStep, RetrySpec, RunStep, Step, StepKind,
+    LoopStep, ProviderStep, RetrySpec, RunStep, Step, StepKind,
 };
 pub use trigger::{CronDecl, GithubWebhookDecl, TriggerDecl};
 pub use workflow::{

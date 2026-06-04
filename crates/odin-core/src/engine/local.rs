@@ -591,6 +591,13 @@ impl LocalEngine {
                 outputs.insert("selected".to_owned(), Value::String(selected));
                 StepOutcome::passing(0, outputs, None)
             }
+            // A `loop:` step is driven by the scheduler (`execute`), which owns `&mut state` for
+            // per-iteration checkpointing — like `approval:`, it never reaches `dispatch`. (The
+            // iterating mini-driver lands in a follow-up; until then a loop step fails loudly here
+            // rather than silently no-op'ing.)
+            StepKind::Loop(_) => {
+                StepOutcome::failed("internal: a loop step was dispatched".to_owned())
+            }
         }
     }
 
