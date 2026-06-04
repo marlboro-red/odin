@@ -1180,14 +1180,25 @@ impl LocalEngine {
         let mut results: IndexMap<StepId, StepResult> = IndexMap::new();
         // `settled` = steps in a terminal status (Passed/Failed/Skipped); a step is *ready*
         // once all its deps are settled. Seeded from a resume with already-finished steps.
+        //
+        // A `Failed` step is seeded too: its retries were already exhausted before the crash, so
+        // re-running it would grant attempts beyond its policy AND leave the run inconsistent —
+        // its dependents are recorded `Skipped` (and seeded as such), so if the failed step
+        // re-ran and now passed, those dependents would stay frozen-skipped forever. Seeding the
+        // failure keeps the resumed run deterministic (the failure and its skip-cascade hold) and
+        // a genuinely independent branch still proceeds.
         let mut settled: HashSet<StepId> = HashSet::new();
         for (id, st) in &state.steps {
-            if matches!(st.status, StepStatus::Passed | StepStatus::Skipped) {
+            if matches!(
+                st.status,
+                StepStatus::Passed | StepStatus::Failed | StepStatus::Skipped
+            ) {
                 settled.insert(id.clone());
                 results.insert(id.clone(), step_result(id, st));
-                // Carry forward side effects already recorded by finished steps; they won't
-                // re-run, so without this a resumed run's summary would drop every PR/commit/
-                // push from before the crash.
+                // Carry forward side effects already recorded by finished steps (including a
+                // failed step's — e.g. a push that landed before a later gate failed); they won't
+                // re-run, so without this a resumed run's summary would drop every PR/commit/push
+                // from before the crash.
                 side_effects.extend(st.side_effects.iter().cloned());
             }
         }
@@ -3230,6 +3241,109 @@ steps:
                 .any(|s| matches!(s, SideEffect::Commit { .. })),
             "the pre-crash side effect must be reconstructed from persisted state: {:?}",
             summaries[0].side_effects
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_a_failed_step_failed_and_its_dependents_skipped() {
+        // A step that FAILED before the crash (retries exhausted) must NOT re-run on resume —
+        // re-running would grant attempts beyond its policy and, since its dependents are recorded
+        // Skipped, leave them frozen-skipped if it now passed. Here `b`'s command is `true` (it
+        // would PASS if re-run), so the buggy behavior resumes to Succeeded; the fix keeps `b`
+        // Failed and `c` Skipped → the run stays Failed, and `b`'s pre-crash side effect survives.
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: f\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"true\"}\n  - {id: b, run: \"true\", depends_on: [a]}\n  - {id: c, run: \"true\", depends_on: [b]}\n",
+        );
+        let ws = WorktreeWorkspace::new(repo.path());
+        let run_id = RunId::new();
+        let handle = ws
+            .acquire(AcquireCtx {
+                run_id,
+                config: wf.workspace.clone(),
+            })
+            .await
+            .unwrap();
+        let mut steps = IndexMap::new();
+        let passed = |code: i32| StepState {
+            status: StepStatus::Passed,
+            attempts: 1,
+            exit_code: Some(code),
+            outputs: IndexMap::new(),
+            usage: None,
+            gates: IndexMap::new(),
+            judge_score: None,
+            side_effects: Vec::new(),
+            error: None,
+        };
+        steps.insert(StepId::new("a"), passed(0));
+        steps.insert(
+            StepId::new("b"),
+            StepState {
+                status: StepStatus::Failed,
+                attempts: 2,
+                exit_code: Some(1),
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: vec![SideEffect::commit("def456", Some("main".to_owned()))],
+                error: Some("boom".to_owned()),
+            },
+        );
+        steps.insert(
+            StepId::new("c"),
+            StepState {
+                status: StepStatus::Skipped,
+                attempts: 0,
+                exit_code: None,
+                outputs: IndexMap::new(),
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: Vec::new(),
+                error: Some("an upstream dependency did not pass".to_owned()),
+            },
+        );
+        let state = RunState {
+            run_id,
+            workflow: wf.name.clone(),
+            schema_major: 1,
+            status: RunStatus::Running,
+            error: None,
+            steps,
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: Some(handle),
+            base_commit: None,
+            snapshot: None,
+            loop_state: IndexMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        store.checkpoint(&state).await.unwrap();
+
+        let summaries = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        let s = &summaries[0];
+        assert_eq!(
+            s.status,
+            RunStatus::Failed,
+            "a settled failure must stay failed"
+        );
+        let by = |id: &str| s.steps.iter().find(|x| x.id.as_str() == id).unwrap();
+        assert_eq!(by("b").status, StepStatus::Failed, "b must not re-run");
+        assert_eq!(by("c").status, StepStatus::Skipped, "c must stay skipped");
+        assert!(
+            s.side_effects
+                .iter()
+                .any(|e| matches!(e, SideEffect::Commit { .. })),
+            "the failed step's pre-crash side effect must survive: {:?}",
+            s.side_effects
         );
     }
 
