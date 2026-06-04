@@ -1,6 +1,7 @@
 //! The [`Action`] trait: a built-in, named side-effect step.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
@@ -9,6 +10,7 @@ use serde_json::Value;
 use crate::api::SideEffect;
 use crate::error::ActionError;
 use crate::ids::StepId;
+use crate::traits::CancelToken;
 
 /// A first-class, reusable side-effect available by name in `action:`
 /// (`github.open_pr`, `git.commit`, `shell.exec`). Distinct from a non-deterministic
@@ -35,6 +37,12 @@ pub struct ActionCtx {
     pub workdir: PathBuf,
     /// The step's `with:` args, already templated.
     pub args: IndexMap<String, Value>,
+    /// Fires when the run is cancelled (Ctrl-C, daemon shutdown). An action that shells out
+    /// MUST pass this to its subprocesses so a hung command (e.g. an interactive auth prompt)
+    /// can be killed instead of wedging the whole run.
+    pub cancel: CancelToken,
+    /// The step's wall-clock timeout, if any — apply it to subprocesses for the same reason.
+    pub timeout: Option<Duration>,
 }
 
 /// What an action produced.
@@ -45,6 +53,9 @@ pub struct ActionOutcome {
     pub exit_code: i32,
     /// Outputs exposed to later steps as `steps.<id>.outputs.*`.
     pub outputs: IndexMap<String, Value>,
+    /// Captured stderr, folded into the step's failure reason / `retry.feedback` when the action
+    /// fails (a non-zero `exit_code`) — so a failed `shell.exec` keeps its actual error.
+    pub stderr: String,
     /// Externally-visible effects, surfaced in [`crate::api::RunSummary`].
     pub side_effects: Vec<SideEffect>,
 }

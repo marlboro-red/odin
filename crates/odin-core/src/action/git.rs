@@ -24,7 +24,7 @@ impl Action for GitCommit {
 
     async fn run(&self, ctx: ActionCtx) -> Result<ActionOutcome, ActionError> {
         let message = super::arg_str(&ctx.args, "message")?;
-        let dir = &ctx.workdir;
+        let dir = &ctx;
 
         super::checked("git", &["add", "-A"], dir).await?;
         let staged = super::checked("git", &["diff", "--cached", "--name-only"], dir).await?;
@@ -48,6 +48,7 @@ impl Action for GitCommit {
         Ok(ActionOutcome {
             exit_code: 0,
             outputs,
+            stderr: String::new(),
             side_effects: vec![SideEffect::commit(sha, Some(branch))],
         })
     }
@@ -66,7 +67,7 @@ impl Action for GitPush {
     }
 
     async fn run(&self, ctx: ActionCtx) -> Result<ActionOutcome, ActionError> {
-        let dir = &ctx.workdir;
+        let dir = &ctx;
         let remote = super::arg_str_or(&ctx.args, "remote", "origin");
         let branch = match ctx.args.get("branch").and_then(Value::as_str) {
             Some(b) => b.to_owned(),
@@ -96,6 +97,7 @@ impl Action for GitPush {
         Ok(ActionOutcome {
             exit_code: 0,
             outputs,
+            stderr: String::new(),
             side_effects: vec![SideEffect::push(branch, remote)],
         })
     }
@@ -127,6 +129,8 @@ mod tests {
             step_id: StepId::new("s"),
             workdir: workdir.to_path_buf(),
             args,
+            cancel: crate::traits::CancelToken::default(),
+            timeout: None,
         }
     }
 
