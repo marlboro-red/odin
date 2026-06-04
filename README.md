@@ -131,14 +131,15 @@ The `Engine` façade needs **both** `runtime` and `templating` (it renders promp
 bundles both. `mock` is opt-in and is *not* part of `full`.
 
 ```toml
-# A linter that only parses and validates:
-odin-core = { version = "0.0.1", default-features = false, features = ["ir", "templating"] }
+# A linter that only parses and validates.
+# Not yet on crates.io (the `odin-core` there is an unrelated crate), so depend on git:
+odin-core = { git = "https://github.com/marlboro-red/odin", default-features = false, features = ["ir", "templating"] }
 ```
 
 ## Documentation
 
 - [Getting started](docs/getting-started.md) — build → validate → run → serve.
-- [Workflow reference](docs/workflow-reference.md) — every YAML field and all 32 `ODIN###`
+- [Workflow reference](docs/workflow-reference.md) — every YAML field and all 44 `ODIN###`
   diagnostics.
 - [Integration guide](docs/integration-guide.md) — embed `odin-core`: the five traits,
   `EngineBuilder`, custom plugins, data in/out, the daemon.
