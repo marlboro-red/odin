@@ -96,9 +96,10 @@ pub enum DiagCode {
     /// ODIN028 — an `action` step sets `scratch: true`; its workspace side effects are
     /// discarded with the throwaway worktree (warning).
     ScratchOnAction,
-    /// ODIN029 — a template accesses a statically-checked root (`params`/`steps`/`artifacts`)
-    /// with subscript syntax (`steps["a"]`); only dot notation is validated, so the
-    /// reference escapes the unknown-ref / upstream-dependency checks (warning).
+    /// ODIN029 — a template uses a construct that escapes static reference checking: subscript
+    /// syntax on a checked root (`steps["a"]`, only dot notation is validated), or a `{% set %}` /
+    /// `{% for %}` binding whose introduced name the checker can't follow. The reference escapes
+    /// the unknown-ref / upstream-dependency checks (warning).
     DynamicTemplateRef,
     /// ODIN030 — a param's `default` value does not match its declared `type`.
     ParamDefaultType,

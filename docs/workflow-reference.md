@@ -577,7 +577,7 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin026"></a>ODIN026 | **warning** | `schema_version` minor is newer than this engine supports. |
 | <a id="odin027"></a>ODIN027 | **warning** | A `github_webhook` trigger maps a param not declared in `params` (the mapping is inert). |
 | <a id="odin028"></a>ODIN028 | **warning** | An *action* step sets `scratch: true` (its side effects are discarded). |
-| <a id="odin029"></a>ODIN029 | **warning** | A template accesses a checked root (`params`/`steps`/`artifacts`) with **subscript** syntax (`steps["a"]`); only dot notation is statically checked, so the reference escapes the unknown-ref / upstream checks. |
+| <a id="odin029"></a>ODIN029 | **warning** | A template escapes static ref checking: **subscript** syntax on a checked root (`steps["a"]`, only dot notation is checked) or a `{% set %}`/`{% for %}` binding whose introduced name can't be followed. The reference escapes the unknown-ref / upstream checks. |
 | <a id="odin030"></a>ODIN030 | error | A param's `default` value does not match its declared `type`. |
 | <a id="odin031"></a>ODIN031 | **warning** | An untrusted `trigger.*` value is interpolated into a shell command — a `run:` step, a gate, or `shell.exec`'s `command` — so a webhook payload reaches `sh -c` unescaped (injection risk). Map the fields you trust into typed `params`.¹ |
 | <a id="odin032"></a>ODIN032 | error | A workflow with an `approval` gate is not `durable` — a paused gate is persisted and resumed from the store, so it can't be approved without durability. |
