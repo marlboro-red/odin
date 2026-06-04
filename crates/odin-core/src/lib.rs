@@ -130,8 +130,8 @@ pub use traits::{Action, Provider, Store, Trigger, Workspace};
 #[cfg(feature = "runtime")]
 pub use traits::{
     AcquireCtx, ActionCtx, ActionOutcome, CancelToken, InvocationCtx, InvocationOutcome,
-    PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState, RunStatusCount, StepState,
-    StoreMetrics, TriggerEvent, WorkspaceHandle,
+    LoopProgress, PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState, RunStatusCount,
+    StepState, StoreMetrics, TriggerEvent, WorkspaceHandle,
 };
 #[cfg(feature = "runtime")]
 pub use view::{GateView, RunDetailView, RunView, StepView};
