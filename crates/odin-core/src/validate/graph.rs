@@ -7,14 +7,16 @@
 use indexmap::{IndexMap, IndexSet};
 
 use crate::ids::StepId;
-use crate::ir::Workflow;
+use crate::ir::Step;
 
 /// Maps each step to its *declared* direct dependencies, dropping edges that point at
-/// undeclared steps (those are reported separately by `ODIN012`).
-fn dep_map(wf: &Workflow) -> IndexMap<StepId, Vec<StepId>> {
-    let declared: IndexSet<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
-    let mut m = IndexMap::with_capacity(wf.steps.len());
-    for s in &wf.steps {
+/// undeclared steps (those are reported separately by `ODIN012`). Operates on a step *slice*
+/// so the same logic serves the top-level DAG (`&wf.steps`) and a `loop:` body (`&loop.steps`),
+/// where an inner edge to an outer (out-of-slice) step is correctly dropped.
+fn dep_map(steps: &[Step]) -> IndexMap<StepId, Vec<StepId>> {
+    let declared: IndexSet<&str> = steps.iter().map(|s| s.id.as_str()).collect();
+    let mut m = IndexMap::with_capacity(steps.len());
+    for s in steps {
         let deps = s
             .depends_on
             .iter()
@@ -32,16 +34,13 @@ fn dep_map(wf: &Workflow) -> IndexMap<StepId, Vec<StepId>> {
 /// # Errors
 /// Returns `Err(remaining)` listing the steps that could not be ordered because they lie
 /// on or after a dependency cycle.
-pub fn topo_order(wf: &Workflow) -> Result<Vec<StepId>, Vec<StepId>> {
-    let deps = dep_map(wf);
+pub fn topo_order(steps: &[Step]) -> Result<Vec<StepId>, Vec<StepId>> {
+    let deps = dep_map(steps);
     let mut indeg: IndexMap<StepId, usize> =
         deps.iter().map(|(k, v)| (k.clone(), v.len())).collect();
 
-    let mut dependents: IndexMap<StepId, Vec<StepId>> = wf
-        .steps
-        .iter()
-        .map(|s| (s.id.clone(), Vec::new()))
-        .collect();
+    let mut dependents: IndexMap<StepId, Vec<StepId>> =
+        steps.iter().map(|s| (s.id.clone(), Vec::new())).collect();
     for (step, ds) in &deps {
         for d in ds {
             if let Some(list) = dependents.get_mut(d) {
@@ -51,14 +50,13 @@ pub fn topo_order(wf: &Workflow) -> Result<Vec<StepId>, Vec<StepId>> {
     }
 
     // Seed the queue in declaration order so the output is deterministic.
-    let mut queue: Vec<StepId> = wf
-        .steps
+    let mut queue: Vec<StepId> = steps
         .iter()
         .map(|s| s.id.clone())
         .filter(|id| indeg.get(id).copied() == Some(0))
         .collect();
 
-    let mut order = Vec::with_capacity(wf.steps.len());
+    let mut order = Vec::with_capacity(steps.len());
     let mut qi = 0;
     while qi < queue.len() {
         let n = queue[qi].clone();
@@ -74,7 +72,7 @@ pub fn topo_order(wf: &Workflow) -> Result<Vec<StepId>, Vec<StepId>> {
         }
     }
 
-    if order.len() == wf.steps.len() {
+    if order.len() == steps.len() {
         Ok(order)
     } else {
         let remaining = indeg
@@ -89,8 +87,8 @@ pub fn topo_order(wf: &Workflow) -> Result<Vec<StepId>, Vec<StepId>> {
 /// Finds one concrete dependency cycle, if any, as the ordered list of step ids that
 /// form it (e.g. `[a, b, a]`). Used to render a helpful `ODIN014` message.
 #[must_use]
-pub fn find_cycle(wf: &Workflow) -> Option<Vec<StepId>> {
-    let deps = dep_map(wf);
+pub fn find_cycle(steps: &[Step]) -> Option<Vec<StepId>> {
+    let deps = dep_map(steps);
     // 0 = unvisited, 1 = on the current DFS stack, 2 = fully explored.
     let mut color: IndexMap<StepId, u8> = deps.keys().map(|k| (k.clone(), 0u8)).collect();
     let mut stack: Vec<StepId> = Vec::new();
@@ -142,10 +140,10 @@ fn dfs_cycle(
 /// For each step, the set of all steps that are transitively upstream of it (its
 /// ancestors via `depends_on`). Cycle-safe: a `seen` guard prevents infinite loops.
 #[must_use]
-pub fn ancestor_sets(wf: &Workflow) -> IndexMap<StepId, IndexSet<StepId>> {
-    let deps = dep_map(wf);
-    let mut out = IndexMap::with_capacity(wf.steps.len());
-    for s in &wf.steps {
+pub fn ancestor_sets(steps: &[Step]) -> IndexMap<StepId, IndexSet<StepId>> {
+    let deps = dep_map(steps);
+    let mut out = IndexMap::with_capacity(steps.len());
+    for s in steps {
         let mut seen: IndexSet<StepId> = IndexSet::new();
         let mut frontier: Vec<StepId> = deps[&s.id].clone();
         while let Some(n) = frontier.pop() {
@@ -163,58 +161,58 @@ pub fn ancestor_sets(wf: &Workflow) -> IndexMap<StepId, IndexSet<StepId>> {
 #[cfg(test)]
 mod tests {
     use super::{ancestor_sets, find_cycle, topo_order};
-    use crate::ir::Workflow;
+    use crate::ir::{Step, Workflow};
 
-    fn wf(yaml: &str) -> Workflow {
-        Workflow::from_yaml_str(yaml).unwrap()
+    fn steps(yaml: &str) -> Vec<Step> {
+        Workflow::from_yaml_str(yaml).unwrap().steps
     }
 
     #[test]
     fn orders_a_dag() {
-        let w = wf(
+        let s = steps(
             "name: t\nsteps:\n  - {id: c, run: x, depends_on: [a, b]}\n  - {id: a, run: x}\n  - {id: b, run: x, depends_on: [a]}\n",
         );
-        let order = topo_order(&w).unwrap();
-        let pos = |id: &str| order.iter().position(|s| s.as_str() == id).unwrap();
+        let order = topo_order(&s).unwrap();
+        let pos = |id: &str| order.iter().position(|x| x.as_str() == id).unwrap();
         assert!(pos("a") < pos("b"));
         assert!(pos("b") < pos("c"));
-        assert!(find_cycle(&w).is_none());
+        assert!(find_cycle(&s).is_none());
     }
 
     #[test]
     fn detects_a_cycle() {
-        let w = wf(
+        let s = steps(
             "name: t\nsteps:\n  - {id: a, run: x, depends_on: [b]}\n  - {id: b, run: x, depends_on: [a]}\n",
         );
-        assert!(topo_order(&w).is_err());
-        let cyc = find_cycle(&w).expect("cycle");
+        assert!(topo_order(&s).is_err());
+        let cyc = find_cycle(&s).expect("cycle");
         assert!(cyc.len() >= 2);
     }
 
     #[test]
     fn detects_a_three_node_cycle() {
-        let w = wf(
+        let s = steps(
             "name: t\nsteps:\n  - {id: a, run: x, depends_on: [c]}\n  - {id: b, run: x, depends_on: [a]}\n  - {id: c, run: x, depends_on: [b]}\n",
         );
-        let cyc = find_cycle(&w).expect("cycle");
+        let cyc = find_cycle(&s).expect("cycle");
         assert!(cyc.len() >= 3, "got {cyc:?}");
     }
 
     #[test]
     fn self_loop_is_not_a_cycle() {
         // A self-loop is ODIN013's job; find_cycle must not report it as a cycle.
-        let w = wf("name: t\nsteps:\n  - {id: a, run: x, depends_on: [a]}\n");
-        assert!(find_cycle(&w).is_none());
+        let s = steps("name: t\nsteps:\n  - {id: a, run: x, depends_on: [a]}\n");
+        assert!(find_cycle(&s).is_none());
         // It is still unschedulable, so topo_order reports it.
-        assert!(topo_order(&w).is_err());
+        assert!(topo_order(&s).is_err());
     }
 
     #[test]
     fn computes_transitive_ancestors() {
-        let w = wf(
+        let s = steps(
             "name: t\nsteps:\n  - {id: a, run: x}\n  - {id: b, run: x, depends_on: [a]}\n  - {id: c, run: x, depends_on: [b]}\n",
         );
-        let anc = ancestor_sets(&w);
+        let anc = ancestor_sets(&s);
         let c = &anc[&crate::ids::StepId::new("c")];
         assert!(c.contains(&crate::ids::StepId::new("a")));
         assert!(c.contains(&crate::ids::StepId::new("b")));

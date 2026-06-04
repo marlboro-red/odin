@@ -67,7 +67,7 @@ impl Default for KnownNames<'static> {
 #[must_use]
 pub fn validate(wf: &Workflow, known: &KnownNames<'_>) -> ValidationReport {
     let mut d = Vec::new();
-    let ancestors = graph::ancestor_sets(wf);
+    let ancestors = graph::ancestor_sets(&wf.steps);
 
     rules::step_list_nonempty(wf, &mut d);
     rules::step_ids(wf, &mut d);
@@ -84,6 +84,7 @@ pub fn validate(wf: &Workflow, known: &KnownNames<'_>) -> ValidationReport {
     rules::retry_fallback(wf, &mut d);
     rules::approval_durable(wf, &mut d);
     rules::case_branches(wf, &mut d);
+    rules::loops(wf, &mut d);
     rules::schema(wf, &mut d);
 
     #[cfg(feature = "templating")]
