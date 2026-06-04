@@ -1,0 +1,51 @@
+# Showcase of features the other examples don't cover, in one cohesive "cut a release" flow:
+#   - a `slot_pool` workspace with `reset: reclone` (each run starts from a pristine fresh clone,
+#     vs `git_clean`'s in-place `reset --hard`) and `base: main` (check the slot out at `main`);
+#   - a boolean param (`dry_run: { type: bool }`);
+#   - a `shell.exec` action (run an arbitrary command in the workspace via the resolved shell);
+#   - `retry.feedback: concise` (on a retry, re-prompt with a ONE-LINE summary of the prior
+#     failure, vs `verbose`'s full output — see `self-correct.yaml` for `verbose`).
+#
+# It is **non-durable** on purpose: this is a fast, fire-and-forget runner with no crash-resume,
+# which is exactly when `slot_pool` is free of the durability caveat (ODIN044). It validates
+# cleanly. A VALIDATION showcase — running it needs a real repo + the `claude` CLI.
+#
+#   odin validate examples/ship-release.yaml
+
+schema_version: "1.0"
+name: ship-release
+description: Build, verify, and tag a release from a clean re-cloned checkout.
+durable: false # fast & fire-and-forget; no crash-resume, so a slot_pool here is caveat-free
+
+workspace:
+  type: slot_pool
+  pool: 2 # two concurrent releases at most
+  reset: reclone # start each run from a fresh `git clone`, not an in-place reset
+  base: main # check the slot out at `main` after cloning
+
+params:
+  dry_run:
+    type: bool # the boolean param type
+    default: false
+    description: When true, build and verify but skip tagging.
+
+steps:
+  - id: build
+    run: "cargo build --release"
+
+  - id: verify
+    provider: claude
+    prompt: "Inspect the release build and flag any blockers (panics, TODOs, version drift)."
+    depends_on: [build]
+    retry:
+      max: 2
+      feedback: concise # re-prompt with a one-line summary of the prior attempt's failure
+
+  - id: tag
+    # `shell.exec` runs an arbitrary command in the workspace via the resolved shell. Interpolating
+    # a *param* (trusted, typed) into the command is the recommended pattern — unlike a raw
+    # `trigger.*` value, which ODIN031 flags as an injection risk.
+    action: shell.exec
+    with:
+      command: "[ {{ params.dry_run }} = true ] && echo 'dry-run: not tagging' || git tag -a release -m release"
+    depends_on: [verify]
