@@ -1245,15 +1245,18 @@ impl LocalEngine {
                     .iter()
                     .filter_map(|id| by_id.get(id.as_str()).copied())
                     .find(|s| {
-                        !started.contains(&s.id) && s.depends_on.iter().all(|d| settled.contains(d))
+                        !started.contains(&s.id)
+                            && s.depends_on.iter().all(|d| settled.contains(d))
+                            // An exclusive (non-scratch) step can only start when the workdir is
+                            // idle. Encoding that here — rather than `break`-ing on the first
+                            // not-yet-startable exclusive step — lets later scratch steps fill the
+                            // remaining slots instead of being blocked head-of-line behind it.
+                            && (s.scratch || in_flight.is_empty())
                     })
                 else {
                     break;
                 };
                 let exclusive = !step.scratch;
-                if exclusive && !in_flight.is_empty() {
-                    break; // an exclusive step must wait until the workdir is idle
-                }
 
                 let deps_passed = step.depends_on.iter().all(|d| {
                     matches!(
@@ -1273,6 +1276,19 @@ impl LocalEngine {
                         o.error = Some("an upstream dependency did not pass".to_owned());
                         in_flight.push(boxed(std::future::ready((id, o))));
                     } else if let Some(decision) = state.approvals.get(&id).cloned() {
+                        // The gate resolves now (a decision is applied), so it "runs": emit a
+                        // StepStarted to pair with the StepFinished `emit_step_events` writes when
+                        // this settles. (A skipped or still-awaiting gate never started, matching
+                        // the skip convention for regular steps.)
+                        self.emit(
+                            run_id,
+                            RunEvent::StepStarted {
+                                step: id.clone(),
+                                attempt: 1,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
                         let o = match decision.decision {
                             Decision::Approved => StepOutcome::gate_approved(&decision),
                             Decision::Rejected => StepOutcome::gate_rejected(&decision),
@@ -1296,6 +1312,17 @@ impl LocalEngine {
                     started.insert(id.clone());
                     let outcome = if deps_passed {
                         self.mark_running(workflow, state, &id).await?;
+                        // Pair a StepStarted with the StepFinished emitted when this settles; the
+                        // loop's own inner steps emit their own paired events inside `run_loop`.
+                        self.emit(
+                            run_id,
+                            RunEvent::StepStarted {
+                                step: id.clone(),
+                                attempt: 1,
+                                at: Utc::now(),
+                            },
+                        )
+                        .await;
                         self.run_loop(
                             run_id,
                             step,
@@ -1610,6 +1637,10 @@ impl LocalEngine {
                         cancel,
                     )
                     .await;
+                // Pair the StepStarted that `run_one` emitted (for an inner step that executed)
+                // with a StepFinished — plus any gate/judge results — so a loop body's inner steps
+                // produce the same audit trail as top-level steps.
+                self.emit_step_events(run_id, inner_id, &o).await;
                 if let Some(u) = &o.usage {
                     usage.add(*u);
                 }
@@ -4446,6 +4477,110 @@ steps:
         assert_eq!(s2.status, RunStatus::Succeeded, "error: {:?}", s2.error);
         assert_eq!(step_status(&s2, "gate"), Some(StepStatus::Passed));
         assert_eq!(step_status(&s2, "ship"), Some(StepStatus::Passed));
+    }
+
+    #[tokio::test]
+    async fn an_approved_gate_emits_paired_start_finish_events() {
+        // A resolved approval gate must emit a StepStarted to pair with its StepFinished, so an
+        // audit consumer sees a complete lifecycle for the gate (it used to emit only Finished).
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        eng.submit_approval(
+            s1.run_id,
+            Decision::Approved,
+            "alice".to_owned(),
+            None,
+            std::slice::from_ref(&wf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = store.events(s1.run_id).await.unwrap();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, RunEvent::StepStarted { step, .. } if step.as_str() == "gate")
+            ),
+            "approval gate missing StepStarted: {events:?}"
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, RunEvent::StepFinished { step, .. } if step.as_str() == "gate")
+            ),
+            "approval gate missing StepFinished: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_emits_paired_start_finish_for_node_and_inner_steps() {
+        // The loop node and each inner step must each emit a paired StepStarted + StepFinished —
+        // previously the node had only Finished and inner steps had only Started.
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.check.status == 'passed'\"\n      max: 3\n      steps:\n        - {id: check, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let events = store.events(s.run_id).await.unwrap();
+        for id in ["fix", "check"] {
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, RunEvent::StepStarted { step, .. } if step.as_str() == id)
+                ),
+                "missing StepStarted for {id:?}: {events:?}"
+            );
+            assert!(
+                events.iter().any(
+                    |e| matches!(e, RunEvent::StepFinished { step, .. } if step.as_str() == id)
+                ),
+                "missing StepFinished for {id:?}: {events:?}"
+            );
+        }
+    }
+
+    // Timing-sensitive: a slow Windows `git worktree add` can serialize the two scratch
+    // acquisitions enough to close the overlap window (see `independent_scratch_steps_run_concurrently`).
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn an_exclusive_step_does_not_block_scratch_steps_behind_it() {
+        // `order = [a (scratch, 0.5s), gate (exclusive, instant), c (scratch, 0.5s)]`. The exclusive
+        // `gate` sits between two independent scratch steps. With head-of-line blocking it stops `c`
+        // from starting beside `a` (serializing them); now `a` and `c` overlap and `gate` waits for
+        // the workdir to clear. We prove overlap from the StepStarted/StepFinished *timestamps*
+        // rather than total wall-clock, so it can't flake under parallel test load.
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: par\ndurable: true\nworkspace: { type: worktree }\nmax_parallel: 3\nsteps:\n  - { id: a, run: \"sleep 0.5\", scratch: true }\n  - { id: gate, run: \"true\" }\n  - { id: c, run: \"sleep 0.5\", scratch: true }\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let events = store.events(s.run_id).await.unwrap();
+        let started = |id: &str| {
+            events.iter().find_map(|e| match e {
+                RunEvent::StepStarted { step, at, .. } if step.as_str() == id => Some(*at),
+                _ => None,
+            })
+        };
+        let finished = |id: &str| {
+            events.iter().find_map(|e| match e {
+                RunEvent::StepFinished { step, at, .. } if step.as_str() == id => Some(*at),
+                _ => None,
+            })
+        };
+        let (a_start, a_fin) = (started("a").unwrap(), finished("a").unwrap());
+        let (c_start, c_fin) = (started("c").unwrap(), finished("c").unwrap());
+        // Two intervals overlap iff each begins before the other ends.
+        assert!(
+            c_start < a_fin && a_start < c_fin,
+            "scratch steps must overlap, not serialize behind the exclusive gate: \
+             a {a_start:?}..{a_fin:?}, c {c_start:?}..{c_fin:?}"
+        );
     }
 
     #[tokio::test]
