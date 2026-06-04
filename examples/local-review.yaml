@@ -1,0 +1,60 @@
+# A one-shot, fully LOCAL PR review that writes a markdown report — the simplest dogfood of Odin:
+# fetch a PR diff, review it with one agent, write the report to a file. No webhook, no approval,
+# no posting. (Contrast `adversarial-review.yaml`, the full fan-out-and-comment version.)
+#
+#   odin run examples/local-review.yaml --repo . --no-store \
+#     --param pr=68 --param out="$PWD/REVIEW.md"
+#
+# `durable: false` + `--no-store` keeps it a stateless one-shot. Because every run executes in a
+# throwaway `worktree`, the report MUST be written to an absolute path (`out`) so it survives the
+# worktree teardown. Running it needs the `claude` CLI and `gh`. Validates cleanly.
+
+name: local-review
+description: Review one PR's diff with Claude and write a markdown report to an absolute path.
+durable: false
+
+workspace:
+  type: worktree
+
+params:
+  pr:
+    type: number
+    required: true
+  out:
+    type: string
+    required: true # ABSOLUTE path for the report (it's written outside the throwaway worktree)
+  repo:
+    type: string
+    default: marlboro-red/odin
+
+steps:
+  - id: diff
+    run: "gh pr diff {{ params.pr }} --repo {{ params.repo }}"
+
+  - id: review
+    provider: claude
+    depends_on: [diff]
+    prompt: |
+      You are a senior reviewer. Review the following pull-request diff and produce a concise
+      GitHub-flavored **markdown** report with these sections:
+      - **Summary** — what the PR does, in 2-3 sentences.
+      - **Blockers** — correctness/security issues that should block merge (with `file:line`).
+      - **Should-fix** — non-blocking but worth addressing.
+      - **Nits** — minor style/clarity.
+      - **Verdict** — APPROVE or REQUEST CHANGES, one line.
+      If a section is empty, write "_none_". Output ONLY the markdown report.
+
+      ```diff
+      {{ steps.diff.outputs.stdout }}
+      ```
+
+  - id: report
+    depends_on: [review]
+    # The quoted heredoc blocks shell expansion of the rendered review; the long random sentinel
+    # makes an early close implausible, and `out` is absolute so the file outlives the worktree.
+    run: |
+      cat > {{ params.out }} <<'ODIN_REVIEW_EOF_9f2c7a1b4e6d'
+      # Review of PR #{{ params.pr }} ({{ params.repo }})
+
+      {{ steps.review.outputs.stdout }}
+      ODIN_REVIEW_EOF_9f2c7a1b4e6d

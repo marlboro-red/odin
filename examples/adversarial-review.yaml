@@ -8,9 +8,14 @@
 # Point it at this repo with `odind` and a `pull_request.opened` webhook and Odin reviews itself.
 # It exercises a wide slice of the engine: webhook trigger + payload→param mapping, `max_parallel`
 # scratch fan-out, cross-provider `judge:`, an `approval:` gate before an outward side effect, and
-# the safe "map trusted fields into typed params, never interpolate `trigger.*` into a shell"
-# pattern (ODIN031). A VALIDATION showcase: running it needs `odind`, a webhook secret, the
-# claude/codex/copilot CLIs, and `gh`. Validates cleanly.
+# the "map trusted fields into typed params and reference those in shells" pattern.
+#   CAVEAT: ODIN031 flags only a raw `trigger.*` value reaching a shell — it does NOT shell-escape
+#   a param. This file is safe because `repo` is pinned by the trigger's `repo:` filter and `pr`
+#   is numeric; feeding a *string* param from an attacker-controlled payload field (e.g.
+#   `title: pull_request.title`) into a `run:` would inject silently and unlinted. Keep
+#   shell-bound params numeric or trigger-pinned.
+# A VALIDATION showcase: running it needs `odind`, a webhook secret, the claude/codex/copilot
+# CLIs, and `gh`. Validates cleanly.
 #
 #   odin validate examples/adversarial-review.yaml
 
@@ -105,12 +110,14 @@ steps:
       message: "Post the synthesized adversarial review as a comment on this PR?"
     depends_on: [synthesize]
 
-  # 5. Post it. The QUOTED heredoc captures the already-rendered review text literally, so its
-  #    Markdown/shell metacharacters are never re-interpreted by the shell.
+  # 5. Post it. The QUOTED heredoc blocks shell *expansion* of the rendered review, and a long
+  #    random sentinel makes it implausible for the adversary-influenced body to close the heredoc
+  #    early. (Residual risk: a body line equal to the sentinel would still end it — which is part
+  #    of why the human approval gate above guards this outward step.)
   - id: post
     depends_on: [gate]
     run: |
-      cat > review.md <<'ODIN_REVIEW_EOF'
+      cat > review.md <<'ODIN_REVIEW_EOF_9f2c7a1b4e6d'
       {{ steps.synthesize.outputs.stdout }}
-      ODIN_REVIEW_EOF
+      ODIN_REVIEW_EOF_9f2c7a1b4e6d
       gh pr comment {{ params.pr }} --repo {{ params.repo }} --body-file review.md

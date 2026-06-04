@@ -14,6 +14,7 @@ const TRIAGE: &str = include_str!("../../../examples/triage.yaml");
 const SHIP_RELEASE: &str = include_str!("../../../examples/ship-release.yaml");
 const LOOP_WITH_CASE: &str = include_str!("../../../examples/loop-with-case.yaml");
 const ADVERSARIAL_REVIEW: &str = include_str!("../../../examples/adversarial-review.yaml");
+const LOCAL_REVIEW: &str = include_str!("../../../examples/local-review.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -271,5 +272,35 @@ fn adversarial_review_validates_and_fans_out_reviewers() {
     assert!(
         wf.steps.iter().any(|s| s.judge.is_some()),
         "a cross-provider judge on the synthesis"
+    );
+}
+
+#[test]
+fn local_review_validates_and_is_a_stateless_one_shot() {
+    use odin_core::StepKind;
+    // The simplest dogfood: fetch a diff, review it with one provider, write a report — no
+    // trigger, no durability, no approval. (Verified end-to-end against PR #68 with the real
+    // `claude` CLI; this test pins the shape.)
+    let wf = Workflow::from_yaml_str(LOCAL_REVIEW).expect("parses");
+    assert!(
+        validate_source(LOCAL_REVIEW, &wf, &KnownNames::builtin()).is_empty(),
+        "local-review should validate clean"
+    );
+    assert!(!wf.durable, "a stateless one-shot (run with --no-store)");
+    assert!(
+        wf.triggers.is_empty(),
+        "no trigger — run manually via `odin run`"
+    );
+    assert!(
+        wf.steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Provider(_))),
+        "must have a provider review step"
+    );
+    assert!(
+        !wf.steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Approval(_))),
+        "no approval gate — it never posts anything outward"
     );
 }
