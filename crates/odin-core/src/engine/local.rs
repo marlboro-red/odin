@@ -37,7 +37,9 @@
 //! beyond the workspace (a pushed branch, an opened PR), `.gitignore`d paths, and nested
 //! untracked git repos (which `git clean` leaves in place).
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -246,7 +248,8 @@ impl LocalEngine {
         // Cache one built-in instance per (kind, config) for the engine's lifetime, so all
         // runs and resumes share it. `slot_pool`'s concurrency cap and lease bookkeeping are
         // in-memory and per-instance — a fresh instance per run would defeat them entirely.
-        let key = format!("{kind}|{}", serde_json::to_string(cfg).unwrap_or_default());
+        let cfg_json = serde_json::to_string(cfg).unwrap_or_default();
+        let key = format!("{kind}|{cfg_json}");
         if let Some(workspace) = self.workspaces.lock().unwrap().get(&key) {
             return Arc::clone(workspace);
         }
@@ -254,12 +257,27 @@ impl LocalEngine {
             WorkspaceConfig::Worktree(_) => {
                 Arc::new(WorktreeWorkspace::new(self.repo_root.clone()))
             }
-            WorkspaceConfig::SlotPool(c) => Arc::new(SlotPoolWorkspace::new(
-                self.repo_root.clone(),
-                self.repo_root.join(".odin").join("slots"),
-                c.pool as usize,
-                c.reset,
-            )),
+            WorkspaceConfig::SlotPool(c) => {
+                // The on-disk pool dir is keyed by the config (a hash of the same JSON the
+                // instance cache uses), so two DISTINCT slot-pool configs never share physical
+                // slot dirs. Otherwise their independent in-memory lease state would hand the
+                // SAME slot-N to two concurrent runs — two agents in one checkout — and defeat
+                // the per-pool concurrency cap (ODIN016).
+                let mut hasher = DefaultHasher::new();
+                cfg_json.hash(&mut hasher);
+                let pool_dir = self
+                    .repo_root
+                    .join(".odin")
+                    .join("slots")
+                    .join(format!("{:016x}", hasher.finish()));
+                Arc::new(SlotPoolWorkspace::new(
+                    self.repo_root.clone(),
+                    pool_dir,
+                    c.pool as usize,
+                    c.reset,
+                    c.base.clone(),
+                ))
+            }
         };
         self.workspaces
             .lock()

@@ -27,6 +27,8 @@ pub struct SlotPoolWorkspace {
     repo_root: PathBuf,
     pool_dir: PathBuf,
     reset: ResetMode,
+    /// Optional ref each slot is checked out at after cloning (else the clone's default HEAD).
+    base: Option<String>,
     size: usize,
     /// Indices of currently-free slots.
     free: Mutex<VecDeque<usize>>,
@@ -49,11 +51,13 @@ impl SlotPoolWorkspace {
         pool_dir: impl Into<PathBuf>,
         size: usize,
         reset: ResetMode,
+        base: Option<String>,
     ) -> Self {
         Self {
             repo_root: repo_root.into(),
             pool_dir: pool_dir.into(),
             reset,
+            base,
             size,
             free: Mutex::new(VecDeque::new()),
             slots: Semaphore::new(size),
@@ -66,6 +70,28 @@ impl SlotPoolWorkspace {
         self.pool_dir.join(format!("slot-{index}"))
     }
 
+    /// True if `slot` is a usable git clone — used to detect a slot left half-cloned by a crash
+    /// (the dir exists but is not a valid repo), which must be re-cloned rather than trusted.
+    async fn is_healthy(slot: &Path) -> bool {
+        slot.join(".git").exists() && git(slot, &["rev-parse", "--git-dir"]).await.is_ok()
+    }
+
+    /// (Re-)clones a slot from the repo and checks out `base` if one was requested. The caller
+    /// removes any stale dir first.
+    async fn provision(&self, slot: &Path) -> Result<(), WorkspaceError> {
+        let repo = self.repo_root.to_string_lossy().into_owned();
+        let slot_str = slot.to_string_lossy().into_owned();
+        git(
+            &self.pool_dir,
+            &["clone", "--local", repo.as_str(), slot_str.as_str()],
+        )
+        .await?;
+        if let Some(base) = &self.base {
+            git(slot, &["checkout", base.as_str()]).await?;
+        }
+        Ok(())
+    }
+
     /// Clones the slots once, on first use.
     async fn ensure_initialized(&self) -> Result<(), WorkspaceError> {
         let mut done = self.initialized.lock().await;
@@ -73,19 +99,16 @@ impl SlotPoolWorkspace {
             return Ok(());
         }
         tokio::fs::create_dir_all(&self.pool_dir).await?;
-        let repo = self.repo_root.to_string_lossy().into_owned();
         // Clone every slot first; publish the free indices only once they ALL succeed, so
         // a failed-then-retried init can never push the same index twice (which would let
-        // two runs claim one slot).
+        // two runs claim one slot). A slot the previous process left half-cloned (exists but
+        // not a valid repo — a crash mid-`git clone`) is removed and re-cloned, rather than
+        // trusted as present and then poisoning the pool when every reset fails on it.
         for i in 0..self.size {
             let slot = self.slot_path(i);
-            if !slot.exists() {
-                let slot_str = slot.to_string_lossy().into_owned();
-                git(
-                    &self.pool_dir,
-                    &["clone", "--local", repo.as_str(), slot_str.as_str()],
-                )
-                .await?;
+            if !Self::is_healthy(&slot).await {
+                let _ = tokio::fs::remove_dir_all(&slot).await;
+                self.provision(&slot).await?;
             }
         }
         let mut free = self.free.lock().await;
@@ -99,18 +122,17 @@ impl SlotPoolWorkspace {
     async fn reset_slot(&self, slot: &Path) -> Result<(), WorkspaceError> {
         match self.reset {
             ResetMode::GitClean => {
-                git(slot, &["reset", "--hard"]).await?;
+                // If the reset fails the slot isn't a healthy repo (e.g. corrupted by a crash) —
+                // re-clone it rather than cycle a dead slot back to the free set forever.
+                if git(slot, &["reset", "--hard"]).await.is_err() {
+                    let _ = tokio::fs::remove_dir_all(slot).await;
+                    return self.provision(slot).await;
+                }
                 git(slot, &["clean", "-fdx"]).await?;
             }
             ResetMode::Reclone => {
                 let _ = tokio::fs::remove_dir_all(slot).await;
-                let repo = self.repo_root.to_string_lossy().into_owned();
-                let slot_str = slot.to_string_lossy().into_owned();
-                git(
-                    &self.pool_dir,
-                    &["clone", "--local", repo.as_str(), slot_str.as_str()],
-                )
-                .await?;
+                self.provision(slot).await?;
             }
         }
         Ok(())
@@ -206,7 +228,7 @@ mod tests {
     async fn slot_has_repo_content_and_is_reset_between_uses() {
         let repo = init_repo().await;
         let pool = tempfile::tempdir().unwrap();
-        let ws = SlotPoolWorkspace::new(repo.path(), pool.path(), 1, ResetMode::GitClean);
+        let ws = SlotPoolWorkspace::new(repo.path(), pool.path(), 1, ResetMode::GitClean, None);
 
         let h1 = ws.acquire(ctx()).await.unwrap();
         assert!(
@@ -234,6 +256,7 @@ mod tests {
             pool.path(),
             1,
             ResetMode::GitClean,
+            None,
         ));
 
         let h1 = ws.acquire(ctx()).await.unwrap();
@@ -265,6 +288,7 @@ mod tests {
             pool.path(),
             1,
             ResetMode::GitClean,
+            None,
         ));
 
         let h1 = ws.acquire(ctx()).await.unwrap();
@@ -288,5 +312,76 @@ mod tests {
         ws.release(h2).await.unwrap();
         let h3 = pending.await.unwrap().unwrap();
         ws.release(h3).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_slot_is_recloned_on_reset() {
+        // A crash can leave a slot whose `.git` is gone/corrupt. The next acquire's reset must
+        // re-clone it, not fail forever and cycle the dead slot back to the free set.
+        let repo = init_repo().await;
+        let pool = tempfile::tempdir().unwrap();
+        let ws = SlotPoolWorkspace::new(repo.path(), pool.path(), 1, ResetMode::GitClean, None);
+        let h1 = ws.acquire(ctx()).await.unwrap();
+        let slot = h1.path.clone();
+        ws.release(h1).await.unwrap();
+        std::fs::remove_dir_all(slot.join(".git")).unwrap(); // corrupt it
+
+        let h2 = ws.acquire(ctx()).await.unwrap();
+        assert!(
+            h2.path.join("README.md").exists() && h2.path.join(".git").exists(),
+            "a corrupt slot must be re-cloned on reset"
+        );
+        ws.release(h2).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_half_cloned_slot_is_recloned_on_init() {
+        // A slot left existing-but-not-a-repo by a crash mid-`git clone` must be re-cloned at init,
+        // not trusted as present (which would poison the pool when every reset failed on it).
+        let repo = init_repo().await;
+        let pool = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pool.path().join("slot-0")).unwrap();
+        std::fs::write(pool.path().join("slot-0").join("junk"), "x").unwrap();
+        let ws = SlotPoolWorkspace::new(repo.path(), pool.path(), 1, ResetMode::GitClean, None);
+
+        let h1 = ws.acquire(ctx()).await.unwrap();
+        assert!(
+            h1.path.join("README.md").exists() && h1.path.join(".git").exists(),
+            "a half-cloned slot must be re-cloned on init"
+        );
+        ws.release(h1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slots_are_checked_out_at_base() {
+        // `base:` must be honored (parity with the worktree workspace), not silently dropped.
+        let repo = init_repo().await;
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo.path())
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        g(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(repo.path().join("only-other.txt"), "x").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "on other"]);
+        g(&["checkout", "-q", "main"]); // leave the repo on main, so base must do the work
+
+        let pool = tempfile::tempdir().unwrap();
+        let ws = SlotPoolWorkspace::new(
+            repo.path(),
+            pool.path(),
+            1,
+            ResetMode::GitClean,
+            Some("other".to_owned()),
+        );
+        let h = ws.acquire(ctx()).await.unwrap();
+        assert!(
+            h.path.join("only-other.txt").exists(),
+            "slot should be checked out at base=other, not the default HEAD"
+        );
+        ws.release(h).await.unwrap();
     }
 }
