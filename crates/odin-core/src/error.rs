@@ -93,6 +93,9 @@ pub enum ProviderError {
     /// The provider CLI was not found on `PATH`.
     #[error("provider CLI not found on PATH: {0}")]
     NotFound(String),
+    /// No POSIX shell could be resolved to run `run:` / gate / `shell.exec` commands.
+    #[error("{0}")]
+    ShellNotFound(String),
     /// The provider exceeded its timeout.
     #[error("provider timed out after {0:?}")]
     Timeout(std::time::Duration),

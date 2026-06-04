@@ -11,4 +11,4 @@ pub mod process;
 pub use claude::ClaudeProvider;
 pub use codex::CodexProvider;
 pub use copilot::CopilotProvider;
-pub use process::{ProcessOptions, ProcessOutput, run_process};
+pub use process::{ProcessOptions, ProcessOutput, posix_shell, run_process};
