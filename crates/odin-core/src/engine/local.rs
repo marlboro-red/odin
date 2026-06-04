@@ -158,6 +158,21 @@ impl StepOutcome {
             judge_score: None,
         }
     }
+
+    /// The persisted projection of this outcome (drops the transient `stderr`/`failure_detail`).
+    fn to_state(&self) -> StepState {
+        StepState {
+            status: self.status,
+            attempts: self.attempts,
+            exit_code: self.exit_code,
+            outputs: self.outputs.clone(),
+            usage: self.usage,
+            gates: self.gates.clone(),
+            judge_score: self.judge_score,
+            side_effects: self.side_effects.clone(),
+            error: self.error.clone(),
+        }
+    }
 }
 
 /// The summary-shaped result of an execution pass.
@@ -1236,6 +1251,38 @@ impl LocalEngine {
                     continue;
                 }
 
+                // A `loop:` step is run by the scheduler, not dispatched: it is exclusive
+                // (non-scratch), so by the exclusivity check above `in_flight` is empty here —
+                // `&mut state` is uncontended and the shared workdir is idle. `run_loop` drives
+                // the body as a sequential mini-driver and returns one aggregate outcome, folded
+                // by the post-step block like any other step.
+                if let StepKind::Loop(l) = &step.kind {
+                    let id = step.id.clone();
+                    started.insert(id.clone());
+                    let outcome = if deps_passed {
+                        self.mark_running(workflow, state, &id).await?;
+                        self.run_loop(
+                            run_id,
+                            step,
+                            l,
+                            state,
+                            workdir,
+                            params,
+                            base_commit.as_deref(),
+                            diff.as_deref(),
+                            workflow,
+                            cancel,
+                        )
+                        .await?
+                    } else {
+                        let mut o = skipped_outcome();
+                        o.error = Some("an upstream dependency did not pass".to_owned());
+                        o
+                    };
+                    in_flight.push(boxed(std::future::ready((id, outcome))));
+                    continue;
+                }
+
                 let timeout = step
                     .timeout
                     .or(workflow.defaults.timeout)
@@ -1285,19 +1332,9 @@ impl LocalEngine {
                 usage.add(*u);
             }
             side_effects.extend(outcome.side_effects.iter().cloned());
-            let step_state = StepState {
-                status: outcome.status,
-                attempts: outcome.attempts,
-                exit_code: outcome.exit_code,
-                outputs: outcome.outputs.clone(),
-                usage: outcome.usage,
-                gates: outcome.gates.clone(),
-                judge_score: outcome.judge_score,
-                // Persist this step's side effects so a later resume can reconstruct the run's
-                // full set without re-running the step (see the resume seed below).
-                side_effects: outcome.side_effects.clone(),
-                error: outcome.error.clone(),
-            };
+            // The persisted projection; side effects are kept so a later resume can reconstruct
+            // the run's full set without re-running the step (see the resume seed below).
+            let step_state = outcome.to_state();
             state.steps.insert(id.clone(), step_state.clone());
             if matches!(
                 outcome.status,
@@ -1421,6 +1458,141 @@ impl LocalEngine {
             }
             Err(e) => (id, StepOutcome::failed(format!("scratch workspace: {e}"))),
         }
+    }
+
+    /// Drives a `loop:` body: runs the inner steps sequentially in dependency order, evaluates the
+    /// `until` guard after each full iteration, and repeats — **accumulating** workdir edits across
+    /// iterations (unlike single-step retry, which rewinds) — until `until` holds or `max`
+    /// iterations elapse.
+    ///
+    /// Returns one aggregate outcome: Passed with `outputs.iterations` (count) and
+    /// `outputs.converged = true` on success; Failed when the cap is hit without `until` holding,
+    /// or when `until` errors. Inner-step states are **transient** — they shape each iteration's
+    /// template context but never enter `state.steps` (which would collide and confuse resume); the
+    /// loop appears to the rest of the run as a single step. Inner side effects and usage are folded
+    /// up into the aggregate outcome.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_loop(
+        &self,
+        run_id: RunId,
+        step: &Step,
+        l: &crate::ir::LoopStep,
+        state: &RunState,
+        workdir: &Path,
+        params: &IndexMap<String, Value>,
+        base_commit: Option<&str>,
+        base_diff: Option<&str>,
+        workflow: &Workflow,
+        cancel: &CancelToken,
+    ) -> Result<StepOutcome> {
+        let _ = step; // (the loop step's own id is folded by the caller; reserved for PR-3b resume)
+        let max = u32::from(l.max);
+        let inner_order = crate::validate::graph::topo_order(&l.steps)
+            .unwrap_or_else(|_| l.steps.iter().map(|s| s.id.clone()).collect());
+        let inner_by_id: HashMap<&str, &Step> =
+            l.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+
+        let mut diff = base_diff.map(str::to_owned);
+        let mut feedback = String::new();
+        let mut side_effects: Vec<SideEffect> = Vec::new();
+        let mut usage = Usage::default();
+
+        let mut iteration: u32 = 0;
+        let mut outcome = loop {
+            iteration += 1;
+            // Per-iteration inner states (transient): each inner step sees the outer run plus the
+            // earlier inner steps of THIS iteration.
+            let mut inner_states: IndexMap<StepId, StepState> = IndexMap::new();
+            let mut last_failure: Option<String> = None;
+
+            for inner_id in &inner_order {
+                let inner = inner_by_id[inner_id.as_str()];
+                let mut steps_view = state.steps.clone();
+                for (k, v) in &inner_states {
+                    steps_view.insert(k.clone(), v.clone());
+                }
+                let ctx = build_ctx_with(
+                    params,
+                    &state.input.trigger_payload,
+                    &steps_view,
+                    diff.as_deref(),
+                    state,
+                    workflow,
+                    iteration,
+                    &feedback,
+                );
+                let deps_passed = inner.depends_on.iter().all(|d| {
+                    matches!(
+                        inner_states.get(d).map(|s| s.status),
+                        Some(StepStatus::Passed)
+                    )
+                });
+                let timeout = inner
+                    .timeout
+                    .or(workflow.defaults.timeout)
+                    .map(crate::ir::HumanDuration::as_duration);
+                let (_, o) = self
+                    .run_one(run_id, inner, ctx, workdir, timeout, deps_passed, cancel)
+                    .await;
+                if let Some(u) = &o.usage {
+                    usage.add(*u);
+                }
+                side_effects.extend(o.side_effects.iter().cloned());
+                // A passing non-scratch inner step accumulates into the shared DIFF.
+                if matches!(o.status, StepStatus::Passed) && !inner.scratch {
+                    diff = self.capture_diff(workdir, base_commit, cancel).await;
+                }
+                if matches!(o.status, StepStatus::Failed) {
+                    last_failure = o.failure_detail.clone().or_else(|| o.error.clone());
+                }
+                inner_states.insert(inner_id.clone(), o.to_state());
+            }
+
+            // Evaluate `until` after the whole body — every inner step has run, so all are visible.
+            let mut steps_view = state.steps.clone();
+            for (k, v) in &inner_states {
+                steps_view.insert(k.clone(), v.clone());
+            }
+            let until_ctx = build_ctx_with(
+                params,
+                &state.input.trigger_payload,
+                &steps_view,
+                diff.as_deref(),
+                state,
+                workflow,
+                iteration,
+                &feedback,
+            );
+            // `iterations` (count so far) and `converged` are reported on every terminal path, so
+            // a hit-the-cap failure is as introspectable as a success.
+            let outputs = |converged: bool| {
+                let mut o = IndexMap::new();
+                o.insert("iterations".to_owned(), Value::from(iteration));
+                o.insert("converged".to_owned(), Value::Bool(converged));
+                o
+            };
+            match eval_when(&l.until, &until_ctx) {
+                Ok(true) => break StepOutcome::passing(0, outputs(true), None),
+                Ok(false) => {
+                    if iteration >= max {
+                        let mut o = StepOutcome::failed(format!(
+                            "loop did not satisfy `until` within {max} iteration(s)"
+                        ));
+                        o.outputs = outputs(false);
+                        break o;
+                    }
+                    feedback = clip_tail(&last_failure.unwrap_or_default(), FEEDBACK_MAX);
+                }
+                Err(e) => {
+                    let mut o = StepOutcome::failed(format!("loop `until` evaluation failed: {e}"));
+                    o.outputs = outputs(false);
+                    break o;
+                }
+            }
+        };
+        outcome.usage = Some(usage);
+        outcome.side_effects = side_effects;
+        Ok(outcome)
     }
 
     /// Adds a detached git worktree at the run's base commit (`HEAD` of `base_workdir`) as a
@@ -2283,7 +2455,8 @@ fn extract_score(value: &Value) -> Option<f32> {
     value.as_object()?.values().find_map(extract_score)
 }
 
-/// Builds the minijinja context from the run state assembled so far.
+/// Builds the minijinja context from the run state assembled so far, with the default `loop` root
+/// (`loop.counter` = 1, empty `loop.feedback`) — the pre-iteration state seen by a top-level step.
 fn build_ctx(
     params: &IndexMap<String, Value>,
     trigger_payload: &Value,
@@ -2291,6 +2464,23 @@ fn build_ctx(
     diff: Option<&str>,
     state: &RunState,
     workflow: &Workflow,
+) -> minijinja::Value {
+    build_ctx_with(params, trigger_payload, steps, diff, state, workflow, 1, "")
+}
+
+/// Builds the context with explicit `loop.counter` / `loop.feedback` — used inside a `loop:` body
+/// so an inner step (and the `until` guard) sees the current iteration. (`loop` is a keyword, so
+/// the root is baked into the JSON here rather than overlaid via `context!` like `retry`.)
+#[allow(clippy::too_many_arguments)]
+fn build_ctx_with(
+    params: &IndexMap<String, Value>,
+    trigger_payload: &Value,
+    steps: &IndexMap<StepId, StepState>,
+    diff: Option<&str>,
+    state: &RunState,
+    workflow: &Workflow,
+    loop_counter: u32,
+    loop_feedback: &str,
 ) -> minijinja::Value {
     let mut steps_obj = serde_json::Map::new();
     for (id, st) in steps {
@@ -2317,6 +2507,9 @@ fn build_ctx(
         // step-level `when:` guard, evaluated once before any attempt. `attempt_context` overrides
         // this per attempt for the step body; here it reflects the pre-attempt state.
         "retry": { "attempt": 1, "feedback": "" },
+        // `loop.*` resolves everywhere too (default counter 1, empty feedback); a `loop:` body
+        // rebuilds the context with the live iteration values.
+        "loop": { "counter": loop_counter, "feedback": loop_feedback },
     });
     build_context(&root)
 }
@@ -3628,6 +3821,142 @@ steps:
             StepStatus::Passed,
             "the guard should be true, not error"
         );
+    }
+
+    // ── loop: execution ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn loop_converges_on_a_later_iteration() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // `check` fails until the 3rd iteration (`loop.counter >= 3`), then passes; `until` then
+        // holds. The loop reports it converged on iteration 3.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.check.status == 'passed'\"\n      max: 5\n      steps:\n        - {id: check, run: \"[ {{ loop.counter }} -ge 3 ]\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let fix = s.steps.iter().find(|x| x.id.as_str() == "fix").unwrap();
+        assert_eq!(fix.status, StepStatus::Passed);
+        assert_eq!(
+            fix.outputs
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(3),
+            "should converge on the 3rd iteration"
+        );
+        assert_eq!(
+            fix.outputs
+                .get("converged")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_exhausts_max_and_fails() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // `until` never holds → the loop fails once `max` iterations elapse → the run fails.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"false\"\n      max: 2\n      steps:\n        - {id: noop, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let fix = s.steps.iter().find(|x| x.id.as_str() == "fix").unwrap();
+        assert_eq!(fix.status, StepStatus::Failed);
+        assert!(
+            fix.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("within 2"),
+            "error: {:?}",
+            fix.error
+        );
+        // A hit-the-cap failure is still introspectable.
+        assert_eq!(
+            fix.outputs
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            fix.outputs
+                .get("converged")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_accumulates_edits_across_iterations() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // Each iteration appends a line to the SHARED workdir; convergence needs 3 lines. If the
+        // loop rewound between iterations (like retry), the file would reset and never reach 3.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.check.status == 'passed'\"\n      max: 6\n      steps:\n        - {id: append, run: \"echo x >> acc.txt\"}\n        - {id: check, run: \"[ $(wc -l < acc.txt) -ge 3 ]\", depends_on: [append]}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let fix = s.steps.iter().find(|x| x.id.as_str() == "fix").unwrap();
+        assert_eq!(
+            fix.outputs
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(3),
+            "accumulating edits should converge on the 3rd iteration"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_feedback_carries_to_the_next_iteration() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // The gate passes only if `loop.feedback` carries "UNLOCK"; iteration 1 fails and emits
+        // UNLOCK to stderr (which becomes the next iteration's feedback), so converging at all
+        // proves the prior failure was fed forward.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.gate.status == 'passed'\"\n      max: 4\n      steps:\n        - {id: gate, run: \"if echo '{{ loop.feedback }}' | grep -q UNLOCK; then exit 0; else echo UNLOCK >&2; exit 1; fi\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let fix = s.steps.iter().find(|x| x.id.as_str() == "fix").unwrap();
+        assert_eq!(
+            fix.outputs
+                .get("iterations")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "should converge on iteration 2 once the feedback carries UNLOCK"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_inner_step_reads_an_outer_step() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // The inner step interpolates an OUTER step's output; if that ref didn't resolve, the
+        // command would fail and the loop would never converge.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: setup, run: \"echo hello\"}\n  - id: fix\n    depends_on: [setup]\n    loop:\n      until: \"steps.use.status == 'passed'\"\n      max: 1\n      steps:\n        - {id: use, run: \"test '{{ steps.setup.outputs.stdout | trim }}' = hello\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
     }
 
     #[tokio::test]
