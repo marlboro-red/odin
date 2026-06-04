@@ -31,7 +31,9 @@ fn status_str(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Pending => "pending",
         RunStatus::Running => "running",
-        RunStatus::AwaitingApproval => "awaiting-approval",
+        // Canonical wire tag (underscore), matching the serde `RunStatus` representation used
+        // everywhere else (`view.rs`, `odin status`) so `inspect --json` doesn't drift.
+        RunStatus::AwaitingApproval => "awaiting_approval",
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
         RunStatus::Cancelled => "cancelled",
