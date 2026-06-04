@@ -92,7 +92,8 @@ The snippet above is **abridged** — the full file adds `git.commit` + `git.pus
 [`triage.yaml`](examples/triage.yaml) (`case:` branching with a merge-back),
 [`ship-release.yaml`](examples/ship-release.yaml) (a `slot_pool` with `reset: reclone`, a `bool` param, and `shell.exec`),
 [`loop-with-case.yaml`](examples/loop-with-case.yaml) (a `case:` selector nested inside a `loop:`), and
-[`adversarial-review.yaml`](examples/adversarial-review.yaml) (**Odin reviewing its own PRs** — webhook-triggered, parallel reviewers, judge, approval gate).
+[`adversarial-review.yaml`](examples/adversarial-review.yaml) (**Odin reviewing its own PRs** — webhook-triggered, parallel reviewers, judge, approval gate), and
+[`local-review.yaml`](examples/local-review.yaml) (a one-shot local PR review → markdown report).
 
 ## Why "library-first"?
 
