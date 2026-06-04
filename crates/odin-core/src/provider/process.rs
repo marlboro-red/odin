@@ -137,6 +137,22 @@ fn well_known_git_roots() -> Vec<PathBuf> {
 /// (Trusted internal `git` invocations spawn outside this path and run no untrusted code.)
 const SHIELDED_ENV: &[&str] = &["ODIN_WEBHOOK_SECRET"];
 
+/// Environment that makes every `git` Odin drives treat content as **raw bytes** — no CRLF↔LF
+/// normalization — so snapshots, diffs, and worktree checkouts are byte-stable across platforms.
+/// On Windows the Git-for-Windows installer defaults to `core.autocrlf=true`, which would
+/// otherwise lay CRLF on checkout while `HEAD` holds LF, making `git diff` report every line
+/// changed and snapshots round-trip differently. Injected via `GIT_CONFIG_*` (git ≥ 2.31) so it
+/// overrides global/repo config **for Odin's invocations only**, never writing the user's repo
+/// config. Applied to all of Odin's git calls (workspace + engine); harmless on Unix, where
+/// `autocrlf` is already off.
+pub(crate) const GIT_PORTABLE_ENV: &[(&str, &str)] = &[
+    ("GIT_CONFIG_COUNT", "2"),
+    ("GIT_CONFIG_KEY_0", "core.autocrlf"),
+    ("GIT_CONFIG_VALUE_0", "false"),
+    ("GIT_CONFIG_KEY_1", "core.safecrlf"),
+    ("GIT_CONFIG_VALUE_1", "false"),
+];
+
 /// Knobs for a single [`run_process`] invocation.
 #[derive(Clone, Debug, Default)]
 pub struct ProcessOptions {
@@ -348,6 +364,78 @@ mod shell_resolution_tests {
     #[test]
     fn the_unix_shell_is_plain_sh() {
         assert_eq!(super::resolve_shell_platform().as_deref(), Some("sh"));
+    }
+}
+
+#[cfg(test)]
+mod git_env_tests {
+    use super::{GIT_PORTABLE_ENV, ProcessOptions, run_process};
+    use crate::traits::CancelToken;
+
+    async fn git(dir: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> String {
+        let opts = ProcessOptions {
+            workdir: Some(dir.to_path_buf()),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..ProcessOptions::default()
+        };
+        let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+        run_process("git", &owned, &opts, &CancelToken::new())
+            .await
+            .unwrap()
+            .stdout
+    }
+
+    /// `GIT_CONFIG_COUNT` must equal the number of key/value pairs, or git ignores the extras.
+    #[test]
+    fn portable_env_count_matches_keys() {
+        let count: usize = GIT_PORTABLE_ENV
+            .iter()
+            .find(|(k, _)| *k == "GIT_CONFIG_COUNT")
+            .unwrap()
+            .1
+            .parse()
+            .unwrap();
+        let keys = GIT_PORTABLE_ENV
+            .iter()
+            .filter(|(k, _)| k.starts_with("GIT_CONFIG_KEY_"))
+            .count();
+        let vals = GIT_PORTABLE_ENV
+            .iter()
+            .filter(|(k, _)| k.starts_with("GIT_CONFIG_VALUE_"))
+            .count();
+        assert_eq!(count, keys, "GIT_CONFIG_COUNT must match the key count");
+        assert_eq!(keys, vals);
+    }
+
+    /// Proves the mechanism cross-platform: in a repo configured `core.autocrlf=true`, adding a
+    /// CRLF file normally strips the CR, but adding it with `GIT_PORTABLE_ENV` preserves the bytes
+    /// — so Odin's snapshots/diffs are stable even where autocrlf is the default (Windows).
+    #[tokio::test]
+    async fn portable_env_disables_autocrlf_normalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"], &[]).await;
+        git(p, &["config", "core.autocrlf", "true"], &[]).await;
+
+        // A separate file per config so git's stat cache can't reuse a prior staging.
+        std::fs::write(p.join("norm.txt"), "alpha\r\nbeta\r\n").unwrap();
+        git(p, &["add", "norm.txt"], &[]).await;
+        let normalized = git(p, &["cat-file", "-p", ":norm.txt"], &[]).await;
+        assert!(
+            !normalized.contains('\r'),
+            "autocrlf=true should strip CR: {normalized:?}"
+        );
+
+        std::fs::write(p.join("raw.txt"), "alpha\r\nbeta\r\n").unwrap();
+        git(p, &["add", "raw.txt"], GIT_PORTABLE_ENV).await;
+        let raw = git(p, &["cat-file", "-p", ":raw.txt"], &[]).await;
+        assert!(
+            raw.contains('\r'),
+            "GIT_PORTABLE_ENV must preserve CR (autocrlf forced off): {raw:?}"
+        );
     }
 }
 

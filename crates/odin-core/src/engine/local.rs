@@ -894,10 +894,7 @@ impl LocalEngine {
         base: Option<&str>,
         cancel: &CancelToken,
     ) -> Option<String> {
-        let opts = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(workdir);
         let intent_to_add = ["add", "-N", "."].map(str::to_owned);
         let _ = run_process("git", &intent_to_add, &opts, cancel).await;
         // Diff against the run's base commit when known (snapshots may have advanced the
@@ -919,10 +916,7 @@ impl LocalEngine {
 
     /// The workspace's current `HEAD` commit, or `None` if it cannot be read (non-git dir).
     async fn git_head(&self, workdir: &Path, cancel: &CancelToken) -> Option<String> {
-        let opts = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(workdir);
         let out = run_process(
             "git",
             &["rev-parse".to_owned(), "HEAD".to_owned()],
@@ -973,23 +967,21 @@ impl LocalEngine {
     ) -> Option<String> {
         let index_path =
             std::env::temp_dir().join(format!("odin-index-{run_id}-{}", uuid::Uuid::new_v4()));
-        let index_str = index_path.to_str()?.to_owned();
+        let index_str = index_path.to_string_lossy().into_owned();
         // Stage into a throwaway index, and pin an explicit identity so `commit-tree`
-        // succeeds even in a repo with no configured user (or `user.useConfigOnly`).
-        let staged = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            env: vec![
-                ("GIT_INDEX_FILE".to_owned(), index_str),
-                ("GIT_AUTHOR_NAME".to_owned(), "odin".to_owned()),
-                ("GIT_AUTHOR_EMAIL".to_owned(), "odin@localhost".to_owned()),
-                ("GIT_COMMITTER_NAME".to_owned(), "odin".to_owned()),
-                (
-                    "GIT_COMMITTER_EMAIL".to_owned(),
-                    "odin@localhost".to_owned(),
-                ),
-            ],
-            ..ProcessOptions::default()
-        };
+        // succeeds even in a repo with no configured user (or `user.useConfigOnly`). The base
+        // git env (raw-bytes / no CRLF normalization) carries through.
+        let mut staged = git_opts(workdir);
+        staged.env.extend([
+            ("GIT_INDEX_FILE".to_owned(), index_str),
+            ("GIT_AUTHOR_NAME".to_owned(), "odin".to_owned()),
+            ("GIT_AUTHOR_EMAIL".to_owned(), "odin@localhost".to_owned()),
+            ("GIT_COMMITTER_NAME".to_owned(), "odin".to_owned()),
+            (
+                "GIT_COMMITTER_EMAIL".to_owned(),
+                "odin@localhost".to_owned(),
+            ),
+        ]);
         let run_git = |args: Vec<String>| {
             let opts = staged.clone();
             async move { run_process("git", &args, &opts, cancel).await.ok() }
@@ -1025,10 +1017,7 @@ impl LocalEngine {
         let _ = std::fs::remove_file(&index_path);
         let sha = sha?;
         // Anchor the dangling commit so it survives until the run completes.
-        let opts = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(workdir);
         let _ = run_process(
             "git",
             &[
@@ -1062,10 +1051,7 @@ impl LocalEngine {
     /// iteration) MUST gate on this — otherwise a reaped snapshot would skip iterations whose work
     /// is no longer present, re-entering against a tree that lacks it.
     async fn restore_workdir(&self, workdir: &Path, target: &str, cancel: &CancelToken) -> bool {
-        let opts = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(workdir);
         let read = ["read-tree", "-u", "--reset", target].map(str::to_owned);
         let reset_ok = run_process("git", &read, &opts, cancel)
             .await
@@ -1089,10 +1075,7 @@ impl LocalEngine {
     async fn delete_snapshot_ref(&self, workdir: &Path, run_id: RunId, cancel: &CancelToken) {
         self.delete_ref(workdir, &format!("refs/odin/run/{run_id}"), cancel)
             .await;
-        let opts = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(workdir);
         // List the run's transient refs (a trailing `/` matches the whole hierarchy) and drop each.
         for prefix in [
             format!("refs/odin/retry/{run_id}/"),
@@ -1113,10 +1096,7 @@ impl LocalEngine {
 
     /// Deletes a git ref (best effort), letting any commit it anchored become collectable.
     async fn delete_ref(&self, workdir: &Path, ref_name: &str, cancel: &CancelToken) {
-        let opts = ProcessOptions {
-            workdir: Some(workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(workdir);
         let args = [
             "update-ref".to_owned(),
             "-d".to_owned(),
@@ -1701,14 +1681,9 @@ impl LocalEngine {
             step_id.as_str(),
             uuid::Uuid::new_v4()
         ));
-        let scratch_str = scratch
-            .to_str()
-            .ok_or_else(|| "scratch path is not valid UTF-8".to_owned())?;
-        let opts = ProcessOptions {
-            workdir: Some(base_workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
-        let args = ["worktree", "add", "--detach", scratch_str, "HEAD"].map(str::to_owned);
+        let scratch_str = scratch.to_string_lossy();
+        let opts = git_opts(base_workdir);
+        let args = ["worktree", "add", "--detach", &scratch_str, "HEAD"].map(str::to_owned);
         // Serialized: concurrent scratch steps must not race on git's worktree metadata.
         let out = {
             let _guard = self.worktree_lock.lock().await;
@@ -1724,14 +1699,9 @@ impl LocalEngine {
 
     /// Removes a scratch worktree (best effort — failure only leaks a temp dir).
     async fn release_scratch(&self, base_workdir: &Path, scratch: &Path, cancel: &CancelToken) {
-        let Some(scratch_str) = scratch.to_str() else {
-            return;
-        };
-        let opts = ProcessOptions {
-            workdir: Some(base_workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
-        let args = ["worktree", "remove", "--force", scratch_str].map(str::to_owned);
+        let scratch_str = scratch.to_string_lossy();
+        let opts = git_opts(base_workdir);
+        let args = ["worktree", "remove", "--force", &scratch_str].map(str::to_owned);
         let _guard = self.worktree_lock.lock().await;
         let _ = run_process("git", &args, &opts, cancel).await;
     }
@@ -1740,10 +1710,7 @@ impl LocalEngine {
     /// kill mid-scratch-step leaks the temp dir). Called once at the start of a run that has
     /// scratch steps, so resumes don't accumulate orphaned worktrees.
     async fn cleanup_scratch(&self, run_id: RunId, base_workdir: &Path, cancel: &CancelToken) {
-        let opts = ProcessOptions {
-            workdir: Some(base_workdir.to_path_buf()),
-            ..ProcessOptions::default()
-        };
+        let opts = git_opts(base_workdir);
         let prefix = format!("odin-scratch-{run_id}-");
         // Serialize against acquire/release_scratch: `git worktree remove` and especially
         // `git worktree prune` (a *global* operation on `.git/worktrees/`) race with a
@@ -1756,10 +1723,10 @@ impl LocalEngine {
                 if !entry.file_name().to_string_lossy().starts_with(&prefix) {
                     continue;
                 }
-                if let Some(p) = entry.path().to_str() {
-                    let args = ["worktree", "remove", "--force", p].map(str::to_owned);
-                    let _ = run_process("git", &args, &opts, cancel).await;
-                }
+                let p = entry.path();
+                let p = p.to_string_lossy();
+                let args = ["worktree", "remove", "--force", &p].map(str::to_owned);
+                let _ = run_process("git", &args, &opts, cancel).await;
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -2419,6 +2386,20 @@ fn step_result(id: &StepId, state: &StepState) -> StepResult {
         judge_score: state.judge_score,
         usage: state.usage,
         error: state.error.clone(),
+    }
+}
+
+/// `ProcessOptions` for an Odin-driven `git` call: the workdir plus
+/// [`crate::provider::process::GIT_PORTABLE_ENV`] so git treats content as raw bytes (byte-stable
+/// snapshots/diffs/checkouts across platforms — see that constant). Every engine git call uses it.
+fn git_opts(workdir: &Path) -> ProcessOptions {
+    ProcessOptions {
+        workdir: Some(workdir.to_path_buf()),
+        env: crate::provider::process::GIT_PORTABLE_ENV
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+        ..ProcessOptions::default()
     }
 }
 

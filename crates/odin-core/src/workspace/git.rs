@@ -20,6 +20,7 @@ pub(crate) async fn git(cwd: &Path, args: &[&str]) -> Result<String, WorkspaceEr
     let output = Command::new("git")
         .current_dir(cwd)
         .args(args)
+        .envs(crate::provider::process::GIT_PORTABLE_ENV.iter().copied())
         .stdin(Stdio::null())
         .output()
         .await
