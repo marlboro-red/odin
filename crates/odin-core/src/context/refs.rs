@@ -20,8 +20,9 @@ use crate::validate::rules::{step_ptr, suggest};
 const DIFF: &str = "DIFF";
 
 /// Roots that are always allowed but whose children are not statically modeled. `retry` exposes
-/// the per-attempt `retry.attempt` / `retry.feedback` to every step (see `retry.feedback`).
-const OPEN_ROOTS: &[&str] = &["trigger", "run", "retry"];
+/// the per-attempt `retry.attempt` / `retry.feedback`; `loop` exposes `loop.counter` /
+/// `loop.feedback` inside a `loop:` body (both per-attempt/iteration, children not modeled).
+const OPEN_ROOTS: &[&str] = &["trigger", "run", "retry", "loop"];
 
 /// Checks every template reference in the workflow, appending diagnostics.
 pub(crate) fn check(
@@ -37,57 +38,34 @@ pub(crate) fn check(
     let empty = IndexSet::new();
 
     for (i, s) in wf.steps.iter().enumerate() {
-        let requires: IndexSet<&str> = s
-            .artifacts
-            .requires
-            .iter()
-            .map(ArtifactName::as_str)
-            .collect();
+        let requires = require_set(s);
         let anc = ancestors.get(&s.id).unwrap_or(&empty);
+        process_templates(
+            collect_templates(&step_ptr(i), s),
+            &shape,
+            &requires,
+            anc,
+            &mut used_params,
+            &mut params_subscripted,
+            d,
+        );
 
-        for tpl in collect_templates(i, s) {
-            let source = if tpl.is_expr {
-                format!("{{{{ {} }}}}", tpl.text)
-            } else {
-                tpl.text.clone()
-            };
-            match analyze(&source) {
-                Err(e) => d.push(Diagnostic::new(
-                    DiagCode::TemplateSyntax,
-                    tpl.pointer.clone(),
-                    format!("template syntax error: {e}"),
-                )),
-                Ok(vars) => {
-                    for var in vars {
-                        check_var(
-                            &var,
-                            &shape,
-                            &requires,
-                            anc,
-                            &tpl.pointer,
-                            tpl.shell,
-                            &mut used_params,
-                            d,
-                        );
-                    }
-                }
-            }
-            // ODIN029 — subscript access (`steps["a"]`) exposes only the bare root to the
-            // analysis above, bypassing the unknown-ref / upstream checks; surface it.
-            for root in subscripted_roots(&source) {
-                if root == "params" {
-                    params_subscripted = true;
-                }
-                d.push(Diagnostic::new(
-                    DiagCode::DynamicTemplateRef,
-                    tpl.pointer.clone(),
-                    format!(
-                        "{root:?} is accessed with subscript syntax (`{root}[…]`); only dot \
-                         notation (`{root}.name`) is statically checked, so an unknown or \
-                         forward reference here will not be caught"
-                    ),
-                ));
-            }
+        // A `loop:` body is checked against a SCOPED context: its inner ids are visible (in
+        // addition to the top-level ids), and each inner step / the `until` guard resolves
+        // `steps.<id>` against the body's own dependency order plus the loop node's outer
+        // upstreams. Inner ids never enter the top-level `ContextShape`, so the dotted-id trap
+        // (`steps.loop.inner`) cannot arise.
+        if let StepKind::Loop(l) = &s.kind {
+            check_loop_body(
+                i,
+                &s.id,
+                l,
+                &shape,
+                ancestors,
+                &mut used_params,
+                &mut params_subscripted,
+                d,
+            );
         }
     }
 
@@ -107,6 +85,139 @@ pub(crate) fn check(
     }
 }
 
+/// A step's `artifacts.requires` as a name set (the visibility scope for `artifacts.*` refs).
+fn require_set(s: &crate::ir::Step) -> IndexSet<&str> {
+    s.artifacts
+        .requires
+        .iter()
+        .map(ArtifactName::as_str)
+        .collect()
+}
+
+/// Analyzes and checks a batch of templated strings against one `(shape, requires, ancestors)`
+/// scope, accumulating used params and the `params[…]`-subscript flag. The single per-template
+/// engine used by both the top-level pass and a `loop:` body.
+#[allow(clippy::too_many_arguments)]
+fn process_templates(
+    templates: Vec<Templated>,
+    shape: &ContextShape,
+    requires: &IndexSet<&str>,
+    ancestors: &IndexSet<StepId>,
+    used_params: &mut IndexSet<String>,
+    params_subscripted: &mut bool,
+    d: &mut Vec<Diagnostic>,
+) {
+    for tpl in templates {
+        let source = if tpl.is_expr {
+            format!("{{{{ {} }}}}", tpl.text)
+        } else {
+            tpl.text.clone()
+        };
+        match analyze(&source) {
+            Err(e) => d.push(Diagnostic::new(
+                DiagCode::TemplateSyntax,
+                tpl.pointer.clone(),
+                format!("template syntax error: {e}"),
+            )),
+            Ok(vars) => {
+                for var in vars {
+                    check_var(
+                        &var,
+                        shape,
+                        requires,
+                        ancestors,
+                        &tpl.pointer,
+                        tpl.shell,
+                        used_params,
+                        d,
+                    );
+                }
+            }
+        }
+        // ODIN029 — subscript access (`steps["a"]`) exposes only the bare root to the
+        // analysis above, bypassing the unknown-ref / upstream checks; surface it.
+        for root in subscripted_roots(&source) {
+            if root == "params" {
+                *params_subscripted = true;
+            }
+            d.push(Diagnostic::new(
+                DiagCode::DynamicTemplateRef,
+                tpl.pointer.clone(),
+                format!(
+                    "{root:?} is accessed with subscript syntax (`{root}[…]`); only dot \
+                     notation (`{root}.name`) is statically checked, so an unknown or \
+                     forward reference here will not be caught"
+                ),
+            ));
+        }
+    }
+}
+
+/// Checks a `loop:` body's templates against a scoped context (`loop` step at top-level index `i`).
+///
+/// Scope: the body's inner ids are added to a clone of the top-level `ContextShape`, so an inner
+/// `steps.<id>` resolving to a sibling is known, and one resolving to a non-existent id is still
+/// `ODIN017`. Visibility (the upstream check) for an inner step = its in-body ancestors ∪ the loop
+/// node's own outer ancestors (steps that ran before the loop). The `until` guard runs *after* the
+/// whole body, so every inner step is visible to it.
+#[allow(clippy::too_many_arguments)]
+fn check_loop_body(
+    i: usize,
+    loop_id: &StepId,
+    l: &crate::ir::LoopStep,
+    top_shape: &ContextShape,
+    ancestors: &IndexMap<StepId, IndexSet<StepId>>,
+    used_params: &mut IndexSet<String>,
+    params_subscripted: &mut bool,
+    d: &mut Vec<Diagnostic>,
+) {
+    let mut scoped = top_shape.clone();
+    for inner in &l.steps {
+        scoped.steps.insert(inner.id.as_str().to_owned());
+    }
+    // The loop node's outer ancestors (steps that completed before the loop began).
+    let outer = ancestors.get(loop_id).cloned().unwrap_or_default();
+    let inner_anc = crate::validate::graph::ancestor_sets(&l.steps);
+
+    for (j, inner) in l.steps.iter().enumerate() {
+        let mut visible = outer.clone();
+        if let Some(a) = inner_anc.get(&inner.id) {
+            visible.extend(a.iter().cloned());
+        }
+        let requires = require_set(inner);
+        process_templates(
+            collect_templates(&format!("{}.loop.steps[{j}]", step_ptr(i)), inner),
+            &scoped,
+            &requires,
+            &visible,
+            used_params,
+            params_subscripted,
+            d,
+        );
+    }
+
+    // The `until` guard: every inner step has run, so all are visible (plus the outer ancestors).
+    let mut until_visible = outer;
+    for inner in &l.steps {
+        until_visible.insert(inner.id.clone());
+    }
+    let until = Templated {
+        text: l.until.clone(),
+        pointer: format!("{}.loop.until", step_ptr(i)),
+        is_expr: true,
+        shell: false,
+    };
+    process_templates(
+        vec![until],
+        &scoped,
+        &IndexSet::new(),
+        &until_visible,
+        used_params,
+        params_subscripted,
+        d,
+    );
+}
+
 /// A single templated string with where it lives, whether it is a bare expression, and
 /// whether it is executed by a shell (a `run:` step, a gate, or `shell.exec`'s `command`) —
 /// the contexts where an interpolated untrusted `trigger.*` value is an injection risk
@@ -118,7 +229,11 @@ struct Templated {
     shell: bool,
 }
 
-fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
+/// Collects the templated strings on one step, anchored under `ptr` (its structural pointer).
+/// `ptr` is a prefix rather than a step index so this serves both a top-level step (`steps[i]`)
+/// and a `loop:` body step (`steps[i].loop.steps[j]`). A loop step's own `until` is collected by
+/// the caller (it sees the whole body), so the [`StepKind::Loop`] arm contributes nothing here.
+fn collect_templates(ptr: &str, s: &crate::ir::Step) -> Vec<Templated> {
     let mut out = Vec::new();
     let mut push = |text: String, pointer: String, is_expr: bool, shell: bool| {
         out.push(Templated {
@@ -131,15 +246,10 @@ fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
     match &s.kind {
         StepKind::Provider(p) => {
             if let Some(t) = &p.prompt {
-                push(t.clone(), format!("{}.prompt", step_ptr(i)), false, false);
+                push(t.clone(), format!("{ptr}.prompt"), false, false);
             }
             if let Some(pf) = &p.prompt_file {
-                push(
-                    pf.clone(),
-                    format!("{}.prompt_file", step_ptr(i)),
-                    false,
-                    false,
-                );
+                push(pf.clone(), format!("{ptr}.prompt_file"), false, false);
             }
         }
         StepKind::Action(a) => {
@@ -148,26 +258,16 @@ fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
                     // `shell.exec`'s `command` arg is run via `sh -c`; other action args are
                     // passed structurally, not through a shell.
                     let shell = a.action == "shell.exec" && k == "command";
-                    push(
-                        sv.to_owned(),
-                        format!("{}.with.{k}", step_ptr(i)),
-                        false,
-                        shell,
-                    );
+                    push(sv.to_owned(), format!("{ptr}.with.{k}"), false, shell);
                 }
             }
         }
-        StepKind::Run(r) => push(r.run.clone(), format!("{}.run", step_ptr(i)), false, true),
+        StepKind::Run(r) => push(r.run.clone(), format!("{ptr}.run"), false, true),
         StepKind::Approval(a) => {
             // The approver message is templated (it can surface `{{ steps… }}` context to the
             // human) but is shown in a UI, never a shell — so it is not an injection sink.
             if let Some(msg) = &a.message {
-                push(
-                    msg.clone(),
-                    format!("{}.approval.message", step_ptr(i)),
-                    false,
-                    false,
-                );
+                push(msg.clone(), format!("{ptr}.approval.message"), false, false);
             }
         }
         StepKind::Case(c) => {
@@ -176,36 +276,30 @@ fn collect_templates(i: usize, s: &crate::ir::Step) -> Vec<Templated> {
                 if let Some(w) = &b.when {
                     push(
                         w.clone(),
-                        format!("{}.case.branches[{bi}].when", step_ptr(i)),
+                        format!("{ptr}.case.branches[{bi}].when"),
                         true,
                         false,
                     );
                 }
             }
         }
-        // The loop body's `until` guard and inner-step templates are checked against a scoped
-        // context (inner ids + the loop node's outer upstreams); that scoped checking lands with
-        // loop execution. Until then a loop step contributes no top-level template refs.
+        // The loop's `until` and its inner steps are checked by the caller against a scoped
+        // context (inner ids + the loop node's outer upstreams).
         StepKind::Loop(_) => {}
     }
     for (name, cmd) in &s.gates {
-        push(
-            cmd.clone(),
-            format!("{}.gates.{name}", step_ptr(i)),
-            false,
-            true,
-        );
+        push(cmd.clone(), format!("{ptr}.gates.{name}"), false, true);
     }
     if let Some(j) = &s.judge {
         push(
             j.criteria.clone(),
-            format!("{}.judge.criteria", step_ptr(i)),
+            format!("{ptr}.judge.criteria"),
             false,
             false,
         );
     }
     if let Some(w) = &s.when {
-        push(w.clone(), format!("{}.when", step_ptr(i)), true, false);
+        push(w.clone(), format!("{ptr}.when"), true, false);
     }
     out
 }
@@ -550,5 +644,92 @@ mod tests {
             "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: \"echo {{ steps['a'].outputs.x }}\", depends_on: [a]}\n",
         );
         assert!(d.iter().any(|x| x.code == DiagCode::DynamicTemplateRef));
+    }
+
+    // ── scoped template checking inside a loop: body ─────────────────────────────
+
+    fn has_unknown_ref(d: &[crate::validate::diagnostic::Diagnostic]) -> bool {
+        d.iter().any(|x| x.code == DiagCode::UnknownTemplateRef)
+    }
+
+    #[test]
+    fn loop_until_referencing_an_inner_step_passes() {
+        // `until` runs after the body, so every inner step (here `test`) is visible to it.
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"steps.test.status == 'passed'\"\n      max: 3\n      steps:\n        - {id: edit, run: \"echo edit\"}\n        - {id: test, run: \"echo test\", depends_on: [edit]}\n",
+        );
+        assert!(!has_unknown_ref(&d), "{d:?}");
+    }
+
+    #[test]
+    fn loop_until_referencing_an_unknown_step_is_flagged() {
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"steps.ghost.status == 'passed'\"\n      max: 2\n      steps:\n        - {id: edit, run: \"echo hi\"}\n",
+        );
+        assert!(has_unknown_ref(&d), "{d:?}");
+    }
+
+    #[test]
+    fn loop_inner_ref_to_an_upstream_sibling_passes() {
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: a, run: \"echo hi\"}\n        - {id: b, run: \"echo {{ steps.a.outputs.stdout }}\", depends_on: [a]}\n",
+        );
+        assert!(!has_unknown_ref(&d), "{d:?}");
+    }
+
+    #[test]
+    fn loop_inner_ref_to_a_non_upstream_sibling_is_flagged() {
+        // `b` references sibling `a` without depending on it — visible-but-not-upstream.
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: a, run: \"echo hi\"}\n        - {id: b, run: \"echo {{ steps.a.outputs.stdout }}\"}\n",
+        );
+        assert!(has_unknown_ref(&d), "{d:?}");
+    }
+
+    #[test]
+    fn loop_inner_ref_to_an_unknown_step_is_flagged() {
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: edit, run: \"echo {{ steps.ghost.outputs.x }}\"}\n",
+        );
+        assert!(has_unknown_ref(&d), "{d:?}");
+    }
+
+    #[test]
+    fn loop_inner_ref_to_an_outer_ancestor_passes() {
+        // An inner step may read an outer step the LOOP depends on (it ran before the loop).
+        let d = check(
+            "name: x\nsteps:\n  - {id: setup, provider: claude, prompt: hi}\n  - id: f\n    depends_on: [setup]\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: edit, run: \"echo {{ steps.setup.outputs.stdout }}\"}\n",
+        );
+        assert!(!has_unknown_ref(&d), "{d:?}");
+    }
+
+    #[test]
+    fn loop_counter_and_feedback_resolve() {
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: edit, provider: claude, prompt: \"try {{ loop.counter }}: {{ loop.feedback }}\"}\n",
+        );
+        assert!(!has_unknown_ref(&d), "loop.* is an open root: {d:?}");
+    }
+
+    #[test]
+    fn param_used_only_in_a_loop_body_is_not_unused() {
+        let d = check(
+            "name: x\nparams:\n  foo: {}\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: edit, provider: claude, prompt: \"{{ params.foo }}\"}\n",
+        );
+        assert!(
+            !d.iter().any(|x| x.code == DiagCode::UnusedParam),
+            "a param referenced only inside a loop body is used: {d:?}"
+        );
+    }
+
+    #[test]
+    fn loop_inner_template_syntax_error_is_flagged() {
+        let d = check(
+            "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: edit, provider: claude, prompt: \"{{ unclosed \"}\n",
+        );
+        assert!(
+            d.iter().any(|x| x.code == DiagCode::TemplateSyntax),
+            "{d:?}"
+        );
     }
 }
