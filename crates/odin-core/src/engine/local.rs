@@ -583,12 +583,20 @@ impl LocalEngine {
                     step_id: step.id.clone(),
                     workdir: workdir.to_path_buf(),
                     args,
+                    // Plumb the run's cancel + the step timeout so a hung action (e.g. an
+                    // interactive auth prompt) is killed instead of wedging the whole run.
+                    cancel: cancel.clone(),
+                    timeout,
                 };
                 match action.run(actx).await {
-                    Ok(o) => StepOutcome {
-                        side_effects: o.side_effects,
-                        ..StepOutcome::passing(o.exit_code, o.outputs, None)
-                    },
+                    Ok(o) => {
+                        let mut outcome = StepOutcome::passing(o.exit_code, o.outputs, None);
+                        outcome.side_effects = o.side_effects;
+                        // Carry the action's stderr so a non-zero exit keeps its real error in the
+                        // failure reason / `retry.feedback` (the exit-code check in `exec_step`).
+                        outcome.stderr = o.stderr;
+                        outcome
+                    }
                     Err(e) => StepOutcome::failed(format!("action error: {e}")),
                 }
             }
@@ -2730,6 +2738,50 @@ steps:
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .contains("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_exec_failure_keeps_its_stderr() {
+        // A failed `shell.exec` must surface its stderr in the step error (and so retry.feedback),
+        // not lose it — the action now carries stderr through ActionOutcome.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: w\nworkspace: { type: worktree }\nsteps:\n  - {id: s, action: shell.exec, with: {command: \"echo BOOM 1>&2; exit 1\"}}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let st = s.steps.iter().find(|x| x.id.as_str() == "s").unwrap();
+        assert!(
+            st.error.as_deref().unwrap_or_default().contains("BOOM"),
+            "the failed shell.exec must keep its stderr: {:?}",
+            st.error
+        );
+    }
+
+    #[tokio::test]
+    async fn an_action_honors_the_step_timeout() {
+        // Before the fix the action arm dropped the timeout and ran the full sleep (~5s); now the
+        // step timeout reaches the subprocess and kills it.
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        let wf = parse(
+            "name: w\nworkspace: { type: worktree }\nsteps:\n  - {id: s, action: shell.exec, with: {command: \"sleep 5\"}, timeout: \"1s\"}\n",
+        );
+        let start = std::time::Instant::now();
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(3),
+            "the action timeout was not honored (took {:?})",
+            start.elapsed()
         );
     }
 

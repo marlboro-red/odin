@@ -23,12 +23,15 @@ impl Action for ShellExec {
         let command = super::arg_str(&ctx.args, "command")?;
         let shell = crate::provider::posix_shell()
             .map_err(|e| ActionError::Other(anyhow::anyhow!("{e}")))?;
-        let out = super::exec(shell, &["-c", command], &ctx.workdir).await?;
+        let out = super::exec(shell, &["-c", command], &ctx).await?;
         let mut outputs = IndexMap::new();
         outputs.insert("stdout".to_owned(), Value::String(out.stdout));
         Ok(ActionOutcome {
             exit_code: out.exit_code,
             outputs,
+            // Surface the command's stderr so a failed `shell.exec` keeps its real error in the
+            // step failure reason and `retry.feedback`.
+            stderr: out.stderr,
             side_effects: Vec::new(),
         })
     }
@@ -47,6 +50,8 @@ mod tests {
             step_id: StepId::new("s"),
             workdir: std::env::temp_dir(),
             args,
+            cancel: crate::traits::CancelToken::default(),
+            timeout: None,
         }
     }
 

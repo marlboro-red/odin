@@ -18,30 +18,31 @@ pub use git::{GitCommit, GitPush};
 pub use github::OpenPr;
 pub use shell::ShellExec;
 
-use std::path::Path;
-
 use indexmap::IndexMap;
 use serde_json::Value;
 
 use crate::error::ActionError;
 use crate::provider::{ProcessOptions, ProcessOutput, run_process};
-use crate::traits::CancelToken;
+use crate::traits::ActionCtx;
 
-/// Runs `program args...` in `workdir`, mapping a spawn failure to an [`ActionError`].
-async fn exec(program: &str, args: &[&str], workdir: &Path) -> Result<ProcessOutput, ActionError> {
+/// Runs `program args...` in the action's workdir, honoring the run's cancel token and the step
+/// timeout (so a hung action can be killed, not wedge the whole run), and mapping a spawn failure
+/// to an [`ActionError`].
+async fn exec(program: &str, args: &[&str], ctx: &ActionCtx) -> Result<ProcessOutput, ActionError> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
     let opts = ProcessOptions {
-        workdir: Some(workdir.to_path_buf()),
+        workdir: Some(ctx.workdir.clone()),
+        timeout: ctx.timeout,
         ..ProcessOptions::default()
     };
-    run_process(program, &owned, &opts, &CancelToken::new())
+    run_process(program, &owned, &opts, &ctx.cancel)
         .await
         .map_err(|e| ActionError::Other(anyhow::anyhow!("{e}")))
 }
 
 /// Like [`exec`] but requires exit code 0, returning stdout.
-async fn checked(program: &str, args: &[&str], workdir: &Path) -> Result<String, ActionError> {
-    let out = exec(program, args, workdir).await?;
+async fn checked(program: &str, args: &[&str], ctx: &ActionCtx) -> Result<String, ActionError> {
+    let out = exec(program, args, ctx).await?;
     if out.exit_code == 0 {
         Ok(out.stdout)
     } else {

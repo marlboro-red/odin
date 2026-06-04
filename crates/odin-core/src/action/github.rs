@@ -30,8 +30,8 @@ fn first_pr(stdout: &str) -> Option<(u64, String)> {
 }
 
 /// The current branch name in `workdir`, or `None` if detached/unresolvable.
-async fn current_branch(workdir: &std::path::Path) -> Option<String> {
-    let out = super::exec("git", &["rev-parse", "--abbrev-ref", "HEAD"], workdir)
+async fn current_branch(ctx: &ActionCtx) -> Option<String> {
+    let out = super::exec("git", &["rev-parse", "--abbrev-ref", "HEAD"], ctx)
         .await
         .ok()?;
     if out.exit_code != 0 {
@@ -50,6 +50,7 @@ fn pr_outcome(number: u64, url: String) -> ActionOutcome {
     ActionOutcome {
         exit_code: 0,
         outputs,
+        stderr: String::new(),
         side_effects: vec![SideEffect::pull_request(url, number)],
     }
 }
@@ -86,7 +87,7 @@ impl Action for OpenPr {
         // re-creating. Best-effort — a failed/empty query just falls through to create.
         let head_branch = match head {
             Some(h) => Some(h.to_owned()),
-            None => current_branch(&ctx.workdir).await,
+            None => current_branch(&ctx).await,
         };
         if let Some(branch) = &head_branch {
             let list = [
@@ -101,7 +102,7 @@ impl Action for OpenPr {
                 "--limit",
                 "1",
             ];
-            if let Ok(out) = super::exec("gh", &list, &ctx.workdir).await {
+            if let Ok(out) = super::exec("gh", &list, &ctx).await {
                 if out.exit_code == 0 {
                     if let Some((number, url)) = first_pr(&out.stdout) {
                         return Ok(pr_outcome(number, url));
@@ -120,7 +121,7 @@ impl Action for OpenPr {
             args.push(head);
         }
 
-        let out = super::exec("gh", &args, &ctx.workdir).await?;
+        let out = super::exec("gh", &args, &ctx).await?;
         if out.exit_code != 0 {
             return Err(ActionError::Other(anyhow::anyhow!(
                 "gh pr create failed: {}",
@@ -162,6 +163,8 @@ mod tests {
             step_id: StepId::new("pr"),
             workdir: std::env::temp_dir(),
             args,
+            cancel: crate::traits::CancelToken::default(),
+            timeout: None,
         }
     }
 

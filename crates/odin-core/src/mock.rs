@@ -115,6 +115,7 @@ impl Action for NoopAction {
         Ok(ActionOutcome {
             exit_code: 0,
             outputs: ctx.args,
+            stderr: String::new(),
             side_effects: Vec::<SideEffect>::new(),
         })
     }
