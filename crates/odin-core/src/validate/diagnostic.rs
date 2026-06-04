@@ -120,6 +120,20 @@ pub enum DiagCode {
     /// stdout to judge) and, worse, a failing gate would flip the always-passing selector to
     /// failed and break a merge-back that depends on it (warning).
     CaseInertChecks,
+    /// ODIN037 — a `loop:` step has a blank `until` (it has no exit condition).
+    LoopMissingUntil,
+    /// ODIN038 — a `loop:` step's `max` is 0 (it could never run an iteration).
+    LoopZeroMax,
+    /// ODIN039 — a `loop:` step declares no body `steps`.
+    LoopNoSteps,
+    /// ODIN040 — a `loop:` body nests another `loop:` (unsupported in v1).
+    LoopNested,
+    /// ODIN041 — a `loop:` body contains an `approval:` gate (unsupported in v1: a mid-iteration
+    /// pause tangles with run-level approval).
+    LoopInnerApproval,
+    /// ODIN042 — a `loop:` selector step carries `gates:`/`judge:`/`scratch:` of its own, which
+    /// are inert — verification is the body's `until`, not gates on the loop node (warning).
+    LoopInertChecks,
 }
 
 impl DiagCode {
@@ -163,6 +177,12 @@ impl DiagCode {
             DiagCode::CaseDuplicateBranchLabel => "ODIN034",
             DiagCode::CaseEmptyBranchLabel => "ODIN035",
             DiagCode::CaseInertChecks => "ODIN036",
+            DiagCode::LoopMissingUntil => "ODIN037",
+            DiagCode::LoopZeroMax => "ODIN038",
+            DiagCode::LoopNoSteps => "ODIN039",
+            DiagCode::LoopNested => "ODIN040",
+            DiagCode::LoopInnerApproval => "ODIN041",
+            DiagCode::LoopInertChecks => "ODIN042",
         }
     }
 
@@ -180,7 +200,8 @@ impl DiagCode {
             | DiagCode::ScratchOnAction
             | DiagCode::DynamicTemplateRef
             | DiagCode::TriggerIntoShell
-            | DiagCode::CaseInertChecks => Severity::Warning,
+            | DiagCode::CaseInertChecks
+            | DiagCode::LoopInertChecks => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -368,13 +389,19 @@ mod tests {
             DiagCode::CaseDuplicateBranchLabel,
             DiagCode::CaseEmptyBranchLabel,
             DiagCode::CaseInertChecks,
+            DiagCode::LoopMissingUntil,
+            DiagCode::LoopZeroMax,
+            DiagCode::LoopNoSteps,
+            DiagCode::LoopNested,
+            DiagCode::LoopInnerApproval,
+            DiagCode::LoopInertChecks,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 36);
+        assert_eq!(seen.len(), 42);
     }
 
     #[test]

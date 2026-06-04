@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN032`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN042`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -434,5 +434,125 @@ fn odin036_gates_or_judge_on_a_case_selector_warns() {
     assert_fires(
         "name: x\nsteps:\n  - id: r\n    gates: {check: \"true\"}\n    case:\n      branches:\n        - {label: a, when: \"true\"}\n",
         DiagCode::CaseInertChecks,
+    );
+}
+
+// ── loop: validation (ODIN037–042 + inner-step coverage via all_steps) ──────────
+
+/// A loop whose body is a self-contained, acyclic sub-DAG with unique inner ids is clean.
+#[test]
+fn a_valid_loop_step_is_clean() {
+    assert_clean(
+        "name: x\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.test.status == 'passed'\"\n      max: 3\n      steps:\n        - {id: edit, run: \"echo edit\"}\n        - {id: test, run: \"echo test\", depends_on: [edit]}\n",
+    );
+}
+
+#[test]
+fn odin037_blank_until_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: f, loop: {until: \" \", max: 2, steps: [{id: e, run: x}]}}\n",
+        DiagCode::LoopMissingUntil,
+    );
+}
+
+#[test]
+fn odin038_zero_max_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: f, loop: {until: a, max: 0, steps: [{id: e, run: x}]}}\n",
+        DiagCode::LoopZeroMax,
+    );
+}
+
+#[test]
+fn odin039_empty_body_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: f, loop: {until: a, max: 2, steps: []}}\n",
+        DiagCode::LoopNoSteps,
+    );
+}
+
+#[test]
+fn odin040_nested_loop_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: f\n    loop:\n      until: a\n      max: 2\n      steps:\n        - {id: inner, loop: {until: b, max: 2, steps: [{id: x, run: z}]}}\n",
+        DiagCode::LoopNested,
+    );
+}
+
+#[test]
+fn odin041_inner_approval_is_flagged() {
+    assert_fires(
+        "name: x\ndurable: true\nsteps:\n  - id: f\n    loop:\n      until: a\n      max: 2\n      steps:\n        - {id: gate, approval: {}}\n",
+        DiagCode::LoopInnerApproval,
+    );
+}
+
+#[test]
+fn odin042_gates_on_a_loop_node_warns() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: f\n    gates: {check: \"true\"}\n    loop: {until: a, max: 2, steps: [{id: e, run: x}]}\n",
+        DiagCode::LoopInertChecks,
+    );
+}
+
+/// Inner ids share the flat namespace: a collision with a top-level id is ODIN003.
+#[test]
+fn loop_inner_id_colliding_with_top_level_is_a_duplicate() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: edit, run: x}\n  - {id: f, loop: {until: a, max: 2, steps: [{id: edit, run: y}]}}\n",
+        DiagCode::DuplicateStepId,
+    );
+}
+
+/// Inner provider/action/prompt refs are validated like any other step (via `all_steps`).
+#[test]
+fn loop_inner_unknown_provider_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: f, loop: {until: a, max: 2, steps: [{id: e, provider: bogus, prompt: hi}]}}\n",
+        DiagCode::UnknownProvider,
+    );
+}
+
+/// A loop body is self-contained: an inner `depends_on` to an outer step is ODIN012.
+#[test]
+fn loop_inner_depends_on_outer_step_is_unknown() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: setup, run: x}\n  - id: f\n    depends_on: [setup]\n    loop:\n      until: a\n      max: 2\n      steps:\n        - {id: e, run: y, depends_on: [setup]}\n",
+        DiagCode::UnknownDependency,
+    );
+}
+
+/// A cycle within the loop body is ODIN014, the same as a top-level cycle.
+#[test]
+fn loop_inner_cycle_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: f\n    loop:\n      until: a\n      max: 2\n      steps:\n        - {id: e1, run: x, depends_on: [e2]}\n        - {id: e2, run: x, depends_on: [e1]}\n",
+        DiagCode::DependencyCycle,
+    );
+}
+
+/// The flat namespace also catches a collision between two different loops' inner ids.
+#[test]
+fn two_loops_sharing_an_inner_id_collide() {
+    assert_fires(
+        "name: x\nsteps:\n  - {id: f1, loop: {until: a, max: 2, steps: [{id: e, run: x}]}}\n  - {id: f2, loop: {until: b, max: 2, steps: [{id: e, run: y}]}}\n",
+        DiagCode::DuplicateStepId,
+    );
+}
+
+/// Inner-step artifacts are validated over the body sub-graph: an unproduced require is ODIN008.
+#[test]
+fn loop_inner_unsatisfied_require_is_flagged() {
+    assert_fires(
+        "name: x\nsteps:\n  - id: f\n    loop:\n      until: a\n      max: 2\n      steps:\n        - {id: e, run: x, artifacts: {requires: [NOPE]}}\n",
+        DiagCode::UnsatisfiedRequires,
+    );
+}
+
+/// A body whose producer is an inner upstream of the consumer is clean (ordering holds).
+#[test]
+fn loop_inner_artifact_produced_upstream_is_clean() {
+    assert_clean(
+        "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: make, run: x, artifacts: {produces: [ART]}}\n        - {id: use, run: y, depends_on: [make], artifacts: {requires: [ART]}}\n",
     );
 }

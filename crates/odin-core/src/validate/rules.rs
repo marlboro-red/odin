@@ -7,13 +7,30 @@ use super::KnownNames;
 use super::diagnostic::{DiagCode, Diagnostic};
 use super::graph;
 use crate::ids::StepId;
-use crate::ir::{StepKind, TriggerDecl, Workflow, WorkspaceConfig};
+use crate::ir::{Step, StepKind, TriggerDecl, Workflow, WorkspaceConfig};
 
 /// The engine-reserved artifact auto-captured after every step.
 const DIFF: &str = "DIFF";
 
 pub(crate) fn step_ptr(i: usize) -> String {
     format!("steps[{i}]")
+}
+
+/// Every step paired with its structural pointer — top-level steps **and** the body steps of
+/// any `loop:` (one level deep; nested loops are rejected by [`DiagCode::LoopNested`]). Per-step
+/// rules iterate this so a loop's inner steps are validated like any other (ids, provider/action
+/// refs, prompts, judge), with inner ids living in the same flat namespace (globally unique).
+pub(crate) fn all_steps(wf: &Workflow) -> Vec<(String, &Step)> {
+    let mut out = Vec::with_capacity(wf.steps.len());
+    for (i, s) in wf.steps.iter().enumerate() {
+        out.push((step_ptr(i), s));
+        if let StepKind::Loop(l) = &s.kind {
+            for (j, inner) in l.steps.iter().enumerate() {
+                out.push((format!("{}.loop.steps[{j}]", step_ptr(i)), inner));
+            }
+        }
+    }
+    out
 }
 
 /// ODIN001 — the workflow must declare at least one step.
@@ -27,48 +44,50 @@ pub(crate) fn step_list_nonempty(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     }
 }
 
-/// ODIN002/003/004 — step ids are non-empty, unique, and valid path segments.
+/// ODIN002/003/004 — step ids are non-empty, unique, and valid path segments. Loop-body steps
+/// share the one flat id namespace, so an inner id colliding with a top-level (or other-loop) id
+/// is a duplicate — inner ids must be globally unique.
 pub(crate) fn step_ids(wf: &Workflow, d: &mut Vec<Diagnostic>) {
-    let mut first_seen: IndexMap<&str, usize> = IndexMap::new();
-    for (i, s) in wf.steps.iter().enumerate() {
+    let mut first_seen: IndexMap<&str, String> = IndexMap::new();
+    for (ptr, s) in all_steps(wf) {
         let id = s.id.as_str();
         if id.trim().is_empty() {
             d.push(Diagnostic::new(
                 DiagCode::EmptyStepId,
-                format!("{}.id", step_ptr(i)),
-                format!("step #{i} has an empty id"),
+                format!("{ptr}.id"),
+                format!("step at {ptr} has an empty id"),
             ));
             continue;
         }
         if !is_valid_id(id) {
             d.push(Diagnostic::new(
                 DiagCode::InvalidStepId,
-                format!("{}.id", step_ptr(i)),
+                format!("{ptr}.id"),
                 format!(
                     "step id {id:?} is invalid: use letters/digits/_/- and start with a letter or _"
                 ),
             ));
         }
-        if let Some(&j) = first_seen.get(id) {
+        if let Some(first) = first_seen.get(id) {
             d.push(Diagnostic::new(
                 DiagCode::DuplicateStepId,
-                format!("{}.id", step_ptr(i)),
-                format!("duplicate step id {id:?} (first at {})", step_ptr(j)),
+                format!("{ptr}.id"),
+                format!("duplicate step id {id:?} (first at {first})"),
             ));
         } else {
-            first_seen.insert(id, i);
+            first_seen.insert(id, ptr);
         }
     }
 }
 
 /// ODIN005 — every provider reference names a registered provider.
 pub(crate) fn provider_refs(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<Diagnostic>) {
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (ptr, s) in all_steps(wf) {
         if let StepKind::Provider(p) = &s.kind {
             check_provider(
                 p.provider.as_str(),
                 known,
-                &format!("{}.provider", step_ptr(i)),
+                &format!("{ptr}.provider"),
                 s.id.as_str(),
                 d,
             );
@@ -77,7 +96,7 @@ pub(crate) fn provider_refs(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<D
             check_provider(
                 j.provider.as_str(),
                 known,
-                &format!("{}.judge.provider", step_ptr(i)),
+                &format!("{ptr}.judge.provider"),
                 s.id.as_str(),
                 d,
             );
@@ -86,7 +105,7 @@ pub(crate) fn provider_refs(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<D
             check_provider(
                 fb.as_str(),
                 known,
-                &format!("{}.retry.on_fallback_provider", step_ptr(i)),
+                &format!("{ptr}.retry.on_fallback_provider"),
                 s.id.as_str(),
                 d,
             );
@@ -121,7 +140,7 @@ fn check_provider(
 
 /// ODIN006/009 — provider steps must have exactly one prompt source.
 pub(crate) fn prompts(wf: &Workflow, d: &mut Vec<Diagnostic>) {
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (ptr, s) in all_steps(wf) {
         if let StepKind::Provider(p) = &s.kind {
             // A present-but-blank prompt/prompt_file is as good as missing.
             let prompt = p.prompt.as_ref().filter(|t| !t.trim().is_empty());
@@ -129,7 +148,7 @@ pub(crate) fn prompts(wf: &Workflow, d: &mut Vec<Diagnostic>) {
             match (prompt, prompt_file) {
                 (None, None) => d.push(Diagnostic::new(
                     DiagCode::MissingPrompt,
-                    step_ptr(i),
+                    ptr,
                     format!(
                         "provider step {:?} has no prompt; set a non-empty prompt: or prompt_file:",
                         s.id.as_str()
@@ -137,7 +156,7 @@ pub(crate) fn prompts(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                 )),
                 (Some(_), Some(_)) => d.push(Diagnostic::new(
                     DiagCode::BothPromptAndFile,
-                    step_ptr(i),
+                    ptr,
                     format!(
                         "step {:?} sets both prompt and prompt_file; choose one",
                         s.id.as_str()
@@ -151,13 +170,13 @@ pub(crate) fn prompts(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 
 /// ODIN010 — every action reference names a registered action.
 pub(crate) fn actions(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<Diagnostic>) {
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (ptr, s) in all_steps(wf) {
         if let StepKind::Action(a) = &s.kind {
             // ODIN028 — an action's effects are discarded with a scratch worktree.
             if s.scratch {
                 d.push(Diagnostic::new(
                     DiagCode::ScratchOnAction,
-                    format!("{}.scratch", step_ptr(i)),
+                    format!("{ptr}.scratch"),
                     format!(
                         "step {:?}: `scratch: true` on an action step discards its workspace \
                          side effects with the throwaway worktree",
@@ -170,7 +189,7 @@ pub(crate) fn actions(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<Diagnos
             }
             let mut diag = Diagnostic::new(
                 DiagCode::UnknownAction,
-                format!("{}.action", step_ptr(i)),
+                format!("{ptr}.action"),
                 format!("step {:?}: unknown action {:?}", s.id.as_str(), a.action),
             )
             .with_help(format!("known actions: {}", known.actions.join(", ")));
@@ -187,12 +206,12 @@ pub(crate) fn actions(wf: &Workflow, known: &KnownNames<'_>, d: &mut Vec<Diagnos
 
 /// ODIN011/021 — judge threshold in range; warn if judged by the same provider.
 pub(crate) fn judge(wf: &Workflow, d: &mut Vec<Diagnostic>) {
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (ptr, s) in all_steps(wf) {
         let Some(j) = &s.judge else { continue };
         if !(0.0..=1.0).contains(&j.threshold) {
             d.push(Diagnostic::new(
                 DiagCode::JudgeThresholdRange,
-                format!("{}.judge.threshold", step_ptr(i)),
+                format!("{ptr}.judge.threshold"),
                 format!(
                     "step {:?} judge threshold {} out of range 0.0..=1.0",
                     s.id.as_str(),
@@ -204,7 +223,7 @@ pub(crate) fn judge(wf: &Workflow, d: &mut Vec<Diagnostic>) {
             if p.provider == j.provider {
                 d.push(Diagnostic::new(
                     DiagCode::SameProviderJudge,
-                    format!("{}.judge.provider", step_ptr(i)),
+                    format!("{ptr}.judge.provider"),
                     format!(
                         "step {:?} is judged by the same provider ({:?}) it produced — consider an independent judge",
                         s.id.as_str(), j.provider.as_str()
@@ -248,7 +267,7 @@ pub(crate) fn depends_on(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 
 /// ODIN014 — the dependency graph is acyclic.
 pub(crate) fn cycles(wf: &Workflow, d: &mut Vec<Diagnostic>) {
-    if let Some(cycle) = graph::find_cycle(wf) {
+    if let Some(cycle) = graph::find_cycle(&wf.steps) {
         let path = cycle
             .iter()
             .map(StepId::as_str)
@@ -262,29 +281,44 @@ pub(crate) fn cycles(wf: &Workflow, d: &mut Vec<Diagnostic>) {
     }
 }
 
-/// ODIN007/008/015/019 — artifact production/consumption is well-formed and ordered.
+/// ODIN007/008/015/019 — artifact production/consumption is well-formed and ordered, for the
+/// top-level steps. A `loop:` body's artifacts are checked the same way over the body sub-graph
+/// (see [`loops`]).
 pub(crate) fn artifacts(
     wf: &Workflow,
     ancestors: &IndexMap<StepId, IndexSet<StepId>>,
     d: &mut Vec<Diagnostic>,
 ) {
+    artifacts_in(&wf.steps, ancestors, step_ptr, d);
+}
+
+/// The artifact checks over an arbitrary step *slice* — the top-level DAG or a `loop:` body —
+/// with `ptr(i)` yielding each step's structural pointer so diagnostics anchor correctly in
+/// either scope. Producers/consumers are resolved *within the slice*: a body that requires an
+/// artifact only an outer step produces is unsatisfied (a loop body is a self-contained sub-DAG).
+fn artifacts_in(
+    steps: &[Step],
+    ancestors: &IndexMap<StepId, IndexSet<StepId>>,
+    ptr: impl Fn(usize) -> String,
+    d: &mut Vec<Diagnostic>,
+) {
     // Build the producer index while checking duplicates and the reserved name.
     let mut producers: IndexMap<String, Vec<StepId>> = IndexMap::new();
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (i, s) in steps.iter().enumerate() {
         let mut seen: IndexSet<&str> = IndexSet::new();
         for a in &s.artifacts.produces {
             let name = a.as_str();
             if name == DIFF {
                 d.push(Diagnostic::new(
                     DiagCode::ReservedArtifactDiff,
-                    format!("{}.artifacts.produces", step_ptr(i)),
+                    format!("{}.artifacts.produces", ptr(i)),
                     format!("{DIFF:?} is auto-captured by the engine; remove it from produces on step {:?}", s.id.as_str()),
                 ));
             }
             if !seen.insert(name) {
                 d.push(Diagnostic::new(
                     DiagCode::DuplicateProduces,
-                    format!("{}.artifacts.produces", step_ptr(i)),
+                    format!("{}.artifacts.produces", ptr(i)),
                     format!("step {:?} produces {name:?} more than once", s.id.as_str()),
                 ));
             }
@@ -295,7 +329,7 @@ pub(crate) fn artifacts(
         }
     }
 
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (i, s) in steps.iter().enumerate() {
         for r in &s.artifacts.requires {
             let name = r.as_str();
             if name == DIFF {
@@ -305,7 +339,7 @@ pub(crate) fn artifacts(
                 None => {
                     let mut diag = Diagnostic::new(
                         DiagCode::UnsatisfiedRequires,
-                        format!("{}.artifacts.requires", step_ptr(i)),
+                        format!("{}.artifacts.requires", ptr(i)),
                         format!(
                             "step {:?} requires artifact {name:?} which no step produces",
                             s.id.as_str()
@@ -326,7 +360,7 @@ pub(crate) fn artifacts(
                         let producer = prods.first().map_or("?", |p| p.as_str());
                         d.push(Diagnostic::new(
                             DiagCode::ArtifactOrdering,
-                            format!("{}.artifacts.requires", step_ptr(i)),
+                            format!("{}.artifacts.requires", ptr(i)),
                             format!(
                                 "step {:?} requires {name:?} but its producer {producer:?} is not an upstream dependency (add it to depends_on)",
                                 s.id.as_str()
@@ -420,11 +454,11 @@ pub(crate) fn params(wf: &Workflow, d: &mut Vec<Diagnostic>) {
 
 /// ODIN023 — warn that `on_fallback_provider` is inert in v1.
 pub(crate) fn retry_fallback(wf: &Workflow, d: &mut Vec<Diagnostic>) {
-    for (i, s) in wf.steps.iter().enumerate() {
+    for (ptr, s) in all_steps(wf) {
         if s.retry.on_fallback_provider.is_some() {
             d.push(Diagnostic::new(
                 DiagCode::InertFallbackProvider,
-                format!("{}.retry.on_fallback_provider", step_ptr(i)),
+                format!("{ptr}.retry.on_fallback_provider"),
                 "on_fallback_provider is declared but routing/fallback is not implemented in v1; this field is inert".to_owned(),
             ));
         }
@@ -519,6 +553,143 @@ pub(crate) fn case_branches(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                 ));
             }
         }
+    }
+}
+
+/// ODIN037-042 — `loop:` steps: a non-blank `until`, a `max >= 1`, a non-empty body, no nested
+/// loop / inner approval, no inert checks on the loop node; plus the body is a self-contained
+/// sub-DAG (inner `depends_on` names only siblings, and the body is acyclic). Inner ids and
+/// provider/action/prompt/judge refs are validated by the per-step rules via [`all_steps`].
+#[allow(clippy::too_many_lines)]
+pub(crate) fn loops(wf: &Workflow, d: &mut Vec<Diagnostic>) {
+    for (i, s) in wf.steps.iter().enumerate() {
+        let StepKind::Loop(l) = &s.kind else {
+            continue;
+        };
+        let ptr = step_ptr(i);
+        // ODIN042 — the loop node's own gates/judge/scratch are inert: a loop produces no output
+        // to check, its verification is the body's `until`, and it never runs in a scratch tree.
+        if !s.gates.is_empty() || s.judge.is_some() || s.scratch {
+            d.push(Diagnostic::new(
+                DiagCode::LoopInertChecks,
+                ptr.clone(),
+                format!(
+                    "loop step {:?} carries gates/judge/scratch of its own, which are inert — a \
+                     loop's verification is its `until` condition over the body",
+                    s.id.as_str()
+                ),
+            ));
+        }
+        // ODIN037 — a blank `until` leaves the loop with no exit condition.
+        if l.until.trim().is_empty() {
+            d.push(Diagnostic::new(
+                DiagCode::LoopMissingUntil,
+                format!("{ptr}.loop.until"),
+                format!(
+                    "loop step {:?} has a blank `until`; give it an exit condition",
+                    s.id.as_str()
+                ),
+            ));
+        }
+        // ODIN038 — max 0 means the body could never run.
+        if l.max == 0 {
+            d.push(Diagnostic::new(
+                DiagCode::LoopZeroMax,
+                format!("{ptr}.loop.max"),
+                format!(
+                    "loop step {:?} has `max: 0`; it could never run an iteration (use >= 1)",
+                    s.id.as_str()
+                ),
+            ));
+        }
+        // ODIN039 — a loop with no body steps does nothing.
+        if l.steps.is_empty() {
+            d.push(Diagnostic::new(
+                DiagCode::LoopNoSteps,
+                format!("{ptr}.loop.steps"),
+                format!("loop step {:?} declares no body steps", s.id.as_str()),
+            ));
+        }
+        // ODIN040/041 — restricted inner kinds.
+        for (j, inner) in l.steps.iter().enumerate() {
+            let iptr = format!("{ptr}.loop.steps[{j}]");
+            match &inner.kind {
+                StepKind::Loop(_) => d.push(Diagnostic::new(
+                    DiagCode::LoopNested,
+                    iptr,
+                    format!(
+                        "loop step {:?} nests another loop ({:?}); nested loops are not supported in v1",
+                        s.id.as_str(),
+                        inner.id.as_str()
+                    ),
+                )),
+                StepKind::Approval(_) => d.push(Diagnostic::new(
+                    DiagCode::LoopInnerApproval,
+                    iptr,
+                    format!(
+                        "loop step {:?} contains an approval gate ({:?}); approvals inside a loop \
+                         are not supported in v1",
+                        s.id.as_str(),
+                        inner.id.as_str()
+                    ),
+                )),
+                _ => {}
+            }
+        }
+        // The body is a self-contained sub-DAG: an inner `depends_on` may name only a sibling in
+        // the same body. (Cross-boundary data flows via templates; cross-boundary ordering via the
+        // loop step's own `depends_on`.)
+        let inner_ids: IndexSet<&str> = l.steps.iter().map(|x| x.id.as_str()).collect();
+        for (j, inner) in l.steps.iter().enumerate() {
+            for (k, dep) in inner.depends_on.iter().enumerate() {
+                let dptr = format!("{ptr}.loop.steps[{j}].depends_on[{k}]");
+                if dep == &inner.id {
+                    d.push(Diagnostic::new(
+                        DiagCode::SelfDependency,
+                        dptr,
+                        format!("step {:?} cannot depend on itself", inner.id.as_str()),
+                    ));
+                } else if !inner_ids.contains(dep.as_str()) {
+                    d.push(Diagnostic::new(
+                        DiagCode::UnknownDependency,
+                        dptr,
+                        format!(
+                            "loop-body step {:?} depends on {:?}, which is not a sibling in the \
+                             same loop body (reference outer steps via templates, and order the \
+                             loop itself with the loop step's own `depends_on`)",
+                            inner.id.as_str(),
+                            dep.as_str()
+                        ),
+                    ));
+                }
+            }
+        }
+        // ODIN014 — the body sub-graph must be acyclic (outer-pointing edges are already dropped).
+        if let Some(cycle) = graph::find_cycle(&l.steps) {
+            let path = cycle
+                .iter()
+                .map(StepId::as_str)
+                .collect::<Vec<_>>()
+                .join(" → ");
+            d.push(Diagnostic::new(
+                DiagCode::DependencyCycle,
+                format!("{ptr}.loop.steps"),
+                format!(
+                    "dependency cycle in loop body of step {:?}: {path}",
+                    s.id.as_str()
+                ),
+            ));
+        }
+        // ODIN007/008/015/019 — the body's artifacts, resolved within the body sub-graph (its own
+        // ancestor sets for ordering), so an inner step needing an unproduced/out-of-order artifact
+        // is caught here rather than slipping through to execution.
+        let inner_anc = graph::ancestor_sets(&l.steps);
+        artifacts_in(
+            &l.steps,
+            &inner_anc,
+            |j| format!("{ptr}.loop.steps[{j}]"),
+            d,
+        );
     }
 }
 

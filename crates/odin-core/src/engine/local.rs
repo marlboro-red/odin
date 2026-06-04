@@ -1103,7 +1103,7 @@ impl LocalEngine {
         params: &IndexMap<String, Value>,
         cancel: &CancelToken,
     ) -> Result<ExecResult> {
-        let order = crate::validate::graph::topo_order(workflow)
+        let order = crate::validate::graph::topo_order(&workflow.steps)
             .unwrap_or_else(|_| workflow.steps.iter().map(|s| s.id.clone()).collect());
         let by_id: HashMap<&str, &Step> =
             workflow.steps.iter().map(|s| (s.id.as_str(), s)).collect();

@@ -420,7 +420,7 @@ mod tests {
 
     fn check(yaml: &str) -> Vec<crate::validate::diagnostic::Diagnostic> {
         let wf = Workflow::from_yaml_str(yaml).unwrap();
-        let anc = ancestor_sets(&wf);
+        let anc = ancestor_sets(&wf.steps);
         let mut d = Vec::new();
         super::check(&wf, &anc, &mut d);
         d
