@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN036`).
+(`ODIN001`–`ODIN042`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -84,7 +84,7 @@ defaults:
 
 ## Steps
 
-A step is exactly one of five **kinds**, chosen by which key it carries:
+A step is exactly one of six **kinds**, chosen by which key it carries:
 
 | Kind | Key | Body runs |
 |------|-----|-----------|
@@ -93,9 +93,10 @@ A step is exactly one of five **kinds**, chosen by which key it carries:
 | **action** | `action:` | a registered named side-effect (e.g. `github.open_pr`) |
 | **approval** | `approval:` | nothing — it **pauses** the run for a human to approve or reject ([below](#approval-step)) |
 | **case** | `case:` | nothing — a **selector** that records which branch to take ([below](#case-step)) |
+| **loop** | `loop:` | a block of steps, iterated until a verification condition holds ([below](#loop-step)) |
 
 Declaring zero or more than one kind is a **parse error**, as is putting a provider-only key
-(`prompt`/`prompt_file`) on a `run`/`action`/`approval`/`case` step, or `with:` on a non-action step.
+(`prompt`/`prompt_file`) on a `run`/`action`/`approval`/`case`/`loop` step, or `with:` on a non-action step.
 
 ### Common step fields (all kinds)
 
@@ -238,6 +239,54 @@ order, so a guard-less branch (an explicit catch-all) shadows any branch after i
 > chosen branch's **work** finishes. To order a step after a branch's work, make it part of that
 > branch (depend on the branch's last step), as `commit` does above.
 
+### Loop step
+
+A `loop:` step iterates a **block** of steps until a verification condition holds — the multi-step
+sibling of single-step [`retry` feedback](#retry). It is the natural shape for an
+**edit → verify → fix** cycle that needs more than one step per round.
+
+```yaml
+- id: make_it_pass
+  loop:
+    until: "steps.test.status == 'passed'"   # minijinja boolean, checked AFTER each iteration
+    max: 5                                     # required cap — a loop is always bounded
+    steps:
+      - id: edit
+        provider: claude
+        prompt: |
+          Make the failing test pass.
+          {% if loop.counter > 1 %}Attempt {{ loop.counter }}. Last failure:
+          {{ loop.feedback }}{% endif %}
+      - id: test
+        run: "cargo test"
+        depends_on: [edit]
+```
+
+- **do-while:** the body always runs at least once; `until` is evaluated *after* each iteration (so
+  it can reference an inner step's `status`). Guard the loop's entry with the loop step's own
+  `when:` if you need it to sometimes not run at all.
+- **Accumulate, not rewind:** workdir edits persist across iterations (unlike `retry`, which
+  rewinds), so iteration *N+1* builds on *N*. The cumulative `{{ artifacts.DIFF }}` is refreshed
+  inside the body.
+- **`loop.*` context** is available to the body (and `until`): `loop.counter` (1-based iteration)
+  and `loop.feedback` (the prior iteration's failure, capped). See [Templating](#templating).
+- **Outcome:** `until` holding → the loop **passes** with `outputs.iterations` (the count) and
+  `outputs.converged: true`; hitting `max` without it (or an `until` error) → the loop **fails**
+  (with `iterations`/`converged: false`), and its dependents skip.
+- **Body scope:** inner step ids share the one flat namespace and must be **globally unique**
+  ([ODIN003](#odin003)); the body is a self-contained sub-DAG — an inner `depends_on` may name only
+  a sibling ([ODIN012](#odin012)), while outer data flows in via templates (`{{ steps.<outer>… }}`,
+  legal when the loop `depends_on` that outer step). Inner steps may be any kind **except**
+  `loop:` ([ODIN040](#odin040)) or `approval:` ([ODIN041](#odin041)).
+- A loop must declare a non-blank `until` ([ODIN037](#odin037)), `max >= 1`
+  ([ODIN038](#odin038)), and at least one body step ([ODIN039](#odin039)); `gates:`/`judge:` on the
+  loop *node* are inert ([ODIN042](#odin042)) — its verification is the body's `until`.
+
+On a durable run, a crash mid-loop **resumes from the last completed iteration** (a per-iteration
+workspace snapshot), so completed iterations are not re-run. (Once an inner step *commits*,
+snapshots disengage and a crash restarts the loop from the first iteration on the committed work.)
+See [`examples/iterate.yaml`](../examples/iterate.yaml).
+
 ### Gates
 
 ```yaml
@@ -379,6 +428,7 @@ rendered):
 | `{{ trigger.* }}` | The free-form trigger payload (e.g. a webhook event body). |
 | `{{ run.id }}` / `{{ run.workflow }}` | This run's id and its workflow name. |
 | `{{ retry.attempt }}` / `{{ retry.feedback }}` | This step's 1-based attempt number and the prior attempt's failure (see [Retry](#retry)). Empty on the first attempt. |
+| `{{ loop.counter }}` / `{{ loop.feedback }}` | Inside a [`loop:`](#loop-step) body: the 1-based iteration and the prior iteration's failure. `1` / empty outside a loop. |
 
 References are checked statically: an unknown `params`/`steps`/`artifacts` reference, or a
 `steps.<id>` that isn't an upstream dependency, is [ODIN017](#odin017); a template that
@@ -487,7 +537,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN036`)
+## Diagnostics catalogue (`ODIN001`–`ODIN042`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -530,6 +580,12 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin034"></a>ODIN034 | error | Two branches of one `case:` (or a branch and the `else`) share a `label`, so `selected` is ambiguous. |
 | <a id="odin035"></a>ODIN035 | error | A `case:` branch has an empty `label`. |
 | <a id="odin036"></a>ODIN036 | **warning** | A `case:` selector carries `gates:`/`judge:` — inert (it has no output to check), and a failing gate would flip the always-passing selector to failed and break a merge-back that depends on it. |
+| <a id="odin037"></a>ODIN037 | error | A `loop:` step has a blank `until` — no exit condition. |
+| <a id="odin038"></a>ODIN038 | error | A `loop:` step's `max` is 0 — it could never run an iteration (use `>= 1`). |
+| <a id="odin039"></a>ODIN039 | error | A `loop:` step declares no body `steps`. |
+| <a id="odin040"></a>ODIN040 | error | A `loop:` body nests another `loop:` — unsupported (v1). |
+| <a id="odin041"></a>ODIN041 | error | A `loop:` body contains an `approval:` gate — unsupported (v1). |
+| <a id="odin042"></a>ODIN042 | **warning** | A `loop:` node carries its own `gates:`/`judge:`/`scratch:` — inert; a loop's verification is its `until` over the body. |
 
 ¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 
