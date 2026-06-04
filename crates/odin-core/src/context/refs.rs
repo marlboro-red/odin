@@ -24,6 +24,17 @@ const DIFF: &str = "DIFF";
 /// `loop.feedback` inside a `loop:` body (both per-attempt/iteration, children not modeled).
 const OPEN_ROOTS: &[&str] = &["trigger", "run", "retry", "loop"];
 
+/// minijinja's built-in global functions (minijinja 2.20). `undeclared_variables` reports a call
+/// like `range(…)` as an undeclared variable `range`, so without this exemption a perfectly valid
+/// `{{ range(loop.counter) }}` would trip a false ODIN017. (Re-verify this list on a minijinja bump.)
+const MINIJINJA_GLOBALS: &[&str] = &["range", "dict", "namespace", "debug"];
+
+/// The keys a `steps.<id>` object exposes in the render context (see `build_ctx_with`): the step's
+/// `outputs` map, its `exit_code`, and its `status`. A dotted `steps.<id>.<field>` is checked
+/// against this set so a typo (`steps.a.exitcode`) is caught; `outputs`' own children are dynamic
+/// and so are not modeled past that point.
+const STEP_FIELDS: &[&str] = &["outputs", "exit_code", "status"];
+
 /// Checks every template reference in the workflow, appending diagnostics.
 pub(crate) fn check(
     wf: &Workflow,
@@ -150,7 +161,35 @@ fn process_templates(
                 ),
             ));
         }
+        // ODIN029 — a `{% set %}` / `{% for %}` binds a new name the analysis can't follow, so a
+        // reference reached *through* that name (`{% set x = steps.a %}{{ x.bogus }}`) escapes the
+        // unknown-ref check. The binding's right-hand side is still checked; only paths off the new
+        // name are blind. Surface it once per template.
+        if binds_a_name(&source) {
+            d.push(Diagnostic::new(
+                DiagCode::DynamicTemplateRef,
+                tpl.pointer.clone(),
+                "uses a `{% set %}` / `{% for %}` binding; references reached through the \
+                 introduced name are not statically checked, so an unknown or forward reference \
+                 there will not be caught"
+                    .to_owned(),
+            ));
+        }
     }
+}
+
+/// True if `source` contains a `{% set … %}` or `{% for … %}` tag (tolerating the `{%-`
+/// whitespace-trim form). These introduce a binding the static ref checker can't follow.
+fn binds_a_name(source: &str) -> bool {
+    let mut rest = source;
+    while let Some(start) = rest.find("{%") {
+        let after = rest[start + 2..].trim_start_matches(['-', ' ', '\t', '\n', '\r']);
+        if after.starts_with("set ") || after.starts_with("for ") {
+            return true;
+        }
+        rest = &rest[start + 2..];
+    }
+    false
 }
 
 /// Checks a `loop:` body's templates against a scoped context (`loop` step at top-level index `i`).
@@ -371,6 +410,22 @@ fn check_var(
                             "references step {name:?} which is not an upstream dependency (add it to depends_on)"
                         ),
                     ));
+                } else if let Some(field) = segs.next() {
+                    // The step id is a known upstream dependency; validate the leaf accessor so a
+                    // typo like `steps.a.exitcode` is caught (only `outputs`/`exit_code`/`status`
+                    // exist). `outputs`' children are dynamic, so a 4th+ segment is not checked.
+                    if !STEP_FIELDS.contains(&field) {
+                        let mut diag =
+                            unknown_ref(pointer, &format!("field {field:?} on step {name:?}"));
+                        diag = match suggest(field, STEP_FIELDS.iter().copied()) {
+                            Some(sg) => diag.with_help(format!(
+                                "did you mean {sg:?}? a step exposes: outputs, exit_code, status"
+                            )),
+                            None => diag
+                                .with_help("a step exposes: outputs, exit_code, status".to_owned()),
+                        };
+                        d.push(diag);
+                    }
                 }
             }
         }
@@ -388,6 +443,8 @@ fn check_var(
             }
         }
         r if OPEN_ROOTS.contains(&r) => { /* allowed; children not modeled */ }
+        r if MINIJINJA_GLOBALS.contains(&r) => { /* a built-in minijinja function, not a variable */
+        }
         other => {
             // Derive the hint from the actual root sets so it can't drift when a root is added.
             let roots = CHECKED_ROOTS
@@ -551,6 +608,63 @@ mod tests {
             "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: \"echo {{ steps.a.outputs.x }}\", depends_on: [a]}\n",
         );
         assert!(!d.iter().any(|x| x.code == DiagCode::UnknownTemplateRef));
+    }
+
+    #[test]
+    fn minijinja_global_is_not_an_unknown_ref() {
+        // `range`/`dict`/`namespace`/`debug` are built-in minijinja functions, not variables —
+        // calling one must not trip ODIN017.
+        let d = check(
+            "name: x\nsteps:\n  - {id: a, provider: claude, prompt: \"{{ range(3) }} {{ dict(k=1) }} {{ namespace(x=1) }}\"}\n",
+        );
+        assert!(
+            !d.iter().any(|x| x.code == DiagCode::UnknownTemplateRef),
+            "minijinja globals must not be flagged: {d:?}"
+        );
+    }
+
+    #[test]
+    fn typoed_step_field_is_flagged_with_a_suggestion() {
+        // `a` IS an upstream dependency, so the id resolves; the leaf `exitcode` (should be
+        // `exit_code`) is the bug, and it must now be caught.
+        let d = check(
+            "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: \"echo {{ steps.a.exitcode }}\", depends_on: [a]}\n",
+        );
+        let diag = d
+            .iter()
+            .find(|x| x.code == DiagCode::UnknownTemplateRef)
+            .expect("a typoed step field must be flagged");
+        assert!(
+            diag.help
+                .as_deref()
+                .unwrap_or_default()
+                .contains("exit_code"),
+            "help should suggest exit_code: {:?}",
+            diag.help
+        );
+    }
+
+    #[test]
+    fn valid_step_fields_pass() {
+        let d = check(
+            "name: x\nsteps:\n  - {id: a, provider: claude, prompt: hi}\n  - {id: b, run: \"{{ steps.a.exit_code }} {{ steps.a.status }} {{ steps.a.outputs.stdout }}\", depends_on: [a]}\n",
+        );
+        assert!(
+            !d.iter().any(|x| x.code == DiagCode::UnknownTemplateRef),
+            "outputs/exit_code/status are all valid: {d:?}"
+        );
+    }
+
+    #[test]
+    fn set_or_for_binding_warns() {
+        // A `{% set %}` binding hides references reached through the new name — warn (ODIN029).
+        let d = check(
+            "name: x\nparams:\n  x: {}\nsteps:\n  - {id: a, provider: claude, prompt: \"{% set s = params.x %}{{ s.bogus }}\"}\n",
+        );
+        assert!(
+            d.iter().any(|x| x.code == DiagCode::DynamicTemplateRef),
+            "a set/for binding must raise ODIN029: {d:?}"
+        );
     }
 
     #[test]

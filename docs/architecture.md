@@ -210,7 +210,7 @@ do not.
 | ODIN026 | warning | the schema minor is newer than this engine |
 | ODIN027 | warning | a `github_webhook` trigger maps a param not declared in `params` (inert) |
 | ODIN028 | warning | an `action` step sets `scratch: true` (its side effects are discarded) |
-| ODIN029 | warning | a template accesses a checked root with subscript syntax (`steps["a"]`), escaping the static ref checks |
+| ODIN029 | warning | a template escapes the static ref checks via subscript syntax (`steps["a"]`) or a `{% set %}`/`{% for %}` binding |
 | ODIN030 | error | a param's `default` matches its declared `type` |
 | ODIN031 | warning | an untrusted `trigger.*` value is interpolated into a shell command (`run:`/gate/`shell.exec`) — injection risk |
 | ODIN032 | error | a workflow with an `approval` gate is not `durable` (a pause can't be resumed without persistence) |
