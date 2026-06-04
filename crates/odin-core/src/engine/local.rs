@@ -58,7 +58,9 @@ use crate::api::{
 use crate::context::render::{build_context, eval_when, render_template};
 use crate::error::{Error, Result};
 use crate::ids::{RunId, StepId};
-use crate::ir::{Backoff, FeedbackMode, JudgeSpec, Step, StepKind, Workflow, WorkspaceConfig};
+use crate::ir::{
+    Backoff, FeedbackMode, JudgeSpec, RetrySpec, Step, StepKind, Workflow, WorkspaceConfig,
+};
 use crate::provider::process::{ProcessOptions, run_process};
 use crate::registry::Registry;
 use crate::traits::{
@@ -751,6 +753,7 @@ impl LocalEngine {
         workdir: &Path,
         timeout: Option<Duration>,
         deps_passed: bool,
+        default_retry: Option<&RetrySpec>,
         cancel: &CancelToken,
     ) -> StepOutcome {
         if !deps_passed {
@@ -759,21 +762,24 @@ impl LocalEngine {
         match step.when.as_deref() {
             Some(expr) => match eval_when(expr, ctx) {
                 Ok(true) => {
-                    self.run_with_retry(run_id, step, ctx, workdir, timeout, cancel)
+                    self.run_with_retry(run_id, step, ctx, workdir, timeout, default_retry, cancel)
                         .await
                 }
                 Ok(false) => skipped_outcome(),
                 Err(e) => StepOutcome::failed(format!("when: {e}")),
             },
             None => {
-                self.run_with_retry(run_id, step, ctx, workdir, timeout, cancel)
+                self.run_with_retry(run_id, step, ctx, workdir, timeout, default_retry, cancel)
                     .await
             }
         }
     }
 
-    /// Runs a step, retrying on failure per its retry policy with backoff between attempts.
-    /// Emits a `StepStarted` event per attempt.
+    /// Runs a step, retrying on failure per its **effective** retry policy with backoff between
+    /// attempts. The effective policy is the step's own `retry:` if it set one, else the workflow
+    /// `defaults.retry` (`default_retry`) — so a bare step inherits the default. Emits a
+    /// `StepStarted` event per attempt.
+    #[allow(clippy::too_many_arguments)]
     async fn run_with_retry(
         &self,
         run_id: RunId,
@@ -781,10 +787,12 @@ impl LocalEngine {
         ctx: &minijinja::Value,
         workdir: &Path,
         timeout: Option<Duration>,
+        default_retry: Option<&RetrySpec>,
         cancel: &CancelToken,
     ) -> StepOutcome {
+        let retry = effective_retry(&step.retry, default_retry);
         // u32 so a (valid) `retry.max` of 255 can't overflow the attempt counter.
-        let max_attempts = 1 + u32::from(step.retry.max);
+        let max_attempts = 1 + u32::from(retry.max);
         // If the step can retry, snapshot the tree as it is BEFORE the first attempt, so each
         // retry runs against that clean state rather than on top of the failed attempt's
         // partial edits (a failing `run:` that mutated the workdir would otherwise double-
@@ -831,8 +839,7 @@ impl LocalEngine {
             .await;
             // Per-attempt context: always exposes `retry.attempt`; on a retry with `feedback`
             // enabled, `retry.feedback` carries the prior failure so the prompt can address it.
-            let attempt_ctx =
-                attempt_context(ctx, step.retry.feedback, attempt, prior_error.as_deref());
+            let attempt_ctx = attempt_context(ctx, retry.feedback, attempt, prior_error.as_deref());
             let mut outcome = self
                 .exec_step(step, &attempt_ctx, workdir, timeout, cancel)
                 .await;
@@ -847,7 +854,7 @@ impl LocalEngine {
                 .failure_detail
                 .clone()
                 .or_else(|| outcome.error.clone());
-            tokio::time::sleep(backoff_delay(step.retry.backoff, attempt)).await;
+            tokio::time::sleep(backoff_delay(retry.backoff, attempt)).await;
         };
         // The retry rewind point is dead once the step settles; drop its ref so the snapshot
         // commit becomes collectable (and doesn't outlive the run as a dangling anchor).
@@ -1320,6 +1327,7 @@ impl LocalEngine {
                     workdir,
                     timeout,
                     deps_passed,
+                    workflow.defaults.retry.as_ref(),
                     cancel,
                 )));
                 if exclusive {
@@ -1426,6 +1434,7 @@ impl LocalEngine {
         base_workdir: &Path,
         timeout: Option<Duration>,
         deps_passed: bool,
+        default_retry: Option<&RetrySpec>,
         cancel: &CancelToken,
     ) -> (StepId, StepOutcome) {
         let id = step.id.clone();
@@ -1440,6 +1449,7 @@ impl LocalEngine {
                     base_workdir,
                     timeout,
                     deps_passed,
+                    default_retry,
                     cancel,
                 )
                 .await;
@@ -1451,7 +1461,16 @@ impl LocalEngine {
         {
             Ok(scratch) => {
                 let mut outcome = self
-                    .decide_outcome(run_id, step, &ctx, &scratch, timeout, deps_passed, cancel)
+                    .decide_outcome(
+                        run_id,
+                        step,
+                        &ctx,
+                        &scratch,
+                        timeout,
+                        deps_passed,
+                        default_retry,
+                        cancel,
+                    )
                     .await;
                 // Capture the candidate's diff for any step that actually executed — Passed
                 // *or* Failed (a failed candidate's partial work is still worth inspecting by
@@ -1563,7 +1582,16 @@ impl LocalEngine {
                     .or(workflow.defaults.timeout)
                     .map(crate::ir::HumanDuration::as_duration);
                 let (_, o) = self
-                    .run_one(run_id, inner, ctx, workdir, timeout, deps_passed, cancel)
+                    .run_one(
+                        run_id,
+                        inner,
+                        ctx,
+                        workdir,
+                        timeout,
+                        deps_passed,
+                        workflow.defaults.retry.as_ref(),
+                        cancel,
+                    )
                     .await;
                 if let Some(u) = &o.usage {
                     usage.add(*u);
@@ -2453,6 +2481,23 @@ fn failure_detail(headline: &str, detail: &str) -> String {
         return headline.to_owned();
     }
     clip_tail(detail, FEEDBACK_MAX)
+}
+
+/// The retry policy a step actually runs under: its own `retry:` if it declared one, else the
+/// workflow `defaults.retry`. A *no-op* `step_retry` (the serde default — no retries) counts as
+/// "unset" and inherits the default, in the spirit of `step.timeout.or(defaults.timeout)`. Unlike
+/// `timeout` (an `Option`, so `None` and `Some(0)` differ), `retry` is a non-`Option` struct whose
+/// no-op default and an explicit `retry: { max: 0 }` collapse to the same value — so a step can't
+/// *explicitly* opt out of a default; give it any non-default `retry:` to take control.
+fn effective_retry<'a>(
+    step_retry: &'a RetrySpec,
+    default_retry: Option<&'a RetrySpec>,
+) -> &'a RetrySpec {
+    if step_retry.is_noop() {
+        default_retry.unwrap_or(step_retry)
+    } else {
+        step_retry
+    }
 }
 
 /// Base inter-attempt retry delay.
@@ -4746,6 +4791,79 @@ steps:
         let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
         assert_eq!(summary.status, RunStatus::Failed);
         assert_eq!(summary.steps[0].attempts, 2, "1 + max attempts");
+    }
+
+    #[tokio::test]
+    async fn a_bare_step_inherits_defaults_retry() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // `flaky` declares no `retry:` of its own, so it must inherit `defaults.retry` (max 2) and
+        // recover on the second attempt. Without the merge it would get 0 retries and the run fails.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\ndefaults:\n  retry: { max: 2 }\nsteps:\n  - {id: flaky, run: \"if [ {{ retry.attempt }} -eq 1 ]; then exit 1; fi; echo ok\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let flaky = s.steps.iter().find(|x| x.id.as_str() == "flaky").unwrap();
+        assert_eq!(
+            flaky.attempts, 2,
+            "inherited defaults.retry should give a 2nd attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_retry_overrides_defaults_retry() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // The step sets its OWN `retry: { max: 1 }` (2 attempts), so it must NOT inherit the more
+        // generous default (max 5). It needs attempt 3 to pass, so capped at 2 it fails.
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\ndefaults:\n  retry: { max: 5 }\nsteps:\n  - {id: flaky, retry: { max: 1 }, run: \"if [ {{ retry.attempt }} -lt 3 ]; then exit 1; fi; echo ok\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            s.status,
+            RunStatus::Failed,
+            "the step's own max:1 must override the default"
+        );
+        let flaky = s.steps.iter().find(|x| x.id.as_str() == "flaky").unwrap();
+        assert_eq!(
+            flaky.attempts, 2,
+            "step's own max:1 = 2 attempts, not the default's 6"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bare_step_inherits_defaults_retry_feedback() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        // The default carries `feedback: concise`, which a bare step must inherit — so attempt 2
+        // sees the prior failure under `retry.feedback`, not an empty string. (Guards against the
+        // effective policy supplying `max` but `feedback` still reading the step's own off mode.)
+        let wf = parse(
+            "name: w\ndurable: true\nworkspace: { type: worktree }\ndefaults:\n  retry: { max: 1, feedback: concise }\nsteps:\n  - {id: flaky, run: \"if [ {{ retry.attempt }} -eq 1 ]; then exit 1; fi; echo 'fb=[{{ retry.feedback }}]'\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded, "error: {:?}", s.error);
+        let flaky = s.steps.iter().find(|x| x.id.as_str() == "flaky").unwrap();
+        let stdout = flaky
+            .outputs
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            stdout.contains("exited with code 1"),
+            "inherited feedback should carry the prior failure; stdout: {stdout:?}"
+        );
     }
 
     /// Three `scratch` steps each write the same filename in their OWN isolated worktree;
