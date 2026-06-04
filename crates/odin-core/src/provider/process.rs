@@ -439,9 +439,9 @@ mod git_env_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::{ProcessOptions, run_process};
+    use super::{ProcessOptions, posix_shell, run_process};
     use crate::error::ProviderError;
     use crate::traits::CancelToken;
     use std::time::Duration;
@@ -450,10 +450,23 @@ mod tests {
         parts.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    /// Resolves the shell or returns `None` to skip — these tests use POSIX command strings, which
+    /// run on any platform with a shell (Unix `sh`, or Git Bash's `sh.exe` on Windows). The skip
+    /// only fires on a Windows box with no shell, where shell behavior can't be exercised anyway.
+    macro_rules! shell_or_skip {
+        () => {
+            match posix_shell() {
+                Ok(s) => s,
+                Err(_) => return,
+            }
+        };
+    }
+
     #[tokio::test]
     async fn captures_output_and_exit_code() {
+        let sh = shell_or_skip!();
         let out = run_process(
-            "sh",
+            sh,
             &args(&["-c", "echo out; echo err 1>&2; exit 3"]),
             &ProcessOptions::default(),
             &CancelToken::new(),
@@ -468,11 +481,12 @@ mod tests {
 
     #[tokio::test]
     async fn times_out_and_kills() {
+        let sh = shell_or_skip!();
         let opts = ProcessOptions {
             timeout: Some(Duration::from_millis(150)),
             ..Default::default()
         };
-        let out = run_process("sh", &args(&["-c", "sleep 5"]), &opts, &CancelToken::new())
+        let out = run_process(sh, &args(&["-c", "sleep 5"]), &opts, &CancelToken::new())
             .await
             .unwrap();
         assert!(out.timed_out, "expected timeout");
@@ -481,6 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancels_promptly() {
+        let sh = shell_or_skip!();
         let cancel = CancelToken::new();
         let trigger = cancel.clone();
         tokio::spawn(async move {
@@ -488,7 +503,7 @@ mod tests {
             trigger.cancel();
         });
         let out = run_process(
-            "sh",
+            sh,
             &args(&["-c", "sleep 5"]),
             &ProcessOptions::default(),
             &cancel,
@@ -500,6 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_binary_is_not_found() {
+        // No shell needed — spawns a bogus program directly, portable across platforms.
         let err = run_process(
             "odin-definitely-not-a-real-binary-xyz",
             &[],
@@ -511,6 +527,9 @@ mod tests {
         assert!(matches!(err, ProviderError::NotFound(_)), "got {err:?}");
     }
 
+    // Genuinely Unix-coupled: relies on pipe inheritance + `&` backgrounding and on a process
+    // group surviving the parent's kill — Windows has no process-group teardown.
+    #[cfg(unix)]
     #[tokio::test]
     async fn timeout_returns_even_if_a_grandchild_holds_the_pipe() {
         // The backgrounded `sleep 10` inherits the stdout pipe and outlives its parent
@@ -539,6 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn shields_odin_secret_from_the_child() {
+        let sh = shell_or_skip!();
         // ODIN_WEBHOOK_SECRET must never reach a spawned child, even when present in its
         // environment; an unrelated var must survive. (We seed it via `opts.env` rather than
         // the parent process env because `std::env::set_var` is `unsafe`, which the crate
@@ -551,7 +571,7 @@ mod tests {
             ..Default::default()
         };
         let out = run_process(
-            "sh",
+            sh,
             &args(&[
                 "-c",
                 "echo \"${ODIN_WEBHOOK_SECRET:-CLEAN}:${ODIN_KEEP_ME:-MISSING}\"",
@@ -566,11 +586,14 @@ mod tests {
 
     #[tokio::test]
     async fn feeds_stdin() {
+        // Route `cat` through the shell so it resolves on Windows (Git Bash ships cat, but it may
+        // not be on PATH for a bare `Command::new("cat")`).
+        let sh = shell_or_skip!();
         let opts = ProcessOptions {
             stdin: Some("hello".to_owned()),
             ..Default::default()
         };
-        let out = run_process("cat", &[], &opts, &CancelToken::new())
+        let out = run_process(sh, &args(&["-c", "cat"]), &opts, &CancelToken::new())
             .await
             .unwrap();
         assert_eq!(out.stdout, "hello");
