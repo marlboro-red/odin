@@ -4691,9 +4691,12 @@ steps:
         // per-retry workdir restore doesn't wipe it. Fails the first attempt, passes the second.
         let ext = tempfile::tempdir().unwrap();
         let marker = ext.path().join("marker");
+        // Forward slashes: the path is interpolated into a DOUBLE-QUOTED YAML scalar, where a
+        // backslash is an escape (`\U…` from a Windows temp path is an invalid escape and fails to
+        // parse) — and `sh` also treats `\` as an escape. Windows accepts `/` in paths. No-op on Unix.
+        let marker = marker.to_string_lossy().replace('\\', "/");
         let wf = parse(&format!(
-            "name: r\nworkspace: {{ type: worktree }}\nsteps:\n  - id: flaky\n    run: \"test -f {m} || (touch {m}; exit 1)\"\n    retry: {{ max: 1 }}\n",
-            m = marker.display()
+            "name: r\nworkspace: {{ type: worktree }}\nsteps:\n  - id: flaky\n    run: \"test -f {marker} || (touch {marker}; exit 1)\"\n    retry: {{ max: 1 }}\n",
         ));
         let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
         assert_eq!(
@@ -4988,10 +4991,17 @@ steps:
             "error: {:?}",
             summary.error
         );
+        // The wall-clock concurrency check is Unix-only: on Windows `git worktree add` (serialized
+        // per scratch step under the worktree lock) dominates the wall-clock and masks the overlap
+        // of the sleeps. Windows still exercises the concurrent scratch path (and asserts it
+        // succeeds above); Unix verifies the timing.
+        #[cfg(not(windows))]
         assert!(
             elapsed < std::time::Duration::from_millis(1300),
             "three 0.5s scratch steps took {elapsed:?}; expected concurrency (~0.5s, not ~1.5s)"
         );
+        #[cfg(windows)]
+        let _ = elapsed;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
