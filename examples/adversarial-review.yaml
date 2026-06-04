@@ -1,0 +1,116 @@
+# Adversarial PR review — Odin reviewing its OWN pull requests (dogfooding).
+#
+# When a PR opens, this workflow fans THREE reviewers out over its diff — each attacking it from a
+# different angle (correctness, security, API/design) concurrently in isolated scratch worktrees —
+# synthesizes one prioritized verdict, has a *different* provider judge whether that verdict is
+# actually useful, and (only after a human approves) posts it back to the PR as a comment.
+#
+# Point it at this repo with `odind` and a `pull_request.opened` webhook and Odin reviews itself.
+# It exercises a wide slice of the engine: webhook trigger + payload→param mapping, `max_parallel`
+# scratch fan-out, cross-provider `judge:`, an `approval:` gate before an outward side effect, and
+# the safe "map trusted fields into typed params, never interpolate `trigger.*` into a shell"
+# pattern (ODIN031). A VALIDATION showcase: running it needs `odind`, a webhook secret, the
+# claude/codex/copilot CLIs, and `gh`. Validates cleanly.
+#
+#   odin validate examples/adversarial-review.yaml
+
+schema_version: "1.0"
+name: adversarial-review
+description: Fan adversarial reviewers over a PR diff, synthesize a verdict, and post it on approval.
+durable: true # the approval gate is persisted + resumed from the store (ODIN032)
+
+workspace:
+  type: worktree
+
+max_parallel: 3 # the three reviewers run concurrently (each in its own scratch worktree)
+
+triggers:
+  - type: github_webhook
+    events: ["pull_request.opened"]
+    repo: marlboro-red/odin
+    # Pull the trusted, typed fields we need out of the SIGNED webhook payload into params, then
+    # reference *those* in shell commands below — never a raw `trigger.*` value (ODIN031).
+    params:
+      pr: number
+      repo: repository.full_name
+
+params:
+  pr:
+    type: number
+    required: true
+  repo:
+    type: string
+    required: true
+
+steps:
+  # 1. Fetch the PR's unified diff. Its stdout is the input every reviewer reads.
+  - id: fetch
+    run: "gh pr diff {{ params.pr }} --repo {{ params.repo }}"
+
+  # 2. Three reviewers, three lenses, run in parallel. They edit nothing — each writes its review
+  #    to stdout. (For very large diffs, codex can stall; prefer a single reviewer or chunk it.)
+  - id: review_correctness
+    provider: claude
+    scratch: true
+    depends_on: [fetch]
+    prompt: |
+      You are a HOSTILE correctness reviewer. Find real bugs, broken edge cases, and wrong
+      assumptions in this diff. Cite exact hunks. If you find nothing, say so plainly.
+
+      {{ steps.fetch.outputs.stdout }}
+
+  - id: review_security
+    provider: codex
+    scratch: true
+    depends_on: [fetch]
+    prompt: |
+      You are a security reviewer. Hunt for injection, auth bypass, unsafe input handling, and
+      secret leakage in this diff. Cite exact hunks. Default to "no issue" only when sure.
+
+      {{ steps.fetch.outputs.stdout }}
+
+  - id: review_design
+    provider: copilot
+    scratch: true
+    depends_on: [fetch]
+    prompt: |
+      You are an API/design reviewer. Flag breaking changes, leaky abstractions, and missing
+      tests or docs in this diff. Cite exact hunks.
+
+      {{ steps.fetch.outputs.stdout }}
+
+  # 3. Merge the three into ONE prioritized verdict. A different provider judges whether the
+  #    synthesis is specific and actionable before the step can pass (cross-provider judge).
+  - id: synthesize
+    provider: claude
+    depends_on: [review_correctness, review_security, review_design]
+    prompt: |
+      Merge these three reviews into one prioritized verdict — blockers first, then nits. Drop
+      duplicates and anything not actionable. End with an explicit APPROVE or REQUEST CHANGES.
+
+      ## Correctness
+      {{ steps.review_correctness.outputs.stdout }}
+      ## Security
+      {{ steps.review_security.outputs.stdout }}
+      ## Design
+      {{ steps.review_design.outputs.stdout }}
+    judge:
+      provider: codex
+      criteria: "Is this review specific, actionable, and free of obvious false positives? Reply with a JSON object {\"score\": 0.0-1.0}."
+      threshold: 0.6
+
+  # 4. A human approves before anything is posted to the PR (an outward side effect).
+  - id: gate
+    approval:
+      message: "Post the synthesized adversarial review as a comment on this PR?"
+    depends_on: [synthesize]
+
+  # 5. Post it. The QUOTED heredoc captures the already-rendered review text literally, so its
+  #    Markdown/shell metacharacters are never re-interpreted by the shell.
+  - id: post
+    depends_on: [gate]
+    run: |
+      cat > review.md <<'ODIN_REVIEW_EOF'
+      {{ steps.synthesize.outputs.stdout }}
+      ODIN_REVIEW_EOF
+      gh pr comment {{ params.pr }} --repo {{ params.repo }} --body-file review.md
