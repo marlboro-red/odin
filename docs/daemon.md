@@ -143,6 +143,11 @@ Point a GitHub webhook (content type `application/json`, secret = your `--webhoo
 This unlocks the marquee flow — label an issue, and `issues.labeled → issue-to-pr` runs. See
 [`examples/issue-to-pr.yaml`](../examples/issue-to-pr.yaml).
 
+> **Setting one up?** The end-to-end [webhook walkthrough](webhook-walkthrough.md) covers the two
+> steps this reference assumes — exposing the daemon publicly (a tunnel) and creating the webhook on
+> GitHub — plus the full open-PR → review → approve → comment loop, worked against
+> [`adversarial-review.yaml`](../examples/adversarial-review.yaml).
+
 ### Approving a paused run over HTTP
 
 When any loaded workflow has an [`approval` gate](workflow-reference.md#approval-step), the same
