@@ -12,7 +12,9 @@ use odin_core::{
 
 /// Parsed arguments for `odin run`.
 pub(crate) struct RunArgs {
+    /// The workflow to run: a file path or a recipe name (see [`crate::catalog::resolve_arg`]).
     pub file: PathBuf,
+    pub recipes_dir: Option<PathBuf>,
     pub params: Vec<String>,
     pub trigger: Option<String>,
     pub repo: Option<PathBuf>,
@@ -21,14 +23,16 @@ pub(crate) struct RunArgs {
     pub json: bool,
 }
 
-/// Runs the workflow at `args.file`. Exit: `0` succeeded, `1` failed / invalid, `2` parse/IO.
+/// Runs the workflow named by `args.file` (a path or a recipe name). Exit: `0` succeeded,
+/// `1` failed / invalid, `2` parse/IO.
 pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
-    let src = std::fs::read_to_string(&args.file)
-        .with_context(|| format!("reading {}", args.file.display()))?;
+    let file = crate::catalog::resolve_arg(&args.file, args.recipes_dir.as_deref())?;
+    let src =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let workflow = match Workflow::from_yaml_str(&src) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("✗ {}: parse error\n  {e}", args.file.display());
+            eprintln!("✗ {}: parse error\n  {e}", file.display());
             return Ok(ExitCode::from(2));
         }
     };

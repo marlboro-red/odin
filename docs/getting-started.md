@@ -71,6 +71,23 @@ resumes. Add `--no-store` to disable persistence.
 The [`odin` CLI reference](cli.md) documents every command, flag, exit code, and `--json`
 shape.
 
+### Run by name (the recipe catalog)
+
+Tired of typing paths? Keep your workflows in the **recipe catalog** and run them by name. Seed
+it once with the shipped examples, then `run`/`validate` resolve a bare name automatically (an
+existing file path always wins):
+
+```sh
+odin recipe init                 # seed the catalog with the bundled starters
+odin recipe list                 # see what's there (name + description)
+odin run adversarial-review --repo . --param pr=42   # run by name, no path
+odin recipe add ./my-flow.yaml   # add your own
+```
+
+The catalog lives in a per-platform directory (macOS `~/Library/Application Support/odin/recipes`,
+Linux `~/.local/share/odin/recipes`, Windows `%LOCALAPPDATA%\odin\data\recipes`), overridable with
+`--recipes-dir` or `$ODIN_RECIPES_DIR`. See [`odin recipe`](cli.md#odin-recipe-subcommand).
+
 ## 3. Inspect past runs
 
 ```sh
@@ -126,7 +143,8 @@ verification and dedup, and the fail-closed security model.
 ## Where next
 
 - [Workflow reference](workflow-reference.md) — every field and all 44 diagnostics.
-- [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references.
+- [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references, including the
+  [recipe catalog](cli.md#odin-recipe-subcommand) (run workflows by name).
 - [Webhook walkthrough](webhook-walkthrough.md) — wire a GitHub webhook end-to-end (tunnel →
   webhook → open-PR → review → approve → comment), worked against the `adversarial-review` example.
 - [Integration guide](integration-guide.md) — embed `odin-core`, plug in custom

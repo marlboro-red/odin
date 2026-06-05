@@ -163,6 +163,37 @@ pub(crate) fn resolve(dir: &Path, name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Resolves a `run`/`validate` workflow argument to a file path: **an existing file path wins**;
+/// otherwise the argument is treated as a recipe **name** and looked up in the catalog. This keeps
+/// `odin run ./wf.yaml` working exactly as before while adding `odin run <recipe-name>`.
+///
+/// # Errors
+/// Fails (with a hint listing available recipes) if `arg` is neither an existing file nor a recipe.
+pub(crate) fn resolve_arg(arg: &Path, recipes_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if arg.is_file() {
+        return Ok(arg.to_path_buf());
+    }
+    let dir = dir(recipes_dir)?;
+    if let Some(path) = arg.to_str().and_then(|name| resolve(&dir, name)) {
+        return Ok(path);
+    }
+    let available = list(&dir).unwrap_or_default();
+    let hint = if available.is_empty() {
+        format!(
+            "not a file, and the recipe catalog at {} is empty (`odin recipe init` to seed it)",
+            dir.display()
+        )
+    } else {
+        let names: Vec<&str> = available.iter().map(|r| r.name.as_str()).collect();
+        format!(
+            "not a file, and no such recipe in {} (available: {})",
+            dir.display(),
+            names.join(", ")
+        )
+    };
+    anyhow::bail!("cannot find workflow '{}': {hint}", arg.display())
+}
+
 /// Lists every recipe in `dir`, sorted by name, reading each file's metadata best-effort. A
 /// missing directory is an **empty** catalog (not an error); an unreadable directory is an error.
 ///
@@ -289,6 +320,28 @@ mod tests {
             Workflow::from_yaml_str(body)
                 .unwrap_or_else(|e| panic!("bundled starter {name} does not parse: {e}"));
         }
+    }
+
+    #[test]
+    fn resolve_arg_prefers_file_then_recipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tmp.path().join("recipes");
+        std::fs::create_dir_all(&catalog_dir).unwrap();
+        write(&catalog_dir, "by-name.yaml", WF);
+
+        // A real file path is returned as-is.
+        let file = tmp.path().join("explicit.yaml");
+        std::fs::write(&file, WF).unwrap();
+        assert_eq!(resolve_arg(&file, Some(&catalog_dir)).unwrap(), file);
+
+        // A bare name resolves against the catalog.
+        assert_eq!(
+            resolve_arg(Path::new("by-name"), Some(&catalog_dir)).unwrap(),
+            catalog_dir.join("by-name.yaml")
+        );
+
+        // Neither a file nor a recipe → error.
+        assert!(resolve_arg(Path::new("nope"), Some(&catalog_dir)).is_err());
     }
 
     #[test]

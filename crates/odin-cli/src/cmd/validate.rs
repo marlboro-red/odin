@@ -6,9 +6,14 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use odin_core::{KnownNames, ValidationReport, Workflow, validate_source};
 
-/// Validates the workflow at `file`. Returns the process exit code:
-/// `0` valid (possibly with warnings), `1` validation errors, `2` parse/IO failure.
-pub(crate) fn run(file: &Path, json: bool) -> anyhow::Result<ExitCode> {
+use crate::catalog;
+
+/// Validates the workflow at `arg` — either a file path or a recipe name (see
+/// [`catalog::resolve_arg`]). Returns the process exit code: `0` valid (possibly with warnings),
+/// `1` validation errors, `2` parse/IO failure.
+pub(crate) fn run(arg: &Path, recipes_dir: Option<&Path>, json: bool) -> anyhow::Result<ExitCode> {
+    let file = catalog::resolve_arg(arg, recipes_dir)?;
+    let file = file.as_path();
     let src =
         std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
 

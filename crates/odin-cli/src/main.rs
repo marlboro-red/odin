@@ -29,16 +29,22 @@ struct Cli {
 enum Command {
     /// Parse and validate a workflow file, reporting all diagnostics.
     Validate {
-        /// Path to the workflow YAML file.
+        /// The workflow: a path to a YAML file, or a recipe name in the catalog.
         file: PathBuf,
+        /// Override the recipe catalog directory used to resolve a name.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
         /// Emit the diagnostics report as JSON instead of human-readable text.
         #[arg(long)]
         json: bool,
     },
     /// Run a workflow to completion.
     Run {
-        /// Path to the workflow YAML file.
+        /// The workflow: a path to a YAML file, or a recipe name in the catalog.
         file: PathBuf,
+        /// Override the recipe catalog directory used to resolve a name.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
         /// A typed input parameter as `KEY=VALUE` (repeatable). Values parse as JSON if
         /// possible (so `42` / `true` are typed), otherwise as a string.
         #[arg(long = "param", value_name = "KEY=VALUE")]
@@ -290,7 +296,11 @@ fn main() -> ExitCode {
         otlp_endpoint: None,
     });
     match cli.command {
-        Command::Validate { file, json } => match cmd::validate::run(&file, json) {
+        Command::Validate {
+            file,
+            recipes_dir,
+            json,
+        } => match cmd::validate::run(&file, recipes_dir.as_deref(), json) {
             Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -299,6 +309,7 @@ fn main() -> ExitCode {
         },
         Command::Run {
             file,
+            recipes_dir,
             param,
             trigger,
             repo,
@@ -308,6 +319,7 @@ fn main() -> ExitCode {
         } => {
             let args = cmd::run::RunArgs {
                 file,
+                recipes_dir,
                 params: param,
                 trigger,
                 repo,
