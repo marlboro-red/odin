@@ -141,6 +141,7 @@ verification and dedup, and the fail-closed security model.
 | [`triage.yaml`](../examples/triage.yaml) | **Branching** with `case:`: classify an issue, then take exactly one labeled branch's steps, with a merge-back. |
 | [`self-correct.yaml`](../examples/self-correct.yaml) | **Single-step self-correct**: `retry` with `feedback`, re-prompting one step with the prior failure (gates as the verifier). |
 | [`iterate.yaml`](../examples/iterate.yaml) | **Multi-step loop** with `loop:`: iterate edit → test until the test passes, feeding each failure back as `loop.feedback`. |
+| [`deep-review.yaml`](../examples/deep-review.yaml) | **Whole-codebase deep review**: four concurrent `scratch:` dimension reviewers (correctness/robustness/concurrency/security) fan in to a cross-provider lead reviewer that synthesizes a ranked report, written to an absolute path via a safe quoted heredoc. ([`-codex`](../examples/deep-review-codex.yaml) swaps the synthesizer to codex.) Verified end-to-end against a real repo. |
 
 ## Where next
 

@@ -15,6 +15,8 @@ const SHIP_RELEASE: &str = include_str!("../../../examples/ship-release.yaml");
 const LOOP_WITH_CASE: &str = include_str!("../../../examples/loop-with-case.yaml");
 const ADVERSARIAL_REVIEW: &str = include_str!("../../../examples/adversarial-review.yaml");
 const LOCAL_REVIEW: &str = include_str!("../../../examples/local-review.yaml");
+const DEEP_REVIEW: &str = include_str!("../../../examples/deep-review.yaml");
+const DEEP_REVIEW_CODEX: &str = include_str!("../../../examples/deep-review-codex.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -303,4 +305,61 @@ fn local_review_validates_and_is_a_stateless_one_shot() {
             .any(|s| matches!(s.kind, StepKind::Approval(_))),
         "no approval gate — it never posts anything outward"
     );
+}
+
+#[test]
+fn deep_review_validates_and_fans_out_then_synthesizes() {
+    use odin_core::StepKind;
+    // Whole-codebase review: four concurrent scratch reviewers (max_parallel) converge at a lead
+    // reviewer that synthesizes their stdouts, then a report step writes to an absolute path.
+    // Verified end-to-end against ../tui-bridge with the real claude + codex CLIs; this pins shape.
+    let wf = Workflow::from_yaml_str(DEEP_REVIEW).expect("parses");
+    assert!(
+        validate_source(DEEP_REVIEW, &wf, &KnownNames::builtin()).is_empty(),
+        "deep-review should validate clean"
+    );
+    assert!(!wf.durable, "a stateless one-shot (run with --no-store)");
+    assert_eq!(wf.max_parallel.map(std::num::NonZeroUsize::get), Some(4));
+    assert_eq!(
+        wf.steps.iter().filter(|s| s.scratch).count(),
+        4,
+        "four concurrent scratch reviewers"
+    );
+    // The lead reviewer depends on all four reviewers (the fan-in).
+    let synth = wf
+        .steps
+        .iter()
+        .find(|s| s.id.as_str() == "synthesize")
+        .expect("a synthesize step");
+    assert_eq!(
+        synth.depends_on.len(),
+        4,
+        "synthesize fans in all reviewers"
+    );
+    assert!(matches!(synth.kind, StepKind::Provider(_)));
+}
+
+#[test]
+fn deep_review_codex_variant_validates_and_swaps_the_judge() {
+    let wf = Workflow::from_yaml_str(DEEP_REVIEW_CODEX).expect("parses");
+    assert!(
+        validate_source(DEEP_REVIEW_CODEX, &wf, &KnownNames::builtin()).is_empty(),
+        "deep-review-codex should validate clean"
+    );
+    // The only meaningful difference from deep-review: the synthesizer's provider is codex.
+    let synth = wf
+        .steps
+        .iter()
+        .find(|s| s.id.as_str() == "synthesize")
+        .expect("a synthesize step");
+    match &synth.kind {
+        odin_core::StepKind::Provider(p) => {
+            assert_eq!(
+                p.provider.as_str(),
+                "codex",
+                "the codex variant judges with codex"
+            );
+        }
+        _ => panic!("synthesize must be a provider step"),
+    }
 }

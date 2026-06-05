@@ -1,0 +1,101 @@
+# Codex-synthesized variant of `deep-review.yaml`: same four parallel `scratch` dimension reviewers,
+# but the LEAD reviewer that consolidates them is `codex` instead of `claude` — an A/B of the
+# cross-provider judge. Reviewers are asked to be concise so the synthesizer's prompt stays well
+# under codex's large-prompt limit.
+#
+#   odin run examples/deep-review-codex.yaml --repo ../tui-bridge --no-store \
+#     --param out="$PWD/../tui-bridge/REVIEW-codex.md"
+
+schema_version: "1.0"
+name: deep-review-codex
+description: Deep multi-dimension codebase review by parallel agents, synthesized by codex into a ranked markdown report at an absolute path.
+tags: [review, template]
+durable: false
+
+workspace:
+  type: worktree
+
+max_parallel: 4
+
+params:
+  out:
+    type: string
+    required: true # ABSOLUTE path for the report (written outside the throwaway worktree)
+
+steps:
+  - id: review_correctness
+    provider: claude
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for CORRECTNESS & BUGS. Read the code — start from the entry
+      points and follow the main runtime flows. Find logic errors, off-by-one / overflow mistakes,
+      wrong state transitions, and mishandled edge cases (empty/huge/hostile input, resize,
+      non-UTF-8 bytes, races between observed and observer).
+      Report only your MOST IMPORTANT findings (at most 8), tightly written. For each: a one-line
+      title, severity (high/medium/low), `file:line`, a short code quote, the concrete impact, and a
+      fix. Cite real `file:line`s only. Output ONLY a markdown list — no preamble. If none, "_none_".
+
+  - id: review_robustness
+    provider: codex
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for ERROR HANDLING & ROBUSTNESS. Find panics / unwraps /
+      expects on fallible paths, resource and child-process lifecycle bugs (leaks, missing cleanup,
+      EOF / closed-pipe handling), partial reads/writes, missing or unbounded timeouts, and what
+      happens when an input is hostile or a subprocess exits or hangs.
+      Report only your MOST IMPORTANT findings (at most 8), tightly written. For each: a one-line
+      title, severity, `file:line`, a short code quote, the concrete impact, and a fix. Output ONLY
+      a markdown list. If none, write "_none_".
+
+  - id: review_concurrency
+    provider: claude
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for CONCURRENCY & ASYNC correctness. Find data races,
+      deadlocks, locks held across await points, blocking calls on an async runtime, unsound shared
+      state, serial bottlenecks that defeat concurrent use, and signal / shutdown handling gaps.
+      Report only your MOST IMPORTANT findings (at most 8), tightly written. For each: a one-line
+      title, severity, `file:line`, a short code quote, the concrete impact, and a fix. Output ONLY
+      a markdown list. If none, write "_none_".
+
+  - id: review_security
+    provider: claude
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for SECURITY. Consider command / argument injection, path
+      traversal, trust and authentication boundaries (any network/IPC control channel), input
+      validation, `unsafe`, and secret / sensitive-data handling. State the attacker model for each
+      issue (who can reach it and what they gain).
+      Report only your MOST IMPORTANT findings (at most 8), tightly written. For each: a one-line
+      title, severity, `file:line`, a short code quote, the concrete impact, and a fix. Output ONLY
+      a markdown list. If none, write "_none_".
+
+  - id: synthesize
+    provider: codex # the cross-provider lead reviewer (the A/B variable vs deep-review.yaml's claude)
+    depends_on: [review_correctness, review_robustness, review_concurrency, review_security]
+    prompt: |
+      You are the lead reviewer. Combine the four dimension reviews below into ONE deep review
+      report. Deduplicate overlapping findings (collapse a shared root cause into a single item),
+      rank everything by real-world impact (severity × likelihood) as P0 / P1 / P2 — each with
+      `file:line` and a concrete fix — call out what is genuinely GOOD about the codebase, give an
+      honest overall health assessment, and end with a prioritized next-steps list. Output ONLY
+      GitHub-flavored markdown.
+
+      === CORRECTNESS (claude) ===
+      {{ steps.review_correctness.outputs.stdout }}
+
+      === ROBUSTNESS (codex) ===
+      {{ steps.review_robustness.outputs.stdout }}
+
+      === CONCURRENCY (claude) ===
+      {{ steps.review_concurrency.outputs.stdout }}
+
+      === SECURITY (claude) ===
+      {{ steps.review_security.outputs.stdout }}
+
+  - id: report
+    depends_on: [synthesize]
+    run: |
+      cat > {{ params.out }} <<'ODIN_DEEP_REVIEW_EOF_7b3e9c1a8f24d05e'
+      {{ steps.synthesize.outputs.stdout }}
+      ODIN_DEEP_REVIEW_EOF_7b3e9c1a8f24d05e
