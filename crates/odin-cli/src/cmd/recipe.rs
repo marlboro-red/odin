@@ -5,6 +5,7 @@
 //! [`crate::catalog`].
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -148,7 +149,8 @@ pub(crate) fn add(
     Ok(ExitCode::SUCCESS)
 }
 
-/// Parsed arguments for `odin recipe new`.
+/// Parsed arguments for `odin recipe new` (mirrors the CLI flags).
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct NewArgs {
     pub name: String,
     pub from: String,
@@ -156,6 +158,8 @@ pub(crate) struct NewArgs {
     pub out: Option<PathBuf>,
     pub catalog: bool,
     pub stdout: bool,
+    pub interactive: bool,
+    pub explain: bool,
     pub recipes_dir: Option<PathBuf>,
     pub force: bool,
 }
@@ -172,12 +176,26 @@ pub(crate) fn new(args: &NewArgs) -> anyhow::Result<ExitCode> {
             args.name
         );
     }
-    let set = parse_set(&args.set)?;
+    let mut set = parse_set(&args.set)?;
     let source = catalog::resolve_source(&args.from, args.recipes_dir.as_deref())?;
+    let tpl = scaffold::parse(&source.body)?;
+
+    // Prompt for missing required variables when attached to a terminal (or forced with
+    // --interactive). Skipped for --explain (a dry inspection) and when there's no template.
+    if let Some(t) = &tpl {
+        if !args.explain && (args.interactive || std::io::stdin().is_terminal()) {
+            scaffold::fill_interactively(t, &mut set, &mut scaffold::StdinPrompter)?;
+        }
+    }
+
+    if args.explain {
+        explain(args, &source, tpl.as_ref(), &set);
+        return Ok(ExitCode::SUCCESS);
+    }
 
     // Fill the template if the source declares one; else require that no --set was given.
-    let rendered = if let Some(tpl) = scaffold::parse(&source.body)? {
-        tpl.render(&set)?
+    let rendered = if let Some(t) = &tpl {
+        t.render(&set)?
     } else {
         anyhow::ensure!(
             set.is_empty(),
@@ -188,13 +206,21 @@ pub(crate) fn new(args: &NewArgs) -> anyhow::Result<ExitCode> {
     };
     // Rewrite the name + assert the (now-substituted, valid-YAML) body round-trips.
     let body = catalog::rewrite_workflow_name(&rendered, &args.name)?;
+    write_result(args, &source, &body)
+}
 
+/// Writes the rendered recipe to its destination (`--stdout`, `--catalog`, `--out`, or the cwd
+/// default) and prints a next-step hint.
+fn write_result(
+    args: &NewArgs,
+    source: &catalog::SourceBody,
+    body: &str,
+) -> anyhow::Result<ExitCode> {
     if args.stdout {
         eprintln!("# recipe {} (from {})", args.name, source.provenance);
         print!("{body}");
         return Ok(ExitCode::SUCCESS);
     }
-
     let dest = if args.catalog {
         catalog::dir_create(args.recipes_dir.as_deref())?.join(format!("{}.yaml", args.name))
     } else {
@@ -206,7 +232,7 @@ pub(crate) fn new(args: &NewArgs) -> anyhow::Result<ExitCode> {
             dest.display()
         );
     }
-    std::fs::write(&dest, &body).with_context(|| format!("writing {}", dest.display()))?;
+    std::fs::write(&dest, body).with_context(|| format!("writing {}", dest.display()))?;
     println!(
         "created '{}' → {} (from {})",
         args.name,
@@ -219,6 +245,75 @@ pub(crate) fn new(args: &NewArgs) -> anyhow::Result<ExitCode> {
         println!("  next: odin validate {0} && odin run {0}", dest.display());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `--explain`: print the two templating layers — the scaffold-time `@@VAR@@` values that would be
+/// baked in now, and the run-time `{{ params.* }}` the result still expects — and write nothing.
+fn explain(
+    args: &NewArgs,
+    source: &catalog::SourceBody,
+    tpl: Option<&scaffold::Template>,
+    set: &BTreeMap<String, String>,
+) {
+    println!("recipe '{}' from {}", args.name, source.provenance);
+    match tpl {
+        None => println!("\nNo scaffold variables — the source is copied verbatim."),
+        Some(t) => {
+            println!("\nScaffold-time variables (@@VAR@@), baked in now:");
+            for v in t.vars() {
+                let (value, origin) = if let Some(s) = set.get(v.name) {
+                    (s.clone(), "set")
+                } else if let Some(d) = v.default {
+                    (d.to_owned(), "default")
+                } else {
+                    ("<required — not provided>".to_owned(), "required")
+                };
+                let desc = v
+                    .description
+                    .map(|d| format!("  # {d}"))
+                    .unwrap_or_default();
+                println!("  @@{}@@ = {value}  [{origin}]{desc}", v.name);
+            }
+        }
+    }
+    // Read run-time params from a *parseable* body. A raw `@@…@@` marker isn't valid YAML (`@` is
+    // a YAML reserved indicator), so for a template we best-effort-fill every variable first; for a
+    // plain source we parse it directly.
+    let parseable = match tpl {
+        Some(t) => {
+            let mut full = BTreeMap::new();
+            for v in t.vars() {
+                let val = set
+                    .get(v.name)
+                    .cloned()
+                    .or_else(|| v.default.map(str::to_owned))
+                    .unwrap_or_else(|| format!("{}_value", v.name));
+                full.insert(v.name.to_owned(), val);
+            }
+            t.render(&full).ok()
+        }
+        None => Some(source.body.clone()),
+    };
+    match parseable.as_deref().map(Workflow::from_yaml_str) {
+        Some(Ok(wf)) if !wf.params.is_empty() => {
+            println!("\nRun-time params ({{{{ params.* }}}}), supplied per run:");
+            for (name, spec) in &wf.params {
+                let req = if spec.required {
+                    "required"
+                } else {
+                    "optional"
+                };
+                let def = spec
+                    .default
+                    .as_ref()
+                    .map(|d| format!(", default {d}"))
+                    .unwrap_or_default();
+                println!("  {name}  ({req}{def})");
+            }
+        }
+        Some(Ok(_)) => println!("\nRun-time params: none."),
+        _ => println!("\nRun-time params: (unavailable — the template did not render/parse)"),
+    }
 }
 
 /// Parses `--set KEY=VALUE` pairs (value may contain `=`; key must be non-empty).

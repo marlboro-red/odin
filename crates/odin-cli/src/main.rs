@@ -264,6 +264,12 @@ enum RecipeSub {
         /// Print the rendered workflow to stdout instead of writing a file.
         #[arg(long)]
         stdout: bool,
+        /// Prompt for missing required template variables (default: prompt only on a terminal).
+        #[arg(long)]
+        interactive: bool,
+        /// Show what would be filled (scaffold variables + run-time params) and write nothing.
+        #[arg(long)]
+        explain: bool,
         /// Override the catalog directory used to resolve `--from` (and `--catalog`).
         #[arg(long, value_name = "DIR")]
         recipes_dir: Option<PathBuf>,
@@ -327,6 +333,8 @@ fn dispatch_recipe(sub: RecipeSub) -> anyhow::Result<ExitCode> {
             out,
             catalog,
             stdout,
+            interactive,
+            explain,
             recipes_dir,
             force,
         } => cmd::recipe::new(&cmd::recipe::NewArgs {
@@ -336,6 +344,8 @@ fn dispatch_recipe(sub: RecipeSub) -> anyhow::Result<ExitCode> {
             out,
             catalog,
             stdout,
+            interactive,
+            explain,
             recipes_dir,
             force,
         }),

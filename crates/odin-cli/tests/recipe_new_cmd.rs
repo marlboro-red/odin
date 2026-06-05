@@ -269,3 +269,43 @@ fn new_catalog_installs_runnable_by_name() {
     assert!(path.status.success());
     assert!(String::from_utf8_lossy(&path.stdout).contains("installed.yaml"));
 }
+
+#[test]
+fn new_explain_describes_scaffold_vars_and_writes_nothing() {
+    let cwd = tempfile::tempdir().unwrap();
+    let rc = tempfile::tempdir().unwrap();
+    let tpl = write_template(cwd.path());
+    let out = odin_in(
+        cwd.path(),
+        rc.path(),
+        &[
+            "recipe",
+            "new",
+            "preview",
+            "--from",
+            tpl.to_str().unwrap(),
+            "--set",
+            "base_branch=main",
+            "--explain",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Scaffold-time variables"), "got:\n{stdout}");
+    assert!(
+        stdout.contains("@@base_branch@@") && stdout.contains("main"),
+        "got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("@@provider@@") && stdout.contains("claude"),
+        "default not shown:\n{stdout}"
+    );
+    assert!(
+        !cwd.path().join("preview.yaml").exists(),
+        "--explain must not write a file"
+    );
+}
