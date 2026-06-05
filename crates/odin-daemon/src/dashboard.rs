@@ -104,7 +104,29 @@ pub(crate) const HTML: &str = r##"<!doctype html>
   .spinner { width: 14px; height: 14px; border: 2px solid var(--border-hi); border-top-color: var(--accent);
              border-radius: 50%; animation: spin .7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } #toast { transition: opacity .2s; } }
+  .refresh { background: var(--bg-sunken); color: var(--text-dim); border: 1px solid var(--border-hi);
+             border-radius: var(--r-sm); padding: var(--s1) var(--s2); font-size: 14px; line-height: 1; }
+  .refresh:hover { color: var(--text); }
+  .banner { background: #3d2f10; color: var(--warn); text-align: center; padding: var(--s2) var(--s4);
+            font-size: 13px; border-bottom: 1px solid rgba(251,191,36,.3); position: sticky; top: 0; z-index: 4; }
+  main.dim { opacity: .45; transition: opacity .2s; }
+  #scrim { position: fixed; inset: 0; background: rgba(0,0,0,.45); opacity: 0; pointer-events: none;
+           transition: opacity .22s; z-index: 19; }
+  #scrim.open { opacity: 1; pointer-events: auto; }
+  #drawer { position: fixed; top: 0; right: 0; height: 100vh; width: min(560px, 92vw);
+            background: var(--bg-card); border-left: 1px solid var(--border-hi);
+            box-shadow: -8px 0 28px rgba(0,0,0,.32); transform: translateX(100%);
+            transition: transform .22s ease; z-index: 20; display: flex; flex-direction: column; }
+  #drawer.open { transform: translateX(0); }
+  #drawer .dhead { display: flex; align-items: center; gap: var(--s3); padding: var(--s3) var(--s4);
+                   border-bottom: 1px solid var(--border); }
+  #drawer .dhead .x { margin-left: auto; background: none; color: var(--text-dim); font-size: 18px;
+                      padding: 0 var(--s2); font-weight: 400; }
+  #drawer .dhead .x:hover { color: var(--text); }
+  #drawer .dbody { padding: var(--s4); overflow: auto; flex: 1; }
+  #drawer pre.diff { max-height: none; margin-top: var(--s3); }
+  .trunc { color: var(--text-mut); font-style: italic; }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } #toast, #drawer, #scrim { transition: none; } }
 </style>
 </head>
 <body>
@@ -116,21 +138,38 @@ pub(crate) const HTML: &str = r##"<!doctype html>
     <input id="approver" placeholder="your name" size="10" aria-label="your name (recorded as the approver)" title="recorded as the approver">
     <input id="secret" type="password" placeholder="webhook secret" size="16" aria-label="webhook secret" title="used to sign approve/reject in your browser; never sent except as a signature">
   </div>
+  <button id="refresh" class="refresh" title="refresh now" aria-label="refresh now">↻</button>
   <span id="tick" aria-live="off"></span>
 </header>
+<div id="banner" class="banner" role="status" hidden></div>
 <main id="runs" role="region" aria-label="workflow runs"><div class="empty"><span class="spinner"></span> loading…</div></main>
 <div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+<div id="scrim"></div>
+<aside id="drawer" aria-hidden="true" aria-label="run detail" tabindex="-1">
+  <div class="dhead">
+    <span class="badge" id="d-badge"></span><span class="wf" id="d-wf"></span><span class="id" id="d-id"></span>
+    <button class="x" id="d-close" aria-label="close detail">✕</button>
+  </div>
+  <div class="dbody" id="d-body"></div>
+</aside>
 <script>
 const $ = (s, r=document) => r.querySelector(s);
 const enc = new TextEncoder();
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let lastFetch = 0, polledOnce = false;
+let lastFetch = 0, polledOnce = false, runsById = {};
+const POLL_BASE = 3000, POLL_MAX = 30000;
+let pollDelay = POLL_BASE, pollTimer = null;
 
 // Persist the secret + approver locally so they survive a reload (never auto-sent to the server).
+// Guarded: private-mode / disabled storage throws — degrade to in-session rather than break the page.
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) { if (!store._warned) { store._warned = 1; toast("storage unavailable — secret won't persist", false); } } },
+};
 for (const id of ["secret", "approver"]) {
   const el = $("#"+id);
-  el.value = localStorage.getItem("odin."+id) || "";
-  el.addEventListener("input", () => localStorage.setItem("odin."+id, el.value));
+  el.value = store.get("odin."+id) || "";
+  el.addEventListener("input", () => store.set("odin."+id, el.value));
 }
 
 function toast(msg, ok=true) {
@@ -189,19 +228,54 @@ async function decide(runId, decision, card) {
   finally { btns.forEach(b => b.disabled = false); }
 }
 
-async function showDiff(runId, host) {
-  if (host.dataset.open) { host.innerHTML = ""; delete host.dataset.open; return; }
-  host.dataset.open = "1"; host.textContent = "loading…";
+// Colorize a unified diff, capping huge diffs (first 500 + last 100 lines) so a 1MB diff can't
+// blow up the DOM / memory. Truncation is applied to the line array before colorizing.
+function renderDiff(text) {
+  let lines = text.split("\n");
+  let trunc = "";
+  if (lines.length > 650) {
+    const dropped = lines.length - 600;
+    trunc = `<span class="trunc">… ${dropped} lines collapsed …</span>\n`;
+    lines = [...lines.slice(0, 500), "__ODIN_TRUNC__", ...lines.slice(-100)];
+  }
+  const colored = lines.map(l =>
+    l === "__ODIN_TRUNC__" ? trunc.trimEnd() :
+    l.startsWith("+") ? '<span class="add">'+esc(l)+'</span>' :
+    l.startsWith("-") ? '<span class="del">'+esc(l)+'</span>' :
+    (l.startsWith("@@") || l.startsWith("diff ")) ? '<span class="hd">'+esc(l)+'</span>' : esc(l)).join("\n");
+  return '<pre class="diff">' + colored + '</pre>';
+}
+
+let drawerRunId = null;
+const drawer = $("#drawer"), scrim = $("#scrim");
+
+function closeDrawer() {
+  drawer.classList.remove("open"); scrim.classList.remove("open");
+  drawer.setAttribute("aria-hidden", "true"); drawerRunId = null;
+}
+
+async function openDrawer(runId, run) {
+  drawerRunId = runId;
+  $("#d-badge").className = "badge b-" + (run?.status || "");
+  $("#d-badge").textContent = (run?.status || "").replace("_"," ");
+  $("#d-wf").textContent = run?.workflow || "";
+  $("#d-id").textContent = runId.slice(0,8);
+  $("#d-body").innerHTML = '<div class="empty"><span class="spinner"></span> loading…</div>';
+  drawer.classList.add("open"); scrim.classList.add("open");
+  drawer.setAttribute("aria-hidden", "false"); drawer.focus();
   try {
     const d = await (await fetch("/api/runs/" + encodeURIComponent(runId))).json();
-    if (!d || !d.diff) { host.innerHTML = '<pre class="diff">(no diff captured)</pre>'; return; }
-    const colored = esc(d.diff).split("\n").map(l =>
-      l.startsWith("+") ? '<span class="add">'+l+'</span>' :
-      l.startsWith("-") ? '<span class="del">'+l+'</span>' :
-      (l.startsWith("@@") || l.startsWith("diff ")) ? '<span class="hd">'+l+'</span>' : l).join("\n");
-    host.innerHTML = '<pre class="diff">' + colored + '</pre>';
-  } catch (e) { host.innerHTML = '<pre class="diff">failed to load diff</pre>'; }
+    if (drawerRunId !== runId) return;   // a newer open won the race
+    let html = "";
+    if (d && d.error) html += `<div class="err">${esc(d.error)}</div>`;   // run-level error (detail-only)
+    html += d && d.diff ? renderDiff(d.diff) : '<pre class="diff">(no diff captured)</pre>';
+    $("#d-body").innerHTML = html;
+  } catch (e) { if (drawerRunId === runId) $("#d-body").innerHTML = '<pre class="diff">failed to load detail</pre>'; }
 }
+
+$("#d-close").addEventListener("click", closeDrawer);
+scrim.addEventListener("click", closeDrawer);
+document.addEventListener("keydown", e => { if (e.key === "Escape" && drawerRunId) closeDrawer(); });
 
 function glyph(s) { return {passed:"✓", failed:"✗", skipped:"⊘", running:"⏳", awaiting_approval:"⏸", pending:"·"}[s] || "·"; }
 
@@ -242,7 +316,7 @@ function cardHTML(r, sig) {
     <div class="steps">${steps}</div>
     ${stepErrs}
     ${gate}
-    ${hasDiff ? `<button class="link" data-diff="${esc(r.run_id)}">diff</button><div class="diffhost"></div>` : ""}
+    ${hasDiff ? `<button class="link" data-diff="${esc(r.run_id)}">details</button>` : ""}
   </div>`;
 }
 
@@ -254,14 +328,14 @@ function isBusy(el) {
   if (el.contains(document.activeElement)) return true;
   const n = el.querySelector("[data-note]"); if (n && n.value.trim()) return true;
   const rr = el.querySelector("[data-rerun]"); if (rr && rr.checked) return true;
-  const dh = el.querySelector(".diffhost"); if (dh && dh.dataset.open) return true;
-  return false;
+  return false;   // the diff now lives in a separate drawer, so an open detail no longer pins the card
 }
 
 // Stateful reconcile: key by run_id, patch only changed (non-busy) cards, keep order, never wipe
 // the whole list. Clicks are handled by one delegated listener (below), so a replaced card's
 // buttons keep working with no rebinding.
 function render(runs) {
+  runsById = {}; for (const r of runs) runsById[r.run_id] = r;
   const counts = runs.reduce((a, r) => (a[r.status] = (a[r.status]||0)+1, a), {});
   $("#counts").innerHTML = ["running","awaiting_approval","succeeded","failed"]
     .filter(s => counts[s]).map(s => `<b>${counts[s]}</b> ${s.replace("_"," ")}`).join("  ·  ") || "no runs yet";
@@ -291,13 +365,19 @@ function render(runs) {
     if (el !== want && !el.contains(document.activeElement)) main.insertBefore(el, want);
     prev = el;
   }
+  // The drawer's diff/error is a snapshot, but keep its status badge live if the run advances.
+  if (drawerRunId && runsById[drawerRunId]) {
+    const r = runsById[drawerRunId];
+    $("#d-badge").className = "badge b-" + r.status;
+    $("#d-badge").textContent = r.status.replace("_"," ");
+  }
 }
 
 $("#runs").addEventListener("click", e => {
   const act = e.target.closest("[data-act]");
   if (act) { const card = act.closest("[data-run-id]"); decide(card.dataset.runId, act.dataset.act, card); return; }
   const dl = e.target.closest("[data-diff]");
-  if (dl) showDiff(dl.dataset.diff, dl.parentElement.querySelector(".diffhost"));
+  if (dl) openDrawer(dl.dataset.diff, runsById[dl.dataset.diff]);
 });
 
 // Relative times tick on their own (no re-render). Card times are relative to the server's
@@ -307,15 +387,34 @@ function tick() {
   $("#tick").textContent = lastFetch ? "updated " + ago(new Date(lastFetch).toISOString()) : "";
 }
 
-async function poll() {
-  try {
-    const runs = await (await fetch("/api/runs?limit=50")).json();
-    render(runs); lastFetch = Date.now(); polledOnce = true;
-  } catch (e) { $("#counts").textContent = "(daemon unreachable)"; }
+function setUnreachable(on) {
+  const b = $("#banner");
+  if (on) { b.textContent = "daemon unreachable — retrying in " + Math.round(pollDelay/1000) + "s…"; b.hidden = false; $("#runs").classList.add("dim"); }
+  else { b.hidden = true; $("#runs").classList.remove("dim"); }
 }
 
+function schedule(delay) { clearTimeout(pollTimer); pollTimer = setTimeout(poll, delay); }
+
+// Self-rescheduling poll: a 5s abort guard, exponential backoff (3→6→…→30s) with a distinct
+// "unreachable" banner on failure (the last list stays visible but dimmed), and no polling while
+// the tab is hidden. Recovers to the base interval on the first success.
+async function poll() {
+  if (document.hidden) { schedule(POLL_BASE); return; }
+  const ctrl = new AbortController();
+  const guard = setTimeout(() => ctrl.abort(), 5000);
+  try {
+    const runs = await (await fetch("/api/runs?limit=50", { signal: ctrl.signal })).json();
+    render(runs); lastFetch = Date.now(); polledOnce = true;
+    pollDelay = POLL_BASE; setUnreachable(false);
+  } catch (e) {
+    pollDelay = Math.min(pollDelay * 2, POLL_MAX); setUnreachable(true);
+  } finally { clearTimeout(guard); schedule(pollDelay); }
+}
+
+$("#refresh").addEventListener("click", () => { clearTimeout(pollTimer); pollDelay = POLL_BASE; poll(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { clearTimeout(pollTimer); pollDelay = POLL_BASE; poll(); } });
+
 setInterval(tick, 1000);
-setInterval(poll, 3000);
 poll();
 </script>
 </body>
