@@ -15,7 +15,9 @@ odind --workflows ./workflows --repo . \
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--workflows <DIR>` | — (**required**) | Directory of workflow files; every `*.yaml`/`*.yml` is loaded (sorted; a bad file is skipped with a warning, not fatal). |
+| `--workflows <DIR>` | — | Directory of workflow files; every `*.yaml`/`*.yml` is loaded (sorted; a bad file is skipped with a warning, not fatal). Optional if `--recipes` is given — supply **at least one** source. |
+| `--recipes` | off | Also serve the [recipe catalog](cli.md#odin-recipe-subcommand) (the same directory `odin run <name>` resolves). On a name collision a `--workflows` file **wins** (a warning names the shadowed recipe). **Note:** a catalog `cron` trigger fires **unattended on start** (no signature gate, unlike webhooks) — enable only for catalogs you trust. |
+| `--recipes-dir <DIR>` | — | Override the catalog directory (implies `--recipes`); else `$ODIN_RECIPES_DIR`, else the platform default. |
 | `--repo <DIR>` | `.` | Git repository the engine provisions workspaces from. |
 | `--db <FILE>` | `<repo>/.odin/state.db` | SQLite state database. |
 | `--max-concurrent-runs <N>` | `4` | Ceiling on runs executing at once across the whole daemon (clamped to ≥ 1). |
@@ -291,7 +293,11 @@ see [Security](#security)). The read-only views work regardless.
 `--webhook-secret` nor a non-empty `$ODIN_WEBHOOK_SECRET`), the daemon **refuses to start** —
 unless you explicitly pass `--webhook-allow-unsigned` for local testing. A network-facing
 endpoint without signature verification would accept requests from anyone — and `/approve`
-mutates run state.
+mutates run state. This covers workflows from **either** source equally: a `--recipes`
+catalog workflow that declares a webhook/approval is held to the same secret requirement as a
+`--workflows` one (the two sources are merged into one set before the check). Note, though, that
+a catalog **`cron`** trigger has no signature gate and fires unattended on start — so only enable
+`--recipes` for catalogs you trust.
 
 There is **no built-in TLS** and **no HTTP-edge rate limiting** by design — both belong at a
 fronting reverse proxy:
