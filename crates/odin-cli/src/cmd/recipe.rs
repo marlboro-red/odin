@@ -4,13 +4,14 @@
 //! resolved filesystem path (for scripting). The catalog directory itself is resolved by
 //! [`crate::catalog`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context as _;
 use odin_core::Workflow;
 
-use crate::catalog;
+use crate::{catalog, scaffold};
 
 /// `odin recipe list [--tag <T>]` — list the recipes in the catalog (name + description + tags),
 /// optionally filtered to those carrying `<T>`, or as JSON.
@@ -147,26 +148,59 @@ pub(crate) fn add(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `odin recipe new <name> --from <src>` — scaffold a new workflow file from an existing recipe,
-/// bundled starter, or file. Writes `./<name>.yaml` by default (or `--out`), rewriting the new
-/// file's `name:` to `<name>`. Refuses to overwrite without `--force`.
-pub(crate) fn new(
-    name: &str,
-    from: &str,
-    out: Option<&Path>,
-    force: bool,
-    recipes_dir: Option<&Path>,
-) -> anyhow::Result<ExitCode> {
-    if !catalog::is_plain_name(name) {
+/// Parsed arguments for `odin recipe new`.
+pub(crate) struct NewArgs {
+    pub name: String,
+    pub from: String,
+    pub set: Vec<String>,
+    pub out: Option<PathBuf>,
+    pub catalog: bool,
+    pub stdout: bool,
+    pub recipes_dir: Option<PathBuf>,
+    pub force: bool,
+}
+
+/// `odin recipe new <name> --from <src> [--set k=v]` — scaffold a new workflow from a recipe,
+/// bundled starter, or file. If the source declares a `# odin:template` header, `@@VAR@@`
+/// placeholders are filled from `--set` (+ defaults); otherwise the source is copied verbatim. The
+/// new file's `name:` is rewritten to `<name>`. Destination: `./<name>.yaml` by default, or `--out`
+/// (a file/dir), `--catalog` (install into the catalog), or `--stdout`.
+pub(crate) fn new(args: &NewArgs) -> anyhow::Result<ExitCode> {
+    if !catalog::is_plain_name(&args.name) {
         anyhow::bail!(
-            "invalid recipe name {name:?}: use letters, digits, '.', '_', '-' (no spaces or path separators)"
+            "invalid recipe name {:?}: use letters, digits, '.', '_', '-' (no spaces or path separators)",
+            args.name
         );
     }
-    let source = catalog::resolve_source(from, recipes_dir)?;
-    let body = catalog::rewrite_workflow_name(&source.body, name)?;
+    let set = parse_set(&args.set)?;
+    let source = catalog::resolve_source(&args.from, args.recipes_dir.as_deref())?;
 
-    let dest = scaffold_dest(name, out)?;
-    if dest.exists() && !force {
+    // Fill the template if the source declares one; else require that no --set was given.
+    let rendered = if let Some(tpl) = scaffold::parse(&source.body)? {
+        tpl.render(&set)?
+    } else {
+        anyhow::ensure!(
+            set.is_empty(),
+            "source {:?} declares no template variables (no `# odin:template` header), but --set was given",
+            args.from
+        );
+        source.body.clone()
+    };
+    // Rewrite the name + assert the (now-substituted, valid-YAML) body round-trips.
+    let body = catalog::rewrite_workflow_name(&rendered, &args.name)?;
+
+    if args.stdout {
+        eprintln!("# recipe {} (from {})", args.name, source.provenance);
+        print!("{body}");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let dest = if args.catalog {
+        catalog::dir_create(args.recipes_dir.as_deref())?.join(format!("{}.yaml", args.name))
+    } else {
+        scaffold_dest(&args.name, args.out.as_deref())?
+    };
+    if dest.exists() && !args.force {
         anyhow::bail!(
             "{} already exists (use --force to overwrite)",
             dest.display()
@@ -174,12 +208,32 @@ pub(crate) fn new(
     }
     std::fs::write(&dest, &body).with_context(|| format!("writing {}", dest.display()))?;
     println!(
-        "created '{name}' → {} (from {})",
+        "created '{}' → {} (from {})",
+        args.name,
         dest.display(),
         source.provenance
     );
-    println!("  next: odin validate {0} && odin run {0}", dest.display());
+    if args.catalog {
+        println!("  run it: odin run {}", args.name);
+    } else {
+        println!("  next: odin validate {0} && odin run {0}", dest.display());
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Parses `--set KEY=VALUE` pairs (value may contain `=`; key must be non-empty).
+fn parse_set(pairs: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for p in pairs {
+        let (k, v) = p
+            .split_once('=')
+            .with_context(|| format!("--set must be KEY=VALUE, got {p:?}"))?;
+        if k.is_empty() {
+            anyhow::bail!("--set has an empty key: {p:?}");
+        }
+        out.insert(k.to_owned(), v.to_owned());
+    }
+    Ok(out)
 }
 
 /// Resolves where `recipe new` writes: `./<name>.yaml` by default; with `--out`, a `.yaml`/`.yml`

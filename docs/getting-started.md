@@ -79,14 +79,16 @@ existing file path always wins):
 
 ```sh
 odin recipe init                 # seed the catalog with the bundled starters
-odin recipe list                 # see what's there (name + description)
+odin recipe list --tag review    # see what's there (name + description + tags), filter by tag
 odin run adversarial-review --repo . --param pr=42   # run by name, no path
 odin recipe add ./my-flow.yaml   # add your own
+odin recipe new my-review --from adversarial-review  # scaffold a new one to edit
 ```
 
 The catalog lives in a per-platform directory (macOS `~/Library/Application Support/odin/recipes`,
 Linux `~/.local/share/odin/recipes`, Windows `%LOCALAPPDATA%\odin\data\recipes`), overridable with
-`--recipes-dir` or `$ODIN_RECIPES_DIR`. See [`odin recipe`](cli.md#odin-recipe-subcommand).
+`--recipes-dir` or `$ODIN_RECIPES_DIR`. See [`odin recipe`](cli.md#odin-recipe-subcommand) and
+[scaffolding & templating](recipe-templating.md) (fill `@@VAR@@` placeholders at scaffold time).
 
 ## 3. Inspect past runs
 
