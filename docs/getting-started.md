@@ -127,6 +127,8 @@ verification and dedup, and the fail-closed security model.
 
 - [Workflow reference](workflow-reference.md) — every field and all 44 diagnostics.
 - [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references.
+- [Webhook walkthrough](webhook-walkthrough.md) — wire a GitHub webhook end-to-end (tunnel →
+  webhook → open-PR → review → approve → comment), worked against the `adversarial-review` example.
 - [Integration guide](integration-guide.md) — embed `odin-core`, plug in custom
   providers/actions/workspaces/triggers.
 - [Architecture](architecture.md) — the layered design and data-flow contracts.

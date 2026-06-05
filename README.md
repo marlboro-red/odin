@@ -146,6 +146,8 @@ odin-core = { git = "https://github.com/marlboro-red/odin", default-features = f
 - [Integration guide](docs/integration-guide.md) — embed `odin-core`: the five traits,
   `EngineBuilder`, custom plugins, data in/out, the daemon.
 - [`odin` CLI](docs/cli.md) and [`odind` daemon](docs/daemon.md) references.
+- [Webhook walkthrough](docs/webhook-walkthrough.md) — wire a GitHub webhook end-to-end (tunnel →
+  webhook → open-PR → review → approve → comment).
 - [Observability](docs/observability.md) — structured `tracing` logs (text/JSON), `$ODIN_LOG`
   levels, and optional OpenTelemetry/OTLP span export.
 - [Architecture](docs/architecture.md) — the layered design and data-flow contracts.
