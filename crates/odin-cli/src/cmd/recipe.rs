@@ -147,6 +147,59 @@ pub(crate) fn add(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `odin recipe new <name> --from <src>` — scaffold a new workflow file from an existing recipe,
+/// bundled starter, or file. Writes `./<name>.yaml` by default (or `--out`), rewriting the new
+/// file's `name:` to `<name>`. Refuses to overwrite without `--force`.
+pub(crate) fn new(
+    name: &str,
+    from: &str,
+    out: Option<&Path>,
+    force: bool,
+    recipes_dir: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    if !catalog::is_plain_name(name) {
+        anyhow::bail!(
+            "invalid recipe name {name:?}: use letters, digits, '.', '_', '-' (no spaces or path separators)"
+        );
+    }
+    let source = catalog::resolve_source(from, recipes_dir)?;
+    let body = catalog::rewrite_workflow_name(&source.body, name)?;
+
+    let dest = scaffold_dest(name, out)?;
+    if dest.exists() && !force {
+        anyhow::bail!(
+            "{} already exists (use --force to overwrite)",
+            dest.display()
+        );
+    }
+    std::fs::write(&dest, &body).with_context(|| format!("writing {}", dest.display()))?;
+    println!(
+        "created '{name}' → {} (from {})",
+        dest.display(),
+        source.provenance
+    );
+    println!("  next: odin validate {0} && odin run {0}", dest.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Resolves where `recipe new` writes: `./<name>.yaml` by default; with `--out`, a `.yaml`/`.yml`
+/// path is taken as the file, anything else as a directory to create and write `<name>.yaml` into.
+fn scaffold_dest(name: &str, out: Option<&Path>) -> anyhow::Result<PathBuf> {
+    match out {
+        None => Ok(PathBuf::from(format!("{name}.yaml"))),
+        Some(p) => {
+            let is_file = matches!(p.extension().and_then(|e| e.to_str()), Some("yaml" | "yml"));
+            if is_file {
+                Ok(p.to_path_buf())
+            } else {
+                std::fs::create_dir_all(p)
+                    .with_context(|| format!("creating output directory {}", p.display()))?;
+                Ok(p.join(format!("{name}.yaml")))
+            }
+        }
+    }
+}
+
 /// `odin recipe show <name>` — print the recipe's workflow YAML to stdout (provenance to stderr,
 /// so stdout stays a clean, pipeable document).
 pub(crate) fn show(name: &str, recipes_dir: Option<&Path>) -> anyhow::Result<ExitCode> {
