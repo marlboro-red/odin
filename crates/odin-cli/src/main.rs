@@ -1,8 +1,10 @@
 //! `odin` — the command-line runner for the Odin workflow engine.
 //!
-//! Subcommands: `validate` (parse + check a workflow), `run` (execute one), and the
-//! read commands `list` / `show` / `logs` over the durable run store.
+//! Subcommands: `validate` (parse + check a workflow), `run` (execute one), the
+//! read commands `list` / `show` / `logs` over the durable run store, and `recipe`
+//! (manage the by-name workflow catalog).
 
+mod catalog;
 mod cmd;
 
 use std::path::PathBuf;
@@ -106,6 +108,8 @@ enum Command {
     Reject(ApprovalCmd),
     /// Delete old/excess terminal runs from the store (never touches in-flight or awaiting runs).
     Prune(PruneCmd),
+    /// Manage the workflow recipe catalog (run/validate workflows by name).
+    Recipe(RecipeCmd),
     /// At-a-glance status of recent runs (counts + steps); `--watch` live-refreshes.
     Status {
         /// The git repository whose `.odin/state.db` to read. Defaults to the current dir.
@@ -210,6 +214,42 @@ impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
     }
 }
 
+/// The `recipe` subcommand group.
+#[derive(clap::Args)]
+struct RecipeCmd {
+    #[command(subcommand)]
+    command: RecipeSub,
+}
+
+#[derive(Subcommand)]
+enum RecipeSub {
+    /// List the recipes in the catalog (name + description).
+    List {
+        /// Override the catalog directory (else `$ODIN_RECIPES_DIR`, else the platform default).
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
+        /// Emit the listing as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a recipe's workflow YAML.
+    Show {
+        /// The recipe name (its filename stem in the catalog).
+        name: String,
+        /// Override the catalog directory.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
+    },
+    /// Print the filesystem path of a recipe (for scripting).
+    Path {
+        /// The recipe name (its filename stem in the catalog).
+        name: String,
+        /// Override the catalog directory.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
+    },
+}
+
 /// Maps a command result to a process exit code, printing any error.
 fn finish(result: anyhow::Result<ExitCode>) -> ExitCode {
     result.unwrap_or_else(|e| {
@@ -281,6 +321,17 @@ fn main() -> ExitCode {
         Command::Approve(c) => finish(cmd::approval::approve(c.into())),
         Command::Reject(c) => finish(cmd::approval::reject(c.into())),
         Command::Prune(c) => finish(cmd::prune::run(c.into())),
+        Command::Recipe(c) => finish(match c.command {
+            RecipeSub::List { recipes_dir, json } => {
+                cmd::recipe::list(recipes_dir.as_deref(), json)
+            }
+            RecipeSub::Show { name, recipes_dir } => {
+                cmd::recipe::show(&name, recipes_dir.as_deref())
+            }
+            RecipeSub::Path { name, recipes_dir } => {
+                cmd::recipe::path(&name, recipes_dir.as_deref())
+            }
+        }),
         Command::Status {
             repo,
             db,
