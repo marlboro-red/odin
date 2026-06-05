@@ -1,0 +1,21 @@
+# odin:template
+#   provider:    { default: claude, description: "agent CLI to review with (claude/codex/copilot)" }
+#   base_branch: { required: true,  description: "branch to diff the working tree against" }
+# end
+schema_version: "1.0"
+name: templated-pr-review
+description: A local PR review whose provider and base branch are chosen when the recipe is scaffolded.
+tags: [review, template]
+durable: false
+workspace: { type: worktree }
+params:
+  report: { required: true, description: "absolute path to write the markdown review to" }
+steps:
+  - id: review
+    provider: @@provider@@
+    prompt: |
+      Review the working-tree changes against @@base_branch@@ for correctness, security, and
+      clarity. Write your review as markdown to {{ params.report }}.
+  - id: confirm
+    run: "test -s {{ params.report }}"
+    depends_on: [review]

@@ -28,6 +28,15 @@ const HEADER_END: &str = "# end";
 struct VarSpec {
     default: Option<String>,
     required: bool,
+    description: Option<String>,
+}
+
+/// A read-only view of a declared variable (for prompting and `--explain`).
+pub(crate) struct VarInfo<'a> {
+    pub name: &'a str,
+    pub default: Option<&'a str>,
+    pub required: bool,
+    pub description: Option<&'a str>,
 }
 
 /// A parsed recipe template: its declared variables (in header order) and the body with the
@@ -105,7 +114,12 @@ fn parse_spec(v: &serde_yaml_ng::Value) -> VarSpec {
     let required = get("required")
         .and_then(serde_yaml_ng::Value::as_bool)
         .unwrap_or(default.is_none());
-    VarSpec { default, required }
+    let description = get("description").and_then(|v| v.as_str().map(str::to_owned));
+    VarSpec {
+        default,
+        required,
+        description,
+    }
 }
 
 /// The string form of a YAML scalar (string/number/bool), for a `default:` value.
@@ -122,6 +136,24 @@ impl Template {
     /// The declared variable names, in header order.
     pub(crate) fn var_names(&self) -> Vec<&str> {
         self.vars.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    /// A read-only view of every declared variable, in header order.
+    pub(crate) fn vars(&self) -> impl Iterator<Item = VarInfo<'_>> {
+        self.vars.iter().map(|(name, spec)| VarInfo {
+            name,
+            default: spec.default.as_deref(),
+            required: spec.required,
+            description: spec.description.as_deref(),
+        })
+    }
+
+    /// The required variables with no value yet — neither a `--set` entry nor a declared default —
+    /// i.e. the ones an interactive prompt should ask for.
+    pub(crate) fn missing_required(&self, set: &BTreeMap<String, String>) -> Vec<VarInfo<'_>> {
+        self.vars()
+            .filter(|v| v.required && v.default.is_none() && !set.contains_key(v.name))
+            .collect()
     }
 
     /// Renders the template: fills each `@@VAR@@` with its `--set` value (or declared default),
@@ -210,6 +242,53 @@ fn read_ident(s: &str) -> Option<&str> {
     Some(&s[..end])
 }
 
+/// Asks the operator for a value — abstracted so tests can inject canned answers.
+pub(crate) trait Prompter {
+    /// Show `prompt` and return the entered line (trailing newline stripped).
+    ///
+    /// # Errors
+    /// Propagates any I/O error from reading the answer.
+    fn ask(&mut self, prompt: &str) -> std::io::Result<String>;
+}
+
+/// Reads answers from stdin, writing the prompt to **stderr** so a piped stdout stays clean.
+pub(crate) struct StdinPrompter;
+
+impl Prompter for StdinPrompter {
+    fn ask(&mut self, prompt: &str) -> std::io::Result<String> {
+        use std::io::Write as _;
+        eprint!("{prompt}");
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        Ok(line.trim_end_matches(['\n', '\r']).to_owned())
+    }
+}
+
+/// Prompts for each [`Template::missing_required`] variable and folds the (non-empty) answers into
+/// `set`. An empty answer is left unset, so [`Template::render`] then reports it as still missing
+/// rather than baking in a blank.
+///
+/// # Errors
+/// Propagates a prompter I/O error.
+pub(crate) fn fill_interactively(
+    tpl: &Template,
+    set: &mut BTreeMap<String, String>,
+    prompter: &mut dyn Prompter,
+) -> std::io::Result<()> {
+    for var in tpl.missing_required(set) {
+        let prompt = match var.description {
+            Some(d) => format!("{} ({d}): ", var.name),
+            None => format!("{}: ", var.name),
+        };
+        let answer = prompter.ask(&prompt)?;
+        if !answer.trim().is_empty() {
+            set.insert(var.name.to_owned(), answer);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,12 +307,58 @@ mod tests {
         name: src\n\
         steps:\n  - id: r\n    provider: @@provider@@\n    run: \"git diff @@base_branch@@...HEAD\"\n";
 
+    struct CannedPrompter(std::collections::VecDeque<String>);
+    impl Prompter for CannedPrompter {
+        fn ask(&mut self, _prompt: &str) -> std::io::Result<String> {
+            Ok(self.0.pop_front().unwrap_or_default())
+        }
+    }
+
     #[test]
     fn header_less_source_is_not_a_template() {
         assert!(
             parse("name: x\nsteps:\n  - {id: a, run: y}\n")
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_required_lists_only_unsatisfied_required_vars() {
+        let t = parse(TPL).unwrap().unwrap();
+        // provider has a default; base_branch is required and unset.
+        let names: Vec<&str> = t
+            .missing_required(&set(&[]))
+            .iter()
+            .map(|v| v.name)
+            .collect();
+        assert_eq!(names, ["base_branch"]);
+        // …and once it's supplied, nothing is missing.
+        assert!(t.missing_required(&set(&[("base_branch", "x")])).is_empty());
+    }
+
+    #[test]
+    fn fill_interactively_supplies_missing_then_renders() {
+        let t = parse(TPL).unwrap().unwrap();
+        let mut s = set(&[]);
+        let mut p = CannedPrompter(["develop".to_owned()].into_iter().collect());
+        fill_interactively(&t, &mut s, &mut p).unwrap();
+        let out = t.render(&s).unwrap();
+        assert!(out.contains("git diff develop...HEAD")); // prompted value
+        assert!(out.contains("provider: claude")); // default still applies
+    }
+
+    #[test]
+    fn fill_interactively_empty_answer_leaves_it_missing() {
+        let t = parse(TPL).unwrap().unwrap();
+        let mut s = set(&[]);
+        let mut p = CannedPrompter([String::new()].into_iter().collect());
+        fill_interactively(&t, &mut s, &mut p).unwrap();
+        assert!(
+            t.render(&s)
+                .unwrap_err()
+                .to_string()
+                .contains("missing required")
         );
     }
 

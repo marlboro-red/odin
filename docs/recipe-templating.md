@@ -63,7 +63,9 @@ Each variable maps to a small spec:
 - `default: <value>` — used when `--set` doesn't supply one. A variable **with** a default is
   optional; one **without** is required.
 - `required: true|false` — force a variable required (or not), overriding the default-based rule.
-- `description: "<text>"` — documentation (shown in errors / future prompts).
+- `description: "<text>"` — documentation (shown in prompts and `--explain`).
+
+A worked example ships at [`examples/templated-pr-review.yaml`](../examples/templated-pr-review.yaml).
 
 Scaffold it, filling the variables:
 
@@ -74,6 +76,28 @@ odin recipe new pr-review --from ./review-template.yaml --set base_branch=main
 
 The result has the header **stripped**, `@@base_branch@@` replaced with `main`, `@@provider@@`
 with `claude`, and the run-time `{{ params.dry_run }}` left exactly as written.
+
+### Preview & prompts
+
+**`--explain`** prints what would be filled — the scaffold-time `@@VAR@@` values (and where each
+comes from: `set` / `default` / `required`) and the run-time `{{ params.* }}` the result still
+expects — and **writes nothing**:
+
+```sh
+$ odin recipe new pr-review --from ./review-template.yaml --set base_branch=main --explain
+recipe 'pr-review' from file ./review-template.yaml
+
+Scaffold-time variables (@@VAR@@), baked in now:
+  @@provider@@ = claude  [default]  # agent CLI to review with
+  @@base_branch@@ = main  [set]     # branch to diff against
+
+Run-time params ({{ params.* }}), supplied per run:
+  report  (required)
+```
+
+**Interactive prompts** — when stdout is a terminal (or you pass `--interactive`), a required
+variable left unset is **prompted for** (showing its description). A non-interactive run (a script,
+a pipe, CI) keeps the hard "missing required variable" error instead of hanging.
 
 ### Rules & guard-rails
 
