@@ -241,6 +241,23 @@ enum RecipeSub {
         #[arg(long)]
         json: bool,
     },
+    /// Scaffold a new workflow file from an existing recipe, bundled starter, or file.
+    New {
+        /// The name for the new recipe (becomes its `name:` and the default filename stem).
+        name: String,
+        /// The source to copy from: a recipe name, a bundled starter name, or a file path.
+        #[arg(long, value_name = "SOURCE")]
+        from: String,
+        /// Write here — a `.yaml`/`.yml` file, or a directory. Default: `./<name>.yaml`.
+        #[arg(long, short = 'o', value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Override the catalog directory used to resolve `--from`.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
+        /// Overwrite the destination if it already exists.
+        #[arg(long)]
+        force: bool,
+    },
     /// Seed the catalog with the bundled starter recipes.
     Init {
         /// Override the catalog directory.
@@ -290,6 +307,13 @@ fn dispatch_recipe(sub: RecipeSub) -> anyhow::Result<ExitCode> {
             recipes_dir,
             json,
         } => cmd::recipe::list(recipes_dir.as_deref(), tag.as_deref(), json),
+        RecipeSub::New {
+            name,
+            from,
+            out,
+            recipes_dir,
+            force,
+        } => cmd::recipe::new(&name, &from, out.as_deref(), force, recipes_dir.as_deref()),
         RecipeSub::Init { recipes_dir, force } => cmd::recipe::init(recipes_dir.as_deref(), force),
         RecipeSub::Add {
             file,

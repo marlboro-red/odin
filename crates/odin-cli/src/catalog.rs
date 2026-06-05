@@ -197,6 +197,106 @@ pub(crate) fn resolve_arg(arg: &Path, recipes_dir: Option<&Path>) -> anyhow::Res
     anyhow::bail!("cannot find workflow '{}': {hint}", arg.display())
 }
 
+/// The raw body of a scaffold source plus a human label of where it came from.
+#[derive(Debug)]
+pub(crate) struct SourceBody {
+    pub body: String,
+    pub provenance: String,
+}
+
+/// Resolves a `recipe new --from <src>` source to its raw YAML, trying — in order — an existing
+/// **file path**, a **catalog recipe** by name, then a **bundled starter** by name. (The
+/// file-first rule matches [`resolve_arg`].) On a miss, the error lists both the catalog and the
+/// built-in starter names.
+///
+/// # Errors
+/// Fails if the source can't be found, or a found file/recipe can't be read.
+pub(crate) fn resolve_source(from: &str, recipes_dir: Option<&Path>) -> anyhow::Result<SourceBody> {
+    let as_path = Path::new(from);
+    if as_path.is_file() {
+        let body = std::fs::read_to_string(as_path)
+            .with_context(|| format!("reading source file {from}"))?;
+        return Ok(SourceBody {
+            body,
+            provenance: format!("file {from}"),
+        });
+    }
+    let dir = dir(recipes_dir)?;
+    if let Some(path) = resolve(&dir, from) {
+        let body = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading recipe {from} at {}", path.display()))?;
+        return Ok(SourceBody {
+            body,
+            provenance: format!("recipe {from}"),
+        });
+    }
+    if let Some((_, body)) = STARTERS.iter().find(|(n, _)| *n == from) {
+        return Ok(SourceBody {
+            body: (*body).to_owned(),
+            provenance: format!("built-in starter {from}"),
+        });
+    }
+    let catalog = list(&dir).unwrap_or_default();
+    let recipes = if catalog.is_empty() {
+        "none".to_owned()
+    } else {
+        catalog
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let starters = STARTERS
+        .iter()
+        .map(|(n, _)| *n)
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "no source {from:?}: not a file, not a recipe in {} (recipes: {recipes}), \
+         and not a built-in starter (starters: {starters})",
+        dir.display()
+    )
+}
+
+/// A `recipe new <name>` target must be a plain slug — a valid catalog name whose every character
+/// is `[A-Za-z0-9._-]`. That makes it both a safe filename **and** a plain-scalar YAML `name:`
+/// value (unlike [`is_valid_name`], which also permits YAML-indicator characters like `#`/`*`/`:`).
+pub(crate) fn is_plain_name(name: &str) -> bool {
+    is_valid_name(name)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Returns `src` with its top-level `name:` rewritten to `new_name`, re-parsing to assert the
+/// rewrite round-trips exactly. `new_name` must already be a [`is_plain_name`]; the first column-0
+/// `name:` line is the workflow name (steps/params are indented), and all bundled starters carry
+/// an unquoted `name:` at column 0.
+///
+/// # Errors
+/// Fails if the source has no top-level `name:` line or the rewrite no longer parses to `new_name`.
+pub(crate) fn rewrite_workflow_name(src: &str, new_name: &str) -> anyhow::Result<String> {
+    let mut lines: Vec<String> = src.lines().map(str::to_owned).collect();
+    let Some(line) = lines.iter_mut().find(|l| l.starts_with("name:")) else {
+        anyhow::bail!("source has no top-level `name:` line to rewrite");
+    };
+    *line = format!("name: {new_name}");
+    let mut out = lines.join("\n");
+    if src.ends_with('\n') {
+        out.push('\n');
+    }
+    // The assert is the real guard: if the rewrite somehow hit the wrong line or produced an
+    // invalid scalar, this catches it (worst case is a loud refusal, never a silently-wrong file).
+    let wf = Workflow::from_yaml_str(&out)
+        .with_context(|| format!("rewritten workflow (name: {new_name}) no longer parses"))?;
+    anyhow::ensure!(
+        wf.name.as_str() == new_name,
+        "name rewrite did not round-trip (got {:?})",
+        wf.name.as_str()
+    );
+    Ok(out)
+}
+
 /// Lists every recipe in `dir`, sorted by name, reading each file's metadata best-effort. A
 /// missing directory is an **empty** catalog (not an error); an unreadable directory is an error.
 ///
@@ -309,6 +409,65 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert!(list(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn is_plain_name_is_stricter_than_is_valid_name() {
+        assert!(is_plain_name("my-thing"));
+        assert!(is_plain_name("a.b_c-1"));
+        // is_valid_name permits these YAML-indicator names; is_plain_name must not.
+        assert!(is_valid_name("#wip") && !is_plain_name("#wip"));
+        assert!(is_valid_name("a b") && !is_plain_name("a b"));
+        assert!(is_valid_name("*") && !is_plain_name("*"));
+        assert!(!is_plain_name("..") && !is_plain_name("a/b"));
+    }
+
+    #[test]
+    fn resolve_source_file_then_catalog_then_starter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_dir = tmp.path().join("recipes");
+        std::fs::create_dir_all(&catalog_dir).unwrap();
+
+        // A bundled starter resolves on a fresh (empty) catalog.
+        let s = resolve_source("local-review", Some(&catalog_dir)).unwrap();
+        assert!(s.provenance.starts_with("built-in starter"));
+        assert!(s.body.contains("name: local-review"));
+
+        // A catalog recipe of the same name wins over the starter.
+        write(
+            &catalog_dir,
+            "local-review.yaml",
+            "name: local-review\nsteps:\n  - {id: s, run: x}\n",
+        );
+        let s = resolve_source("local-review", Some(&catalog_dir)).unwrap();
+        assert!(s.provenance.starts_with("recipe"));
+
+        // An existing file path wins over everything.
+        let file = tmp.path().join("explicit.yaml");
+        std::fs::write(&file, WF).unwrap();
+        let s = resolve_source(file.to_str().unwrap(), Some(&catalog_dir)).unwrap();
+        assert!(s.provenance.starts_with("file"));
+
+        // A miss lists both recipes and starters.
+        let err = resolve_source("does-not-exist", Some(&catalog_dir))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("recipes:") && err.contains("starters:"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rewrite_workflow_name_round_trips() {
+        let out = rewrite_workflow_name(WF, "renamed").unwrap();
+        let wf = odin_core::Workflow::from_yaml_str(&out).unwrap();
+        assert_eq!(wf.name.as_str(), "renamed");
+        // description and steps survive the rewrite.
+        assert_eq!(wf.description.as_deref(), Some("a demo recipe"));
+        assert_eq!(wf.steps.len(), 1);
+        // A source with no top-level name: is refused.
+        assert!(rewrite_workflow_name("steps:\n  - {id: s, run: x}\n", "x").is_err());
     }
 
     #[test]
