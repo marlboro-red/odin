@@ -1,13 +1,13 @@
 //! `odind` — the Odin daemon.
 //!
-//! A thin runner over [`odin_daemon`]: load a directory of workflow files, build an engine
-//! backed by a SQLite store, derive triggers from each workflow's `triggers:` block (cron
-//! schedules and a GitHub webhook server), and serve until `ctrl-c`. Durable in-flight runs
-//! resume on the next start.
+//! A thin runner over [`odin_daemon`]: load workflows (a `--workflows` directory and/or the
+//! `--recipes` catalog), build an engine backed by a SQLite store, derive triggers from each
+//! workflow's `triggers:` block (cron schedules and a GitHub webhook server), and serve until
+//! `ctrl-c`. Durable in-flight runs resume on the next start.
 //!
 //! ```text
-//! odind --workflows ./workflows --repo . [--db ./.odin/state.db] \
-//!       [--webhook-addr 127.0.0.1:9292] [--webhook-secret <SECRET>] \
+//! odind [--workflows ./workflows] [--recipes [--recipes-dir <DIR>]] --repo . \
+//!       [--db ./.odin/state.db] [--webhook-addr 127.0.0.1:9292] [--webhook-secret <SECRET>] \
 //!       [--log-format text|json] [--otlp-endpoint http://localhost:4317]
 //! ```
 //!
@@ -15,6 +15,9 @@
 //! defaulting to `info`. `--otlp-endpoint` exports spans to an OpenTelemetry collector when
 //! built with `--features otlp`.
 
+mod catalog;
+
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,9 +34,21 @@ use odin_daemon::{Daemon, WebhookServer};
 #[derive(Parser)]
 #[command(name = "odind", version, about)]
 struct Cli {
-    /// Directory of workflow files to serve; every `*.yaml` / `*.yml` is loaded.
+    /// Directory of workflow files to serve; every `*.yaml` / `*.yml` is loaded. Optional if
+    /// `--recipes` is given (you must supply at least one source).
     #[arg(long, value_name = "DIR")]
-    workflows: PathBuf,
+    workflows: Option<PathBuf>,
+    /// Also serve the workflows in the recipe catalog (the same `~/.../odin/recipes` directory
+    /// `odin run <name>` resolves). On a name collision a `--workflows` file wins.
+    ///
+    /// NOTE: a catalog recipe can declare a `cron` trigger that fires UNATTENDED on start — there
+    /// is no signature gate on cron (unlike webhooks). Enable only for catalogs you trust.
+    #[arg(long)]
+    recipes: bool,
+    /// Override the recipe-catalog directory (implies `--recipes`); else `$ODIN_RECIPES_DIR`, else
+    /// the platform default.
+    #[arg(long, value_name = "DIR")]
+    recipes_dir: Option<PathBuf>,
     /// Git repository the engine provisions workspaces from.
     #[arg(long, value_name = "DIR", default_value = ".")]
     repo: PathBuf,
@@ -111,15 +126,33 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     });
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "odind starting");
 
-    let workflows = load_workflows(&cli.workflows)?;
-    if workflows.is_empty() {
-        anyhow::bail!("no valid workflows found in {}", cli.workflows.display());
+    // A `--recipes-dir` implies `--recipes`. Resolve the catalog dir only when recipes are wanted.
+    let want_recipes = cli.recipes || cli.recipes_dir.is_some();
+    if cli.workflows.is_none() && !want_recipes {
+        anyhow::bail!(
+            "no workflow source: pass --workflows <dir> and/or --recipes (with optional --recipes-dir)"
+        );
     }
-    tracing::info!(
-        count = workflows.len(),
-        dir = %cli.workflows.display(),
-        "loaded workflows"
-    );
+    let recipes_dir = if want_recipes {
+        Some(catalog::dir(cli.recipes_dir.as_deref())?)
+    } else {
+        None
+    };
+    let workflows = load_all(cli.workflows.as_deref(), recipes_dir.as_deref())?;
+    if workflows.is_empty() {
+        anyhow::bail!(
+            "no valid workflows found (checked{}{})",
+            cli.workflows
+                .as_deref()
+                .map(|d| format!(" --workflows {}", d.display()))
+                .unwrap_or_default(),
+            recipes_dir
+                .as_deref()
+                .map(|d| format!(" recipe catalog {}", d.display()))
+                .unwrap_or_default(),
+        );
+    }
+    tracing::info!(count = workflows.len(), "loaded workflows");
 
     let db = cli
         .db
@@ -314,6 +347,56 @@ fn load_workflows(dir: &Path) -> anyhow::Result<Vec<Workflow>> {
     Ok(workflows)
 }
 
+/// Loads workflows from `--workflows` and/or the recipe catalog into a **single, name-deduped**
+/// list. `--workflows` definitions win over catalog recipes on a name collision (and duplicates
+/// within `--workflows` keep the first); each shadowed entry is warned. A **missing** catalog
+/// directory is empty (not an error) — only `--workflows` being unreadable is fatal.
+///
+/// Building one deduped list here — before the webhook server, approval scan, and fail-closed
+/// check — is load-bearing: it guarantees a shadowed webhook trigger isn't double-subscribed and
+/// that the fail-closed secret requirement covers catalog-supplied triggers too.
+fn load_all(
+    workflows_dir: Option<&Path>,
+    recipes_dir: Option<&Path>,
+) -> anyhow::Result<Vec<Workflow>> {
+    let mut merged: Vec<Workflow> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if let Some(dir) = workflows_dir {
+        merge_in(&mut merged, &mut seen, load_workflows(dir)?, false);
+    }
+    if let Some(dir) = recipes_dir {
+        let loaded = if dir.exists() {
+            load_workflows(dir)?
+        } else {
+            tracing::info!(dir = %dir.display(), "recipe catalog directory does not exist yet; loading no recipes");
+            Vec::new()
+        };
+        merge_in(&mut merged, &mut seen, loaded, true);
+    }
+    Ok(merged)
+}
+
+/// Appends `list` to `merged`, skipping any whose name was already `seen` (keeping the first).
+/// `from_catalog` only changes the warning wording (shadowed-by-`--workflows` vs intra-dup).
+fn merge_in(
+    merged: &mut Vec<Workflow>,
+    seen: &mut HashSet<String>,
+    list: Vec<Workflow>,
+    from_catalog: bool,
+) {
+    for workflow in list {
+        let name = workflow.name.as_str().to_owned();
+        if seen.insert(name.clone()) {
+            merged.push(workflow);
+        } else if from_catalog {
+            tracing::warn!(workflow = %name, "catalog recipe shadowed by a --workflows definition (the --workflows one wins)");
+        } else {
+            tracing::warn!(workflow = %name, "duplicate workflow name across --workflows files; keeping the first");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::prune_policy;
@@ -342,5 +425,64 @@ mod tests {
     #[test]
     fn prune_policy_rejects_a_bad_age() {
         assert!(prune_policy(Some("24h"), Some("not-a-duration"), None).is_err());
+    }
+
+    use super::{catalog, load_all};
+    use std::path::Path;
+
+    fn wf(dir: &Path, file: &str, name: &str) {
+        std::fs::write(
+            dir.join(file),
+            format!("name: {name}\nsteps:\n  - {{id: a, run: \"echo hi\"}}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn catalog_dir_prefers_explicit_override() {
+        let p = std::path::PathBuf::from("/tmp/some/recipes");
+        assert_eq!(catalog::dir(Some(&p)).unwrap(), p);
+    }
+
+    #[test]
+    fn load_all_merges_workflows_over_recipes() {
+        let wfs = tempfile::tempdir().unwrap();
+        let recs = tempfile::tempdir().unwrap();
+        wf(wfs.path(), "a.yaml", "alpha");
+        wf(wfs.path(), "shared.yaml", "shared"); // the --workflows definition
+        wf(recs.path(), "shared.yaml", "shared"); // a catalog recipe with the same name
+        wf(recs.path(), "b.yaml", "beta");
+
+        let merged = load_all(Some(wfs.path()), Some(recs.path())).unwrap();
+        let mut names: Vec<&str> = merged.iter().map(|w| w.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["alpha", "beta", "shared"]); // `shared` appears exactly once
+        // and it's the --workflows file's definition that survived.
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|w| w.name.as_str() == "shared")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn load_all_treats_a_missing_catalog_as_empty() {
+        let wfs = tempfile::tempdir().unwrap();
+        wf(wfs.path(), "a.yaml", "alpha");
+        let missing = wfs.path().join("nope-recipes");
+        let merged = load_all(Some(wfs.path()), Some(&missing)).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name.as_str(), "alpha");
+    }
+
+    #[test]
+    fn load_all_recipes_only() {
+        let recs = tempfile::tempdir().unwrap();
+        wf(recs.path(), "only.yaml", "only");
+        let merged = load_all(None, Some(recs.path())).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name.as_str(), "only");
     }
 }
