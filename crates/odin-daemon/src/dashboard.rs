@@ -40,8 +40,13 @@ pub(crate) const HTML: &str = r##"<!doctype html>
            display: flex; gap: var(--s4); align-items: center; flex-wrap: wrap; }
   header h1 { font-size: 17px; font-weight: 700; margin: 0; letter-spacing: -.01em; }
   header h1 b { color: var(--accent); }
-  .counts { color: var(--text-dim); font-size: 13px; }
-  .counts b { color: var(--text); font-weight: 600; }
+  .chips { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
+  .chip { font-size: 12px; line-height: 1.4; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+          background: var(--bg-sunken); border: 1px solid var(--border); color: var(--text-dim); font: inherit; }
+  .chip:hover { border-color: var(--border-hi); color: var(--text); }
+  .chip.active { background: #0f263e; border-color: var(--accent); color: var(--text); }
+  .chip .n { color: var(--text-mut); margin-left: 5px; font-variant-numeric: tabular-nums; }
+  .chip.active .n { color: var(--accent); }
   .spacer { flex: 1; }
   .cfg { display: flex; gap: var(--s2); }
   .cfg input { background: var(--bg-sunken); border: 1px solid var(--border-hi); color: var(--text);
@@ -127,12 +132,25 @@ pub(crate) const HTML: &str = r##"<!doctype html>
   #drawer pre.diff { max-height: none; margin-top: var(--s3); }
   .trunc { color: var(--text-mut); font-style: italic; }
   @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } #toast, #drawer, #scrim { transition: none; } }
+  @media (max-width: 640px) {
+    header { padding: var(--s3); gap: var(--s2); row-gap: var(--s3); }
+    header h1 { font-size: 16px; }
+    .spacer { display: none; }
+    #tick { display: none; }
+    .cfg { order: 3; flex: 1 1 100%; }
+    .cfg input { flex: 1; min-width: 0; }
+    .chips { order: 2; flex: 1 1 100%; }
+    main { padding: var(--s3); gap: var(--s2); }
+    .run { padding: var(--s3); }
+    .gate .note { min-width: 0; flex-basis: 100%; }
+    #drawer { width: 100vw; }
+  }
 </style>
 </head>
 <body>
 <header>
   <h1><b>Odin</b> dashboard</h1>
-  <div class="counts" id="counts"></div>
+  <div class="chips" id="chips" role="group" aria-label="filter runs by status"></div>
   <div class="spacer"></div>
   <div class="cfg">
     <input id="approver" placeholder="your name" size="10" aria-label="your name (recorded as the approver)" title="recorded as the approver">
@@ -156,7 +174,7 @@ pub(crate) const HTML: &str = r##"<!doctype html>
 const $ = (s, r=document) => r.querySelector(s);
 const enc = new TextEncoder();
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let lastFetch = 0, polledOnce = false, runsById = {};
+let lastFetch = 0, polledOnce = false, runsById = {}, lastRuns = [], filter = "all";
 const POLL_BASE = 3000, POLL_MAX = 30000;
 let pollDelay = POLL_BASE, pollTimer = null;
 
@@ -171,6 +189,7 @@ for (const id of ["secret", "approver"]) {
   el.value = store.get("odin."+id) || "";
   el.addEventListener("input", () => store.set("odin."+id, el.value));
 }
+filter = store.get("odin.filter") || "all";   // remembered status filter (set by the chips below)
 
 function toast(msg, ok=true) {
   const t = $("#toast");
@@ -334,22 +353,39 @@ function isBusy(el) {
 // Stateful reconcile: key by run_id, patch only changed (non-busy) cards, keep order, never wipe
 // the whole list. Clicks are handled by one delegated listener (below), so a replaced card's
 // buttons keep working with no rebinding.
+// One filter chip per status actually present, plus an always-on "all"; each carries a live count.
+// The active chip survives reloads (persisted), but resets to "all" if its status drains away.
+const CHIP_ORDER = ["awaiting_approval", "running", "succeeded", "failed", "cancelled", "pending"];
+function renderChips(runs) {
+  const counts = runs.reduce((a, r) => (a[r.status] = (a[r.status]||0)+1, a), {});
+  const chips = [["all", "all", runs.length], ...CHIP_ORDER.filter(s => counts[s]).map(s => [s, s.replace("_"," "), counts[s]])];
+  $("#chips").innerHTML = chips.map(([val, label, n]) =>
+    `<button class="chip${filter===val?" active":""}" data-filter="${val}" aria-pressed="${filter===val}">${label}<span class="n">${n}</span></button>`).join("");
+}
+
 function render(runs) {
   runsById = {}; for (const r of runs) runsById[r.run_id] = r;
-  const counts = runs.reduce((a, r) => (a[r.status] = (a[r.status]||0)+1, a), {});
-  $("#counts").innerHTML = ["running","awaiting_approval","succeeded","failed"]
-    .filter(s => counts[s]).map(s => `<b>${counts[s]}</b> ${s.replace("_"," ")}`).join("  ·  ") || "no runs yet";
+  lastRuns = runs;
+  // If the filtered-on status drained away, fall back to "all" so the operator isn't stuck on an empty view.
+  if (filter !== "all" && !runs.some(r => r.status === filter)) { filter = "all"; store.set("odin.filter", "all"); }
+  renderChips(runs);
   const main = $("#runs");
   if (!runs.length) {
     main.innerHTML = polledOnce ? '<div class="empty">no runs yet</div>' : '<div class="empty"><span class="spinner"></span> loading…</div>';
     return;
   }
-  const ph = main.querySelector(".empty"); if (ph) ph.remove();
-  const ids = new Set(runs.map(r => r.run_id));
-  for (const el of [...main.children]) if (!ids.has(el.dataset.runId)) el.remove();
+  const shown = filter === "all" ? runs : runs.filter(r => r.status === filter);
+  if (!shown.length) {   // runs exist but none match the active chip
+    const msg = "no " + filter.replace("_"," ") + " runs";
+    const cur = main.querySelector(".empty");
+    if (!cur || cur.textContent !== msg) main.innerHTML = `<div class="empty">${esc(msg)}</div>`;
+    return;
+  }
+  const ids = new Set(shown.map(r => r.run_id));
+  for (const el of [...main.children]) if (!el.dataset.runId || !ids.has(el.dataset.runId)) el.remove();
   // The one action that matters — a paused run awaiting approval — floats to the top; the rest keep
   // the server's newest-first order. `filter` is stable, so order within each group is preserved.
-  const sorted = [...runs.filter(r => r.gate), ...runs.filter(r => !r.gate)];
+  const sorted = [...shown.filter(r => r.gate), ...shown.filter(r => !r.gate)];
   let prev = null;
   for (const r of sorted) {
     const sig = cardSig(r);
@@ -378,6 +414,16 @@ $("#runs").addEventListener("click", e => {
   if (act) { const card = act.closest("[data-run-id]"); decide(card.dataset.runId, act.dataset.act, card); return; }
   const dl = e.target.closest("[data-diff]");
   if (dl) openDrawer(dl.dataset.diff, runsById[dl.dataset.diff]);
+});
+
+// Status filter chips — purely client-side over the last fetched runs, so toggling is instant and
+// the choice is remembered. Re-render off `lastRuns` (no refetch).
+$("#chips").addEventListener("click", e => {
+  const c = e.target.closest("[data-filter]");
+  if (!c) return;
+  filter = c.dataset.filter;
+  store.set("odin.filter", filter);
+  render(lastRuns);
 });
 
 // Relative times tick on their own (no re-render). Card times are relative to the server's
