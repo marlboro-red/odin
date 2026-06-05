@@ -89,6 +89,10 @@ pub(crate) const HTML: &str = r##"<!doctype html>
              max-height: 360px; font: 12px/1.5 var(--mono); white-space: pre; }
   pre.diff .add { color: var(--ok); } pre.diff .del { color: var(--bad); } pre.diff .hd { color: var(--accent); }
   .err { color: var(--bad); font-size: 12px; margin-top: var(--s2); white-space: pre-wrap; font-family: var(--mono); }
+  .gate .err { margin-top: 0; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+             clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+  button[disabled] { opacity: .5; cursor: default; }
   #toast { position: fixed; bottom: var(--s5); left: 50%; transform: translateX(-50%) translateY(8px);
            background: var(--bg-card); color: var(--text); padding: var(--s3) var(--s4);
            border-radius: var(--r-md); box-shadow: var(--shadow); opacity: 0;
@@ -109,13 +113,13 @@ pub(crate) const HTML: &str = r##"<!doctype html>
   <div class="counts" id="counts"></div>
   <div class="spacer"></div>
   <div class="cfg">
-    <input id="approver" placeholder="your name" size="10" title="recorded as the approver">
-    <input id="secret" type="password" placeholder="webhook secret" size="16" title="used to sign approve/reject in your browser; never sent except as a signature">
+    <input id="approver" placeholder="your name" size="10" aria-label="your name (recorded as the approver)" title="recorded as the approver">
+    <input id="secret" type="password" placeholder="webhook secret" size="16" aria-label="webhook secret" title="used to sign approve/reject in your browser; never sent except as a signature">
   </div>
-  <span id="tick"></span>
+  <span id="tick" aria-live="off"></span>
 </header>
-<main id="runs"><div class="empty"><span class="spinner"></span> loading…</div></main>
-<div id="toast"></div>
+<main id="runs" role="region" aria-label="workflow runs"><div class="empty"><span class="spinner"></span> loading…</div></main>
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 <script>
 const $ = (s, r=document) => r.querySelector(s);
 const enc = new TextEncoder();
@@ -152,19 +156,37 @@ async function sign(secret, body) {
   return "sha256=" + [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2,"0")).join("");
 }
 
+// Friendly copy for a resulting run status (the /approve response carries the live status).
+const friendly = st => ({ succeeded: "completed", failed: "failed", awaiting_approval: "paused at next gate", running: "running" }[st] || (st ? st.replace("_"," ") : ""));
+
 async function decide(runId, decision, card) {
   const noteEl = card.querySelector("[data-note]");
+  const rerunEl = card.querySelector("[data-rerun]");
+  const errEl = card.querySelector("[data-gate-err]");
+  const btns = [...card.querySelectorAll("[data-act]")];
+  // Inline error keeps the operator in context (and keeps the note filled), with a toast to match.
+  const showErr = m => { if (errEl) { errEl.textContent = m; errEl.hidden = false; } toast(m, false); };
+  if (errEl) errEl.hidden = true;
   const note = (noteEl?.value || "").trim();
-  if (decision === "rejected" && !note) { toast("a reject needs a note (the feedback)", false); noteEl?.focus(); return; }
-  const rerun = decision === "rejected" && !!card.querySelector("[data-rerun]")?.checked;
+  if (decision === "rejected" && !note) { showErr("a reject needs a note (the feedback)"); noteEl?.focus(); return; }
+  const rerun = decision === "rejected" && !!rerunEl?.checked;
   const body = JSON.stringify({ run_id: runId, decision, approver: $("#approver").value.trim() || "dashboard", note, rerun });
+  btns.forEach(b => b.disabled = true);   // no double-submit while the async sign+POST is in flight
   try {
     const sig = await sign($("#secret").value.trim(), body);
     const res = await fetch("/approve", { method: "POST", headers: {"Content-Type":"application/json","X-Hub-Signature-256":sig}, body });
-    if (!res.ok) { toast(decision + " failed: " + res.status + " " + (await res.text()), false); return; }
-    toast(decision === "approved" ? "approved — resuming" : (rerun ? "rejected — rerunning with feedback" : "rejected"));
+    if (!res.ok) { showErr(decision + " failed: " + res.status + " " + (await res.text())); return; }
+    // A plain decision returns a RunSummary (top-level `status`); a reject-with-rerun returns a
+    // RerunOutcome { rejected, rerun } with NO top-level status — read the rerun's status instead.
+    const out = await res.json().catch(() => ({}));
+    if (rerun) toast("rejected — reran (" + friendly(out.rerun?.status) + ")");
+    else toast((decision === "approved" ? "approved — " : "rejected — ") + friendly(out.status));
+    if (noteEl) noteEl.value = "";          // clear interaction state so the next poll reconciles this card
+    if (rerunEl) rerunEl.checked = false;
+    btns.forEach(b => b.blur());
     poll();
-  } catch (e) { toast(e.message, false); }
+  } catch (e) { showErr(e.message); }
+  finally { btns.forEach(b => b.disabled = false); }
 }
 
 async function showDiff(runId, host) {
@@ -191,8 +213,13 @@ function cardSig(r) {
 }
 
 function cardHTML(r, sig) {
+  // The glyph is decorative (aria-hidden); a visually-hidden span carries the status word so a
+  // screen reader announces e.g. "passed build (0)" rather than just "build (0)".
   const steps = r.steps.map(s =>
-    `<span class="step" title="${esc(s.error||"")}"><span class="g g-${s.status}">${glyph(s.status)}</span>${esc(s.id)}${s.exit_code!=null?` (${s.exit_code})`:""}</span>`).join("");
+    `<span class="step" title="${esc(s.error||"")}"><span class="g g-${s.status}" aria-hidden="true">${glyph(s.status)}</span><span class="sr-only">${s.status.replace("_"," ")} </span>${esc(s.id)}${s.exit_code!=null?` (${s.exit_code})`:""}</span>`).join("");
+  // Failed steps carry their error in the list payload — surface it inline (not just a hover title).
+  const stepErrs = r.steps.filter(s => s.status === "failed" && s.error)
+    .map(s => `<div class="err">${esc(s.id)}: ${esc(s.error)}</div>`).join("");
   let gate = "";
   if (r.gate) {
     gate = `<div class="gate"><div class="msg">⏸ ${esc(r.gate.message || "Awaiting approval")}</div>
@@ -201,17 +228,19 @@ function cardHTML(r, sig) {
         <label><input type="checkbox" data-rerun> rerun</label>
         <button class="approve" data-act="approved">✓ Approve</button>
         <button class="reject" data-act="rejected">✗ Reject</button>
-      </div></div>`;
+      </div>
+      <div class="err gate-err" data-gate-err hidden></div></div>`;
   }
   const hasDiff = r.steps.some(s => s.status === "passed" || s.status === "failed");
   return `<div class="run ${r.gate?"await":""}" data-run-id="${esc(r.run_id)}" data-sig="${esc(sig)}">
     <div class="row1">
-      <span class="badge b-${r.status}">${r.status.replace("_"," ")}</span>
+      <span class="badge b-${r.status}" aria-label="status: ${r.status.replace("_"," ")}">${r.status.replace("_"," ")}</span>
       <span class="wf">${esc(r.workflow)}</span>
       <span class="id">${esc(r.run_id.slice(0,8))}</span>
-      <span class="ago" data-iso="${esc(r.updated_at)}">${ago(r.updated_at)}</span>
+      <span class="ago" data-iso="${esc(r.updated_at)}" title="${esc(r.updated_at)}">${ago(r.updated_at)}</span>
     </div>
     <div class="steps">${steps}</div>
+    ${stepErrs}
     ${gate}
     ${hasDiff ? `<button class="link" data-diff="${esc(r.run_id)}">diff</button><div class="diffhost"></div>` : ""}
   </div>`;
@@ -244,8 +273,11 @@ function render(runs) {
   const ph = main.querySelector(".empty"); if (ph) ph.remove();
   const ids = new Set(runs.map(r => r.run_id));
   for (const el of [...main.children]) if (!ids.has(el.dataset.runId)) el.remove();
+  // The one action that matters — a paused run awaiting approval — floats to the top; the rest keep
+  // the server's newest-first order. `filter` is stable, so order within each group is preserved.
+  const sorted = [...runs.filter(r => r.gate), ...runs.filter(r => !r.gate)];
   let prev = null;
-  for (const r of runs) {
+  for (const r of sorted) {
     const sig = cardSig(r);
     let el = main.querySelector(`:scope > [data-run-id="${CSS.escape(r.run_id)}"]`);
     if (!el) {
