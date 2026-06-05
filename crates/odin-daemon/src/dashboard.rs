@@ -7,6 +7,10 @@
 /// The dashboard single-page app, served at `GET /`. No build step, no external assets, no
 /// third-party JS. Approve/reject sign in-browser with the Web Crypto API (available on
 /// `localhost` and over HTTPS), so the webhook secret never leaves the operator's browser.
+///
+/// The render is **stateful**: cards are keyed by `run_id` and reconciled in place each poll, so a
+/// half-typed approval note, an open diff, focus, and scroll all survive the 3s refresh. Click
+/// handling is delegated on `#runs` (a reconciled card keeps working without per-element rebinding).
 pub(crate) const HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
@@ -14,51 +18,89 @@ pub(crate) const HTML: &str = r##"<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Odin</title>
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #0a0e14; --bg-card: #13171f; --bg-sunken: #0d1017;
+    --border: #232b38; --border-hi: #38424f;
+    --text: #e6eaf0; --text-dim: #99a1b3; --text-mut: #a6adba;
+    --accent: #60a5fa; --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+    --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 20px; --s6: 24px;
+    --r-sm: 6px; --r-md: 8px; --r-lg: 12px;
+    --shadow: 0 1px 2px rgba(0,0,0,.22), 0 1px 3px rgba(0,0,0,.14);
+    --font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.5 -apple-system, system-ui, sans-serif; background: #0f1115; color: #d7dae0; }
-  header { position: sticky; top: 0; background: #161922; border-bottom: 1px solid #262b36;
-           padding: 12px 18px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
-  header h1 { font-size: 16px; margin: 0; letter-spacing: .04em; }
-  header h1 b { color: #6ea8fe; }
-  .counts { color: #8b93a1; font-size: 13px; }
-  .counts b { color: #d7dae0; }
+  body { margin: 0; font: 14px/1.55 var(--font); background: var(--bg); color: var(--text);
+         -webkit-font-smoothing: antialiased; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+  header { position: sticky; top: 0; z-index: 5; background: var(--bg-card);
+           border-bottom: 1px solid var(--border); padding: var(--s3) var(--s4);
+           display: flex; gap: var(--s4); align-items: center; flex-wrap: wrap; }
+  header h1 { font-size: 17px; font-weight: 700; margin: 0; letter-spacing: -.01em; }
+  header h1 b { color: var(--accent); }
+  .counts { color: var(--text-dim); font-size: 13px; }
+  .counts b { color: var(--text); font-weight: 600; }
   .spacer { flex: 1; }
-  .cfg { display: flex; gap: 8px; align-items: center; }
-  .cfg input { background: #0f1115; border: 1px solid #2a3140; color: #d7dae0; border-radius: 6px; padding: 5px 8px; font: inherit; }
-  #tick { color: #6b7280; font-size: 12px; min-width: 86px; text-align: right; }
-  main { padding: 16px 18px; max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
-  .run { background: #161922; border: 1px solid #262b36; border-radius: 10px; padding: 12px 14px; }
-  .run.await { border-color: #b9852a; box-shadow: 0 0 0 1px #b9852a33; }
-  .row1 { display: flex; align-items: center; gap: 10px; }
-  .wf { font-weight: 600; }
-  .id { color: #6b7280; font-family: ui-monospace, monospace; font-size: 12px; }
-  .ago { color: #6b7280; font-size: 12px; margin-left: auto; }
-  .badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase; letter-spacing: .04em; }
-  .b-succeeded { background: #15331f; color: #58d68d; }
-  .b-failed, .b-cancelled { background: #3a1b1b; color: #f1707a; }
-  .b-running, .b-pending { background: #16263f; color: #6ea8fe; }
-  .b-awaiting_approval { background: #3a2c12; color: #f0b24a; }
-  .steps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
-  .step { font-size: 12px; padding: 2px 7px; border-radius: 6px; background: #0f1115; border: 1px solid #262b36; color: #aab2c0; }
-  .step .g { margin-right: 5px; }
-  .g-passed { color: #58d68d; } .g-failed { color: #f1707a; } .g-skipped { color: #6b7280; }
-  .g-running { color: #6ea8fe; } .g-awaiting_approval { color: #f0b24a; } .g-pending { color: #6b7280; }
-  .gate { margin-top: 11px; padding-top: 11px; border-top: 1px dashed #2a3140; }
-  .gate .msg { color: #f0b24a; margin-bottom: 8px; }
-  .gate .ctl { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .gate input { flex: 1; min-width: 180px; background: #0f1115; border: 1px solid #2a3140; color: #d7dae0; border-radius: 6px; padding: 6px 8px; font: inherit; }
-  button { font: inherit; border: 0; border-radius: 6px; padding: 6px 12px; cursor: pointer; color: #0f1115; font-weight: 600; }
-  .approve { background: #58d68d; } .reject { background: #f1707a; }
-  .link { background: none; color: #6ea8fe; padding: 2px 0; font-weight: 400; text-decoration: underline; }
-  pre.diff { margin: 9px 0 0; padding: 10px; background: #0b0d11; border: 1px solid #262b36; border-radius: 8px;
-             overflow: auto; max-height: 360px; font: 12px/1.45 ui-monospace, monospace; white-space: pre; }
-  pre.diff .add { color: #58d68d; } pre.diff .del { color: #f1707a; } pre.diff .hd { color: #6ea8fe; }
-  .err { color: #f1707a; font-size: 12px; margin-top: 6px; white-space: pre-wrap; }
-  #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #222; color: #fff;
-           padding: 9px 16px; border-radius: 8px; opacity: 0; transition: opacity .2s; pointer-events: none; border: 1px solid #333; }
-  #toast.show { opacity: 1; }
-  .empty { color: #6b7280; text-align: center; padding: 40px; }
+  .cfg { display: flex; gap: var(--s2); }
+  .cfg input { background: var(--bg-sunken); border: 1px solid var(--border-hi); color: var(--text);
+               border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; }
+  .cfg input::placeholder { color: var(--text-mut); }
+  #tick { color: var(--text-mut); font-size: 12px; min-width: 92px; text-align: right; }
+
+  main { padding: var(--s4); max-width: 1080px; margin: 0 auto;
+         display: flex; flex-direction: column; gap: var(--s3); }
+  .run { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--r-lg);
+         padding: var(--s3) var(--s4); box-shadow: var(--shadow); }
+  .run.await { border-color: var(--warn); box-shadow: var(--shadow), 0 0 0 1px rgba(251,191,36,.28); }
+  .row1 { display: flex; align-items: center; gap: var(--s3); }
+  .wf { font-weight: 600; font-size: 15px; }
+  .id { color: var(--text-mut); font-family: var(--mono); font-size: 12px; }
+  .ago { color: var(--text-mut); font-size: 12px; margin-left: auto; white-space: nowrap; }
+  .badge { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+           text-transform: uppercase; letter-spacing: .04em; }
+  .b-succeeded { background: #10381f; color: var(--ok); }
+  .b-failed, .b-cancelled { background: #431515; color: var(--bad); }
+  .b-running, .b-pending { background: #0f263e; color: var(--accent); }
+  .b-awaiting_approval { background: #3d2f10; color: var(--warn); }
+  .steps { display: flex; flex-wrap: wrap; gap: var(--s2); margin-top: var(--s3); }
+  .step { font-size: 12px; padding: 3px 8px; border-radius: var(--r-md); background: var(--bg-sunken);
+          border: 1px solid var(--border); color: var(--text-dim); font-family: var(--mono); }
+  .step .g { margin-right: var(--s1); font-family: var(--font); }
+  .g-passed { color: var(--ok); } .g-failed { color: var(--bad); } .g-skipped { color: var(--text-mut); }
+  .g-running { color: var(--accent); } .g-awaiting_approval { color: var(--warn); } .g-pending { color: var(--text-mut); }
+  .gate { margin-top: var(--s3); padding-top: var(--s3); border-top: 1px dashed var(--border-hi); }
+  .gate .msg { color: var(--warn); margin-bottom: var(--s2); font-weight: 500; }
+  .gate .ctl { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; }
+  .gate .note { flex: 1; min-width: 200px; background: var(--bg-sunken); border: 1px solid var(--border-hi);
+                color: var(--text); border-radius: var(--r-sm); padding: var(--s2) var(--s3); font: inherit; }
+  .gate .note::placeholder { color: var(--text-mut); }
+  .gate label { font-size: 12px; color: var(--text-dim); display: inline-flex; align-items: center; gap: var(--s1); }
+  button { font: inherit; border: 0; border-radius: var(--r-sm); padding: var(--s2) var(--s3);
+           cursor: pointer; color: #06121f; font-weight: 600; }
+  .approve { background: var(--ok); } .approve:hover { background: #2cc28a; }
+  .reject { background: var(--bad); } .reject:hover { background: #f1606b; }
+  .link { background: none; color: var(--accent); padding: var(--s1) 0; font-weight: 500;
+          border-bottom: 1px solid transparent; }
+  .link:hover { border-bottom-color: var(--accent); }
+  pre.diff { margin: var(--s3) 0 0; padding: var(--s3); background: var(--bg-sunken);
+             border: 1px solid var(--border); border-radius: var(--r-md); overflow: auto;
+             max-height: 360px; font: 12px/1.5 var(--mono); white-space: pre; }
+  pre.diff .add { color: var(--ok); } pre.diff .del { color: var(--bad); } pre.diff .hd { color: var(--accent); }
+  .err { color: var(--bad); font-size: 12px; margin-top: var(--s2); white-space: pre-wrap; font-family: var(--mono); }
+  #toast { position: fixed; bottom: var(--s5); left: 50%; transform: translateX(-50%) translateY(8px);
+           background: var(--bg-card); color: var(--text); padding: var(--s3) var(--s4);
+           border-radius: var(--r-md); box-shadow: var(--shadow); opacity: 0;
+           transition: opacity .2s, transform .2s; pointer-events: none; border: 1px solid var(--border-hi);
+           font-size: 13px; max-width: min(520px, 90vw); }
+  #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .empty { color: var(--text-mut); text-align: center; padding: var(--s6) var(--s4);
+           display: flex; align-items: center; justify-content: center; gap: var(--s2); }
+  .spinner { width: 14px; height: 14px; border: 2px solid var(--border-hi); border-top-color: var(--accent);
+             border-radius: 50%; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } #toast { transition: opacity .2s; } }
 </style>
 </head>
 <body>
@@ -72,18 +114,18 @@ pub(crate) const HTML: &str = r##"<!doctype html>
   </div>
   <span id="tick"></span>
 </header>
-<main id="runs"><div class="empty">loading…</div></main>
+<main id="runs"><div class="empty"><span class="spinner"></span> loading…</div></main>
 <div id="toast"></div>
 <script>
 const $ = (s, r=document) => r.querySelector(s);
 const enc = new TextEncoder();
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let lastFetch = 0;
+let lastFetch = 0, polledOnce = false;
 
 // Persist the secret + approver locally so they survive a reload (never auto-sent to the server).
 for (const id of ["secret", "approver"]) {
   const el = $("#"+id);
-  el.value = localStorage.getItem("odin."+id) || (id === "approver" ? "" : "");
+  el.value = localStorage.getItem("odin."+id) || "";
   el.addEventListener("input", () => localStorage.setItem("odin."+id, el.value));
 }
 
@@ -110,10 +152,11 @@ async function sign(secret, body) {
   return "sha256=" + [...new Uint8Array(mac)].map(b => b.toString(16).padStart(2,"0")).join("");
 }
 
-async function decide(runId, decision, noteEl) {
+async function decide(runId, decision, card) {
+  const noteEl = card.querySelector("[data-note]");
   const note = (noteEl?.value || "").trim();
   if (decision === "rejected" && !note) { toast("a reject needs a note (the feedback)", false); noteEl?.focus(); return; }
-  const rerun = decision === "rejected" && $("#rerun-"+CSS.escape(runId))?.checked;
+  const rerun = decision === "rejected" && !!card.querySelector("[data-rerun]")?.checked;
   const body = JSON.stringify({ run_id: runId, decision, approver: $("#approver").value.trim() || "dashboard", note, rerun });
   try {
     const sig = await sign($("#secret").value.trim(), body);
@@ -140,53 +183,106 @@ async function showDiff(runId, host) {
 
 function glyph(s) { return {passed:"✓", failed:"✗", skipped:"⊘", running:"⏳", awaiting_approval:"⏸", pending:"·"}[s] || "·"; }
 
+// A signature over only what a card RENDERS — excludes `updated_at`, so a poll that merely bumps
+// the timestamp does not blow the card away (the relative time updates separately, see tick()).
+function cardSig(r) {
+  return JSON.stringify([r.status, r.workflow, r.gate ? r.gate.message : null,
+    r.steps.map(s => [s.id, s.status, s.exit_code, s.error || null])]);
+}
+
+function cardHTML(r, sig) {
+  const steps = r.steps.map(s =>
+    `<span class="step" title="${esc(s.error||"")}"><span class="g g-${s.status}">${glyph(s.status)}</span>${esc(s.id)}${s.exit_code!=null?` (${s.exit_code})`:""}</span>`).join("");
+  let gate = "";
+  if (r.gate) {
+    gate = `<div class="gate"><div class="msg">⏸ ${esc(r.gate.message || "Awaiting approval")}</div>
+      <div class="ctl">
+        <input class="note" data-note placeholder="note / feedback (required to reject)">
+        <label><input type="checkbox" data-rerun> rerun</label>
+        <button class="approve" data-act="approved">✓ Approve</button>
+        <button class="reject" data-act="rejected">✗ Reject</button>
+      </div></div>`;
+  }
+  const hasDiff = r.steps.some(s => s.status === "passed" || s.status === "failed");
+  return `<div class="run ${r.gate?"await":""}" data-run-id="${esc(r.run_id)}" data-sig="${esc(sig)}">
+    <div class="row1">
+      <span class="badge b-${r.status}">${r.status.replace("_"," ")}</span>
+      <span class="wf">${esc(r.workflow)}</span>
+      <span class="id">${esc(r.run_id.slice(0,8))}</span>
+      <span class="ago" data-iso="${esc(r.updated_at)}">${ago(r.updated_at)}</span>
+    </div>
+    <div class="steps">${steps}</div>
+    ${gate}
+    ${hasDiff ? `<button class="link" data-diff="${esc(r.run_id)}">diff</button><div class="diffhost"></div>` : ""}
+  </div>`;
+}
+
+function nodeFrom(html) { const t = document.createElement("template"); t.innerHTML = html.trim(); return t.content.firstElementChild; }
+
+// A card is "busy" when the operator is mid-interaction — don't replace its DOM (which would lose a
+// half-typed note, the rerun choice, focus, or an open diff). Covers focus AND lingering state.
+function isBusy(el) {
+  if (el.contains(document.activeElement)) return true;
+  const n = el.querySelector("[data-note]"); if (n && n.value.trim()) return true;
+  const rr = el.querySelector("[data-rerun]"); if (rr && rr.checked) return true;
+  const dh = el.querySelector(".diffhost"); if (dh && dh.dataset.open) return true;
+  return false;
+}
+
+// Stateful reconcile: key by run_id, patch only changed (non-busy) cards, keep order, never wipe
+// the whole list. Clicks are handled by one delegated listener (below), so a replaced card's
+// buttons keep working with no rebinding.
 function render(runs) {
   const counts = runs.reduce((a, r) => (a[r.status] = (a[r.status]||0)+1, a), {});
   $("#counts").innerHTML = ["running","awaiting_approval","succeeded","failed"]
-    .filter(s => counts[s]).map(s => `<b>${counts[s]}</b> ${s.replace("_"," ")}`).join(" · ") || "no runs yet";
+    .filter(s => counts[s]).map(s => `<b>${counts[s]}</b> ${s.replace("_"," ")}`).join("  ·  ") || "no runs yet";
   const main = $("#runs");
-  if (!runs.length) { main.innerHTML = '<div class="empty">no runs yet</div>'; return; }
-  main.innerHTML = runs.map(r => {
-    const steps = r.steps.map(s =>
-      `<span class="step" title="${esc(s.error||"")}"><span class="g g-${s.status}">${glyph(s.status)}</span>${esc(s.id)}${s.exit_code!=null?` (${s.exit_code})`:""}</span>`).join("");
-    let gate = "";
-    if (r.gate) {
-      gate = `<div class="gate"><div class="msg">⏸ ${esc(r.gate.message || "Awaiting approval")}</div>
-        <div class="ctl">
-          <input id="note-${esc(r.run_id)}" placeholder="note / feedback (required to reject)">
-          <label style="font-size:12px;color:#8b93a1"><input type="checkbox" id="rerun-${esc(r.run_id)}"> rerun</label>
-          <button class="approve" data-act="approved" data-run="${esc(r.run_id)}">✓ Approve</button>
-          <button class="reject" data-act="rejected" data-run="${esc(r.run_id)}">✗ Reject</button>
-        </div></div>`;
+  if (!runs.length) {
+    main.innerHTML = polledOnce ? '<div class="empty">no runs yet</div>' : '<div class="empty"><span class="spinner"></span> loading…</div>';
+    return;
+  }
+  const ph = main.querySelector(".empty"); if (ph) ph.remove();
+  const ids = new Set(runs.map(r => r.run_id));
+  for (const el of [...main.children]) if (!ids.has(el.dataset.runId)) el.remove();
+  let prev = null;
+  for (const r of runs) {
+    const sig = cardSig(r);
+    let el = main.querySelector(`:scope > [data-run-id="${CSS.escape(r.run_id)}"]`);
+    if (!el) {
+      el = nodeFrom(cardHTML(r, sig));
+      main.insertBefore(el, prev ? prev.nextSibling : main.firstChild);
+    } else if (el.dataset.sig !== sig && !isBusy(el)) {
+      const fresh = nodeFrom(cardHTML(r, sig));
+      el.replaceWith(fresh); el = fresh;
     }
-    const hasDiff = r.steps.some(s => s.status === "passed" || s.status === "failed");
-    return `<div class="run ${r.gate?"await":""}">
-      <div class="row1">
-        <span class="badge b-${r.status}">${r.status.replace("_"," ")}</span>
-        <span class="wf">${esc(r.workflow)}</span>
-        <span class="id">${esc(r.run_id.slice(0,8))}</span>
-        <span class="ago">${ago(r.updated_at)}</span>
-      </div>
-      <div class="steps">${steps}</div>
-      ${gate}
-      ${hasDiff ? `<button class="link" data-diff="${esc(r.run_id)}">diff</button><div class="diffhost"></div>` : ""}
-    </div>`;
-  }).join("");
+    const want = prev ? prev.nextSibling : main.firstChild;
+    if (el !== want && !el.contains(document.activeElement)) main.insertBefore(el, want);
+    prev = el;
+  }
+}
 
-  main.querySelectorAll("button[data-act]").forEach(b =>
-    b.onclick = () => decide(b.dataset.run, b.dataset.act, $("#note-"+CSS.escape(b.dataset.run))));
-  main.querySelectorAll("button[data-diff]").forEach(b =>
-    b.onclick = () => showDiff(b.dataset.diff, b.parentElement.querySelector(".diffhost")));
+$("#runs").addEventListener("click", e => {
+  const act = e.target.closest("[data-act]");
+  if (act) { const card = act.closest("[data-run-id]"); decide(card.dataset.runId, act.dataset.act, card); return; }
+  const dl = e.target.closest("[data-diff]");
+  if (dl) showDiff(dl.dataset.diff, dl.parentElement.querySelector(".diffhost"));
+});
+
+// Relative times tick on their own (no re-render). Card times are relative to the server's
+// `updated_at`; the "updated …" indicator stays on the client clock to avoid clock-skew artifacts.
+function tick() {
+  for (const el of document.querySelectorAll(".ago[data-iso]")) el.textContent = ago(el.dataset.iso);
+  $("#tick").textContent = lastFetch ? "updated " + ago(new Date(lastFetch).toISOString()) : "";
 }
 
 async function poll() {
   try {
     const runs = await (await fetch("/api/runs?limit=50")).json();
-    render(runs); lastFetch = Date.now();
+    render(runs); lastFetch = Date.now(); polledOnce = true;
   } catch (e) { $("#counts").textContent = "(daemon unreachable)"; }
 }
 
-setInterval(() => { $("#tick").textContent = lastFetch ? "updated " + ago(new Date(lastFetch).toISOString()) : ""; }, 1000);
+setInterval(tick, 1000);
 setInterval(poll, 3000);
 poll();
 </script>
