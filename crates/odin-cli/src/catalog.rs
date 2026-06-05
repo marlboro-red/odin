@@ -45,6 +45,88 @@ pub(crate) fn dir(override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     Ok(proj.data_local_dir().join("recipes"))
 }
 
+/// Resolves the catalog directory and creates it if missing — for write/seed operations.
+///
+/// # Errors
+/// Fails if the directory cannot be resolved (see [`dir`]) or created.
+pub(crate) fn dir_create(override_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    let d = dir(override_dir)?;
+    std::fs::create_dir_all(&d)
+        .with_context(|| format!("creating recipe catalog directory {}", d.display()))?;
+    Ok(d)
+}
+
+/// The bundled **starter recipes**, embedded at build time so an installed `odin` can seed a
+/// catalog with no source tree nearby. Each entry is `(catalog name, YAML contents)`; the name is
+/// the example's filename stem (kept in sync with `examples/`). `recipe init` writes these out.
+pub(crate) const STARTERS: &[(&str, &str)] = &[
+    (
+        "adversarial-review",
+        include_str!("../../../examples/adversarial-review.yaml"),
+    ),
+    (
+        "fix-flaky-test",
+        include_str!("../../../examples/fix-flaky-test.yaml"),
+    ),
+    (
+        "gated-deploy",
+        include_str!("../../../examples/gated-deploy.yaml"),
+    ),
+    (
+        "issue-to-pr",
+        include_str!("../../../examples/issue-to-pr.yaml"),
+    ),
+    ("iterate", include_str!("../../../examples/iterate.yaml")),
+    (
+        "local-review",
+        include_str!("../../../examples/local-review.yaml"),
+    ),
+    (
+        "loop-with-case",
+        include_str!("../../../examples/loop-with-case.yaml"),
+    ),
+    (
+        "multi-agent-eval",
+        include_str!("../../../examples/multi-agent-eval.yaml"),
+    ),
+    (
+        "nightly-maintenance",
+        include_str!("../../../examples/nightly-maintenance.yaml"),
+    ),
+    (
+        "self-correct",
+        include_str!("../../../examples/self-correct.yaml"),
+    ),
+    (
+        "ship-release",
+        include_str!("../../../examples/ship-release.yaml"),
+    ),
+    ("triage", include_str!("../../../examples/triage.yaml")),
+];
+
+/// Writes the bundled [`STARTERS`] into `dir`, skipping any that already exist unless `force`.
+/// Returns `(written names, skipped names)`.
+///
+/// # Errors
+/// Fails if a starter file cannot be written.
+pub(crate) fn seed(
+    dir: &Path,
+    force: bool,
+) -> anyhow::Result<(Vec<&'static str>, Vec<&'static str>)> {
+    let mut wrote = Vec::new();
+    let mut skipped = Vec::new();
+    for (name, body) in STARTERS {
+        let path = dir.join(format!("{name}.yaml"));
+        if path.exists() && !force {
+            skipped.push(*name);
+            continue;
+        }
+        std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+        wrote.push(*name);
+    }
+    Ok((wrote, skipped))
+}
+
 /// A recipe as listed: its catalog key (filename stem), path, and best-effort parsed metadata.
 /// `workflow_name`/`description` are `None` if the file does not parse as a workflow.
 pub(crate) struct Recipe {
@@ -192,5 +274,40 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert!(list(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn starters_all_parse_and_names_unique() {
+        assert!(!STARTERS.is_empty());
+        let mut seen = std::collections::HashSet::new();
+        for (name, body) in STARTERS {
+            assert!(
+                is_valid_name(name),
+                "starter name {name} is not a valid catalog name"
+            );
+            assert!(seen.insert(*name), "duplicate starter name {name}");
+            Workflow::from_yaml_str(body)
+                .unwrap_or_else(|e| panic!("bundled starter {name} does not parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn seed_writes_then_skips_unless_forced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (wrote, skipped) = seed(tmp.path(), false).unwrap();
+        assert_eq!(wrote.len(), STARTERS.len());
+        assert!(skipped.is_empty());
+        // Every seeded starter is now resolvable by name.
+        assert!(resolve(tmp.path(), STARTERS[0].0).is_some());
+
+        // A second seed skips everything (idempotent)…
+        let (wrote2, skipped2) = seed(tmp.path(), false).unwrap();
+        assert!(wrote2.is_empty());
+        assert_eq!(skipped2.len(), STARTERS.len());
+
+        // …unless forced, which rewrites them all.
+        let (wrote3, skipped3) = seed(tmp.path(), true).unwrap();
+        assert_eq!(wrote3.len(), STARTERS.len());
+        assert!(skipped3.is_empty());
     }
 }
