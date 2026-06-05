@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::Context as _;
+use odin_core::Workflow;
 
 use crate::catalog;
 
@@ -35,7 +36,7 @@ pub(crate) fn list(recipes_dir: Option<&Path>, json: bool) -> anyhow::Result<Exi
     if recipes.is_empty() {
         println!("no recipes in {}", dir.display());
         println!(
-            "  drop workflow .yaml files there to populate the catalog (see `odin recipe --help`)."
+            "  run `odin recipe init` to add the bundled starters, or `odin recipe add <file>`."
         );
         return Ok(ExitCode::SUCCESS);
     }
@@ -49,6 +50,66 @@ pub(crate) fn list(recipes_dir: Option<&Path>, json: bool) -> anyhow::Result<Exi
             (Some(_), None) => println!("  {:<width$}", r.name),
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `odin recipe init` — seed the catalog with the bundled starter recipes. Existing recipes are
+/// kept unless `--force`.
+pub(crate) fn init(recipes_dir: Option<&Path>, force: bool) -> anyhow::Result<ExitCode> {
+    let dir = catalog::dir_create(recipes_dir)?;
+    let (wrote, skipped) = catalog::seed(&dir, force)?;
+    println!("seeded {} recipe(s) into {}", wrote.len(), dir.display());
+    if !skipped.is_empty() {
+        println!(
+            "  kept {} already present: {} (use --force to overwrite)",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `odin recipe add <file> [--as <name>]` — copy a workflow file into the catalog. The recipe name
+/// defaults to the file's stem; refuses to overwrite an existing recipe unless `--force`.
+pub(crate) fn add(
+    file: &Path,
+    as_name: Option<&str>,
+    force: bool,
+    recipes_dir: Option<&Path>,
+) -> anyhow::Result<ExitCode> {
+    let body =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    // Validate it's a parseable workflow before adding, so a typo is caught now (not at run time).
+    Workflow::from_yaml_str(&body)
+        .with_context(|| format!("{} is not a valid workflow", file.display()))?;
+
+    let name = match as_name {
+        Some(n) => n.to_owned(),
+        None => file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_owned)
+            .with_context(|| {
+                format!(
+                    "could not derive a recipe name from {}; pass --as <name>",
+                    file.display()
+                )
+            })?,
+    };
+    if !catalog::is_valid_name(&name) {
+        anyhow::bail!("invalid recipe name '{name}' (no path separators, '.', or '..')");
+    }
+
+    let dir = catalog::dir_create(recipes_dir)?;
+    let dest = dir.join(format!("{name}.yaml"));
+    if dest.exists() && !force {
+        anyhow::bail!(
+            "recipe '{name}' already exists at {} (use --force to overwrite)",
+            dest.display()
+        );
+    }
+    std::fs::write(&dest, &body).with_context(|| format!("writing {}", dest.display()))?;
+    println!("added recipe '{name}' → {}", dest.display());
     Ok(ExitCode::SUCCESS)
 }
 

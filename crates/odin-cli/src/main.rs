@@ -232,6 +232,29 @@ enum RecipeSub {
         #[arg(long)]
         json: bool,
     },
+    /// Seed the catalog with the bundled starter recipes.
+    Init {
+        /// Override the catalog directory.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
+        /// Overwrite recipes that already exist (default: keep them).
+        #[arg(long)]
+        force: bool,
+    },
+    /// Copy a workflow file into the catalog as a recipe.
+    Add {
+        /// Path to the workflow YAML file to add.
+        file: PathBuf,
+        /// The recipe name to store it under (default: the file's stem).
+        #[arg(long = "as", value_name = "NAME")]
+        as_name: Option<String>,
+        /// Override the catalog directory.
+        #[arg(long, value_name = "DIR")]
+        recipes_dir: Option<PathBuf>,
+        /// Overwrite an existing recipe of the same name.
+        #[arg(long)]
+        force: bool,
+    },
     /// Print a recipe's workflow YAML.
     Show {
         /// The recipe name (its filename stem in the catalog).
@@ -325,6 +348,15 @@ fn main() -> ExitCode {
             RecipeSub::List { recipes_dir, json } => {
                 cmd::recipe::list(recipes_dir.as_deref(), json)
             }
+            RecipeSub::Init { recipes_dir, force } => {
+                cmd::recipe::init(recipes_dir.as_deref(), force)
+            }
+            RecipeSub::Add {
+                file,
+                as_name,
+                recipes_dir,
+                force,
+            } => cmd::recipe::add(&file, as_name.as_deref(), force, recipes_dir.as_deref()),
             RecipeSub::Show { name, recipes_dir } => {
                 cmd::recipe::show(&name, recipes_dir.as_deref())
             }
