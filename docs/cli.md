@@ -8,16 +8,21 @@ the durable store. (For event-driven execution — cron and webhooks — see the
 odin <command> [args]
 
 Commands:
-  validate <FILE>      Parse and validate a workflow, reporting all diagnostics
-  run <FILE>           Run a workflow to completion
-  list                 List recent runs from the store
-  show <RUN_ID>        Show a run's details
-  logs <RUN_ID>        Show a run's event log
-  status               At-a-glance status of recent runs (--watch to live-refresh)
-  approve <RUN_ID>     Approve a run paused at an approval gate
-  reject  <RUN_ID>     Reject a paused run (optionally rerun with feedback)
-  prune                Delete old/excess terminal runs from the store
+  validate <FILE|RECIPE>   Parse and validate a workflow, reporting all diagnostics
+  run <FILE|RECIPE>        Run a workflow to completion
+  list                     List recent runs from the store
+  show <RUN_ID>            Show a run's details
+  logs <RUN_ID>            Show a run's event log
+  status                   At-a-glance status of recent runs (--watch to live-refresh)
+  approve <RUN_ID>         Approve a run paused at an approval gate
+  reject  <RUN_ID>         Reject a paused run (optionally rerun with feedback)
+  prune                    Delete old/excess terminal runs from the store
+  recipe <SUBCOMMAND>      Manage the by-name workflow recipe catalog
 ```
+
+Wherever a command takes a workflow `<FILE>`, you can give a **recipe name** instead — a bare
+name is resolved against the [recipe catalog](#odin-recipe-subcommand) when no file exists at
+that path. An existing file path always wins.
 
 Every command takes `--json` for machine-readable output on **stdout**. A command's normal
 report — including `validate`'s diagnostics, errors and all — also goes to stdout. Failures go
@@ -27,13 +32,14 @@ exits non-zero.
 
 ---
 
-## `odin validate <FILE> [--json]`
+## `odin validate <FILE|RECIPE> [--json]`
 
-Parse and validate a workflow file, reporting **all** diagnostics at once.
+Parse and validate a workflow, reporting **all** diagnostics at once.
 
 | Flag | Meaning |
 |------|---------|
-| `<FILE>` | Path to the workflow YAML file (required). |
+| `<FILE\|RECIPE>` | Path to a workflow YAML file, or a [recipe name](#odin-recipe-subcommand) (required). |
+| `--recipes-dir <DIR>` | Override the recipe-catalog directory used to resolve a name. |
 | `--json` | Emit the diagnostics report as JSON instead of human-readable text. |
 
 ```sh
@@ -55,14 +61,15 @@ I/O error.
 
 ---
 
-## `odin run <FILE> [flags]`
+## `odin run <FILE|RECIPE> [flags]`
 
 Run a workflow to completion against a git repository. Steps using `run:` execute for free;
 `provider:` steps invoke the real agent CLI.
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `<FILE>` | — | Path to the workflow YAML file (required). |
+| `<FILE\|RECIPE>` | — | Path to a workflow YAML file, or a [recipe name](#odin-recipe-subcommand) (required). |
+| `--recipes-dir <DIR>` | — | Override the recipe-catalog directory used to resolve a name. |
 | `--param <KEY=VALUE>` | — | A typed input param (repeatable). Values parse as JSON when possible (so `42`/`true` are typed), else as a string. |
 | `--trigger <NAME>` | `manual` | The trigger name to record for this run. |
 | `--repo <DIR>` | `.` | The git repository to provision workspaces from. |
@@ -72,6 +79,7 @@ Run a workflow to completion against a git repository. Steps using `run:` execut
 
 ```sh
 odin run examples/issue-to-pr.yaml --repo . --param issue_url=https://github.com/owner/repo/issues/1
+odin run issue-to-pr --repo . --param issue_url=…   # same workflow, by recipe name
 ```
 
 ```text
@@ -289,6 +297,58 @@ counter drop — each pruned run is folded into a persistent tally first, so the
 monotonic (it reflects lifetime completions, not just retained rows). `odin list` naturally shows
 fewer runs after a prune. **Exit:** `0` (incl. a dry-run, a no-op, or a declined prune); `2` on
 an error (no age/count limit given, or a store/engine failure).
+
+---
+
+## `odin recipe <SUBCOMMAND>`
+
+A **recipe catalog** is a directory of workflow `.yaml` files you can run, validate, and inspect
+*by name* instead of by path — `odin run adversarial-review` rather than
+`odin run ~/some/long/path/adversarial-review.yaml`. A recipe is just an ordinary workflow file;
+its **catalog name is the filename stem** (`adversarial-review.yaml` → `adversarial-review`).
+
+The catalog directory is resolved with this precedence:
+
+1. an explicit `--recipes-dir <DIR>`,
+2. the `ODIN_RECIPES_DIR` environment variable,
+3. the platform **data-local** directory (via the `directories` crate):
+
+| OS | Default catalog directory |
+|----|---------------------------|
+| macOS | `~/Library/Application Support/odin/recipes` |
+| Linux | `~/.local/share/odin/recipes` (honors `$XDG_DATA_HOME`) |
+| Windows | `%LOCALAPPDATA%\odin\data\recipes` |
+
+The catalog starts empty. `odin recipe init` seeds it with the bundled starter recipes (the
+[shipped examples](getting-started.md#the-shipped-examples)), which you can then edit freely.
+
+| Subcommand | Meaning |
+|------------|---------|
+| `recipe list [--json]` | List the catalog: each recipe's name and `description:` (unparseable files are listed but flagged). |
+| `recipe init [--force]` | Write the bundled starters into the catalog, skipping ones already present (`--force` overwrites). Safe to re-run. |
+| `recipe add <FILE> [--as <NAME>] [--force]` | Copy a workflow file into the catalog under its stem (or `--as <NAME>`). Validates it first; won't overwrite without `--force`. |
+| `recipe show <NAME>` | Print the recipe's YAML to stdout (provenance to stderr, so the output pipes cleanly). |
+| `recipe path <NAME>` | Print the recipe's resolved filesystem path (for scripting). |
+
+Every subcommand accepts `--recipes-dir <DIR>` to target a catalog other than the default.
+
+```sh
+$ odin recipe init
+seeded 12 recipe(s) into /Users/you/Library/Application Support/odin/recipes
+
+$ odin recipe list
+recipes in /Users/you/Library/Application Support/odin/recipes:
+
+  adversarial-review   Fan adversarial reviewers over a PR diff, synthesize a verdict, and post it on approval.
+  issue-to-pr          Plan → implement → self-review → open a PR for a GitHub issue.
+  …
+
+$ odin run adversarial-review --repo . --param pr=42   # run it by name
+$ odin recipe add ./my-review.yaml                      # add your own
+```
+
+**Exit:** `0` on success; `2` when a named recipe can't be found (the error lists what *is*
+available), the catalog directory can't be resolved/created, or a file can't be read/written.
 
 ---
 
