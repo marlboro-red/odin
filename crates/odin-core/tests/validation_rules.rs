@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN042`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN045`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -555,4 +555,59 @@ fn loop_inner_artifact_produced_upstream_is_clean() {
     assert_clean(
         "name: x\nsteps:\n  - id: f\n    loop:\n      until: \"true\"\n      max: 2\n      steps:\n        - {id: make, run: x, artifacts: {produces: [ART]}}\n        - {id: use, run: y, depends_on: [make], artifacts: {requires: [ART]}}\n",
     );
+}
+
+#[test]
+fn odin045_empty_tag_is_flagged() {
+    assert_fires(
+        "name: x\ntags: [\"good\", \"  \"]\nsteps:\n  - {id: a, run: ./x}\n",
+        DiagCode::MalformedTag,
+    );
+}
+
+#[test]
+fn odin045_duplicate_tag_is_flagged() {
+    // A case/whitespace duplicate is collapsed on parse; the rule warns about the collapse.
+    assert_fires(
+        "name: x\ntags: [\"CI\", \"ci\"]\nsteps:\n  - {id: a, run: ./x}\n",
+        DiagCode::MalformedTag,
+    );
+}
+
+#[test]
+fn odin045_odd_charset_tag_is_flagged() {
+    assert_fires(
+        "name: x\ntags: [\"Review!\"]\nsteps:\n  - {id: a, run: ./x}\n",
+        DiagCode::MalformedTag,
+    );
+}
+
+#[test]
+fn odin045_is_a_never_blocking_warning() {
+    // A malformed tag warns but never errors — the workflow is still valid.
+    let r = report("name: x\ntags: [\"Review!\", \"\"]\nsteps:\n  - {id: a, run: ./x}\n");
+    assert!(r.contains(DiagCode::MalformedTag));
+    assert!(!r.has_errors(), "tags must never block a run; got:\n{r}");
+}
+
+#[test]
+fn clean_tags_produce_no_diagnostics() {
+    // Well-formed tags emit neither ODIN045 nor a spurious ODIN025 (the KNOWN-allowlist edit).
+    let r = report("name: x\ntags: [review, ci]\nsteps:\n  - {id: a, run: ./x}\n");
+    assert!(!r.contains(DiagCode::MalformedTag), "got:\n{r}");
+    assert!(
+        !r.contains(DiagCode::UnknownRootField),
+        "tags must be in the root allowlist; got:\n{r}"
+    );
+}
+
+#[test]
+fn odin045_is_lint_time_only_not_engine_validate() {
+    // Like ODIN025, the tags rule lives in validate_source (the CLI path), not validate().
+    use odin_core::validate;
+    let yaml = "name: x\ntags: [\"Review!\"]\nsteps:\n  - {id: a, run: ./x}\n";
+    let wf = Workflow::from_yaml_str(yaml).unwrap();
+    let engine_only = validate(&wf, &KnownNames::builtin());
+    assert!(!engine_only.contains(DiagCode::MalformedTag));
+    assert!(report(yaml).contains(DiagCode::MalformedTag)); // …but the source path catches it
 }

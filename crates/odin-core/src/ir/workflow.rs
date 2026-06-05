@@ -42,6 +42,17 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Free-form labels for categorizing/filtering this workflow (e.g. in the recipe catalog).
+    /// Normalized on parse: each tag is trimmed and lowercased, empties are dropped, and
+    /// duplicates are collapsed (first occurrence wins, author order otherwise preserved).
+    /// Malformed tags are surfaced by validation (`ODIN045`) but never block a run.
+    #[serde(
+        default,
+        deserialize_with = "de_tags",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tags: Vec<String>,
+
     /// Whether runs of this workflow are checkpointed to the [`crate::traits::Store`].
     #[serde(default = "default_true")]
     pub durable: bool,
@@ -77,6 +88,26 @@ pub struct Workflow {
 
 fn default_true() -> bool {
     true
+}
+
+/// Deserializes and **normalizes** workflow tags: trim, lowercase (ASCII), drop empties, and
+/// collapse duplicates keeping first occurrence (so author order survives). The raw tokens are
+/// re-read from source by validation (`ODIN045`) to warn about anything normalization had to fix;
+/// `to_ascii_lowercase` (not `to_lowercase`) is deliberate so a non-ASCII tag isn't Unicode-folded
+/// into something the `[a-z0-9._-]` charset check then flags as its own normalization.
+fn de_tags<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(d)?;
+    let mut out: Vec<String> = Vec::with_capacity(raw.len());
+    for tag in raw {
+        let norm = tag.trim().to_ascii_lowercase();
+        if !norm.is_empty() && !out.contains(&norm) {
+            out.push(norm);
+        }
+    }
+    Ok(out)
 }
 
 /// Workflow-level defaults applied to steps that don't override them.

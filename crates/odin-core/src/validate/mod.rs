@@ -99,6 +99,7 @@ pub fn validate(wf: &Workflow, known: &KnownNames<'_>) -> ValidationReport {
 pub fn validate_source(src: &str, wf: &Workflow, known: &KnownNames<'_>) -> ValidationReport {
     let mut report = validate(wf, known);
     rules::root_unknown_fields(src, &mut report.diagnostics);
+    rules::tags(src, &mut report.diagnostics);
     report
 }
 

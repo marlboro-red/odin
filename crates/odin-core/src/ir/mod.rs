@@ -91,4 +91,37 @@ mod tests {
         let y = "name: x\nfuture_field: 1\nsteps:\n  - id: a\n    run: ./x.sh\n";
         assert!(Workflow::from_yaml_str(y).is_ok());
     }
+
+    #[test]
+    fn tags_are_normalized_on_parse() {
+        // trim + lowercase + drop-empty + dedupe(first-wins), author order otherwise preserved.
+        let y = "name: x\ntags: [Review, \"  CI  \", review, \"\", DEPLOY]\n\
+                 steps:\n  - id: a\n    run: ./x.sh\n";
+        let wf = Workflow::from_yaml_str(y).unwrap();
+        assert_eq!(wf.tags, ["review", "ci", "deploy"]);
+    }
+
+    #[test]
+    fn tags_default_empty_and_round_trip() {
+        let wf = Workflow::from_yaml_str("name: x\nsteps:\n  - id: a\n    run: ./x.sh\n").unwrap();
+        assert!(wf.tags.is_empty());
+        // skip_serializing_if keeps an empty `tags` out of the serialized form.
+        let json = serde_json::to_string(&wf).unwrap();
+        assert!(!json.contains("tags"), "empty tags should not serialize");
+    }
+
+    #[test]
+    fn tags_coerce_scalars_but_reject_nested_sequence() {
+        // serde coerces a number/bool scalar to its string form…
+        let wf = Workflow::from_yaml_str(
+            "name: x\ntags: [2024, true]\nsteps:\n  - id: a\n    run: ./x.sh\n",
+        )
+        .unwrap();
+        assert_eq!(wf.tags, ["2024", "true"]);
+        // …but a nested sequence is not a string scalar — a hard parse error (documents the boundary).
+        assert!(
+            Workflow::from_yaml_str("name: x\ntags: [[]]\nsteps:\n  - id: a\n    run: ./x.sh\n")
+                .is_err()
+        );
+    }
 }
