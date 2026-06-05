@@ -1,0 +1,108 @@
+# A DEEP, whole-codebase review as an Odin workflow: fan four dimension reviewers out in parallel
+# (each in its own isolated `scratch` worktree), then a cross-provider lead reviewer synthesizes
+# them into one ranked report written to an absolute path. The simplest dogfood of Odin's
+# parallel-agents + DAG + multi-provider orchestration on a real repo.
+#
+#   odin validate examples/deep-review.yaml
+#   odin run examples/deep-review.yaml --repo ../tui-bridge --no-store \
+#     --param out="$PWD/../tui-bridge/REVIEW.md"
+#
+# `durable: false` + `--no-store` keeps it a stateless one-shot. Every run executes in throwaway
+# worktrees, so the report MUST be written to an ABSOLUTE `out` path to survive teardown. Running it
+# needs the agent CLIs the provider steps name (claude/codex/copilot) on PATH and authenticated.
+# Swap any provider below to taste — the structure is provider-agnostic.
+
+schema_version: "1.0"
+name: deep-review
+description: Deep multi-dimension codebase review by parallel agents, synthesized into a ranked markdown report at an absolute path.
+tags: [review, template]
+durable: false
+
+workspace:
+  type: worktree
+
+# The four dimension reviewers are `scratch` (isolated worktrees), so they run concurrently.
+max_parallel: 4
+
+params:
+  out:
+    type: string
+    required: true # ABSOLUTE path for the report (written outside the throwaway worktree)
+
+steps:
+  - id: review_correctness
+    provider: claude
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for CORRECTNESS & BUGS. Read the code — start from the entry
+      points and follow the main runtime flows. Find logic errors, off-by-one / overflow mistakes,
+      wrong state transitions, and mishandled edge cases (empty/huge/hostile input, resize,
+      non-UTF-8 bytes, races between observed and observer).
+      For each finding give: a one-line title, severity (high/medium/low), `file:line`, a short
+      code quote, the concrete impact (what breaks, when), and a fix. Cite real `file:line`s only.
+      Output ONLY a markdown list of findings — no preamble. If you find none, write "_none_".
+
+  - id: review_robustness
+    provider: codex
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for ERROR HANDLING & ROBUSTNESS. Find panics / unwraps /
+      expects on fallible paths, resource and child-process lifecycle bugs (leaks, missing cleanup,
+      EOF / closed-pipe handling), partial reads/writes, missing or unbounded timeouts, and what
+      happens when an input is hostile or a subprocess exits or hangs.
+      For each finding give: a one-line title, severity, `file:line`, a short code quote, the
+      concrete impact, and a fix. Output ONLY a markdown list of findings. If none, write "_none_".
+
+  - id: review_concurrency
+    provider: claude
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for CONCURRENCY & ASYNC correctness. Find data races,
+      deadlocks, locks held across await points, blocking calls on an async runtime, unsound shared
+      state, serial bottlenecks that defeat concurrent use, and signal / shutdown handling gaps.
+      For each finding give: a one-line title, severity, `file:line`, a short code quote, the
+      concrete impact, and a fix. Output ONLY a markdown list of findings. If none, write "_none_".
+
+  - id: review_security
+    provider: claude
+    scratch: true
+    prompt: |
+      Review THIS ENTIRE REPOSITORY for SECURITY. Consider command / argument injection, path
+      traversal, trust and authentication boundaries (any network/IPC control channel), input
+      validation, `unsafe`, and secret / sensitive-data handling. State the attacker model for each
+      issue (who can reach it and what they gain).
+      For each finding give: a one-line title, severity, `file:line`, a short code quote, the
+      concrete impact, and a fix. Output ONLY a markdown list of findings. If none, write "_none_".
+
+  - id: synthesize
+    provider: claude # the cross-provider lead reviewer — reads all three providers' reviews
+    depends_on: [review_correctness, review_robustness, review_concurrency, review_security]
+    prompt: |
+      You are the lead reviewer. Combine the four dimension reviews below into ONE deep review
+      report. Deduplicate overlapping findings (collapse a shared root cause into a single item),
+      rank everything by real-world impact (severity × likelihood) as **P0 / P1 / P2** — each with
+      `file:line` and a concrete fix — call out what is genuinely GOOD about the codebase (don't
+      only list problems), give an honest overall health assessment, and end with a prioritized
+      next-steps list. Output ONLY GitHub-flavored markdown.
+
+      === CORRECTNESS (claude) ===
+      {{ steps.review_correctness.outputs.stdout }}
+
+      === ROBUSTNESS (codex) ===
+      {{ steps.review_robustness.outputs.stdout }}
+
+      === CONCURRENCY (claude) ===
+      {{ steps.review_concurrency.outputs.stdout }}
+
+      === SECURITY (claude) ===
+      {{ steps.review_security.outputs.stdout }}
+
+  - id: report
+    depends_on: [synthesize]
+    # Quoted heredoc blocks shell expansion of the rendered report (never interpolate agent output
+    # into a shell command unquoted); the long random sentinel makes an early close implausible, and
+    # `out` is absolute so the file outlives the worktree.
+    run: |
+      cat > {{ params.out }} <<'ODIN_DEEP_REVIEW_EOF_7b3e9c1a8f24d05e'
+      {{ steps.synthesize.outputs.stdout }}
+      ODIN_DEEP_REVIEW_EOF_7b3e9c1a8f24d05e
