@@ -9,6 +9,7 @@ schema_version: "1.0"
 name: nightly-maintenance
 version: "1.0.0"
 description: Nightly dependency refresh — update, verify, summarize, and open a PR.
+tags: [maintenance]
 durable: true # checkpointed & crash-resumable
 
 workspace:

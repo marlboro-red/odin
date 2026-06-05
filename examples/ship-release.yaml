@@ -15,6 +15,7 @@
 schema_version: "1.0"
 name: ship-release
 description: Build, verify, and tag a release from a clean re-cloned checkout.
+tags: [release]
 durable: false # fast & fire-and-forget; no crash-resume, so a slot_pool here is caveat-free
 
 workspace:

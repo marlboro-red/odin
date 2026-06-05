@@ -12,13 +12,28 @@ use odin_core::Workflow;
 
 use crate::catalog;
 
-/// `odin recipe list` — list the recipes in the catalog (name + description), or as JSON.
-pub(crate) fn list(recipes_dir: Option<&Path>, json: bool) -> anyhow::Result<ExitCode> {
+/// `odin recipe list [--tag <T>]` — list the recipes in the catalog (name + description + tags),
+/// optionally filtered to those carrying `<T>`, or as JSON.
+pub(crate) fn list(
+    recipes_dir: Option<&Path>,
+    tag: Option<&str>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
     let dir = catalog::dir(recipes_dir)?;
-    let recipes = catalog::list(&dir)?;
+    let all = catalog::list(&dir)?;
+    // Tags are normalized to lowercase by the IR, so match against a lowercased filter.
+    let tag_lc = tag.map(str::to_ascii_lowercase);
+    let shown: Vec<&catalog::Recipe> = all
+        .iter()
+        .filter(|r| {
+            tag_lc
+                .as_ref()
+                .is_none_or(|t| r.tags.iter().any(|rt| rt == t))
+        })
+        .collect();
 
     if json {
-        let arr: Vec<_> = recipes
+        let arr: Vec<_> = shown
             .iter()
             .map(|r| {
                 serde_json::json!({
@@ -26,6 +41,7 @@ pub(crate) fn list(recipes_dir: Option<&Path>, json: bool) -> anyhow::Result<Exi
                     "path": r.path,
                     "workflow_name": r.workflow_name,
                     "description": r.description,
+                    "tags": r.tags,
                 })
             })
             .collect();
@@ -33,24 +49,42 @@ pub(crate) fn list(recipes_dir: Option<&Path>, json: bool) -> anyhow::Result<Exi
         return Ok(ExitCode::SUCCESS);
     }
 
-    if recipes.is_empty() {
+    print_human_list(&dir, all.is_empty(), &shown, tag);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Renders the human (non-JSON) recipe listing: the empty-catalog hint, the no-match-for-`--tag`
+/// line, or a name/description/tags table over `shown`.
+fn print_human_list(dir: &Path, all_empty: bool, shown: &[&catalog::Recipe], tag: Option<&str>) {
+    if all_empty {
         println!("no recipes in {}", dir.display());
         println!(
             "  run `odin recipe init` to add the bundled starters, or `odin recipe add <file>`."
         );
-        return Ok(ExitCode::SUCCESS);
+        return;
     }
-
+    if shown.is_empty() {
+        println!(
+            "no recipes tagged {:?} in {}",
+            tag.unwrap_or(""),
+            dir.display()
+        );
+        return;
+    }
     println!("recipes in {}:\n", dir.display());
-    let width = recipes.iter().map(|r| r.name.len()).max().unwrap_or(0);
-    for r in &recipes {
+    let width = shown.iter().map(|r| r.name.len()).max().unwrap_or(0);
+    for r in shown {
+        let tags = if r.tags.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", r.tags.join(", "))
+        };
         match (&r.workflow_name, &r.description) {
             (None, _) => println!("  {:<width$}  (does not parse as a workflow)", r.name),
-            (Some(_), Some(desc)) => println!("  {:<width$}  {desc}", r.name),
-            (Some(_), None) => println!("  {:<width$}", r.name),
+            (Some(_), Some(desc)) => println!("  {:<width$}  {desc}{tags}", r.name),
+            (Some(_), None) => println!("  {:<width$}{tags}", r.name),
         }
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 /// `odin recipe init` — seed the catalog with the bundled starter recipes. Existing recipes are
