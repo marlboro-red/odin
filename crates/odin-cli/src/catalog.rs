@@ -134,6 +134,9 @@ pub(crate) struct Recipe {
     pub path: PathBuf,
     pub workflow_name: Option<String>,
     pub description: Option<String>,
+    /// The workflow's normalized `tags` (already trimmed/lowercased by the IR), empty if none or
+    /// if the file does not parse.
+    pub tags: Vec<String>,
 }
 
 /// A recipe name must be a single, plain path component — never a separator, `.`/`..`, or empty —
@@ -221,15 +224,16 @@ pub(crate) fn list(dir: &Path) -> anyhow::Result<Vec<Recipe>> {
                 .and_then(|s| s.to_str())
                 .unwrap_or_default()
                 .to_owned();
-            let (workflow_name, description) = match Workflow::from_yaml_path(&path) {
-                Ok(wf) => (Some(wf.name.to_string()), wf.description),
-                Err(_) => (None, None),
+            let (workflow_name, description, tags) = match Workflow::from_yaml_path(&path) {
+                Ok(wf) => (Some(wf.name.to_string()), wf.description, wf.tags),
+                Err(_) => (None, None, Vec::new()),
             };
             Recipe {
                 name,
                 path,
                 workflow_name,
                 description,
+                tags,
             }
         })
         .collect())
@@ -305,6 +309,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert!(list(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_reads_normalized_tags() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "tagged.yaml",
+            "name: t\ntags: [Review, CI]\nsteps:\n  - id: s\n    run: \"echo hi\"\n",
+        );
+        write(tmp.path(), "untagged.yaml", WF);
+        let got = list(tmp.path()).unwrap();
+        let tagged = got.iter().find(|r| r.name == "tagged").unwrap();
+        assert_eq!(tagged.tags, ["review", "ci"]); // IR-normalized to lowercase
+        let untagged = got.iter().find(|r| r.name == "untagged").unwrap();
+        assert!(untagged.tags.is_empty());
     }
 
     #[test]

@@ -22,6 +22,7 @@
 schema_version: "1.0"
 name: adversarial-review
 description: Fan adversarial reviewers over a PR diff, synthesize a verdict, and post it on approval.
+tags: [review, ci]
 durable: true # the approval gate is persisted + resumed from the store (ODIN032)
 
 workspace:

@@ -229,8 +229,11 @@ struct RecipeCmd {
 
 #[derive(Subcommand)]
 enum RecipeSub {
-    /// List the recipes in the catalog (name + description).
+    /// List the recipes in the catalog (name + description + tags).
     List {
+        /// Only list recipes carrying this tag (case-insensitive).
+        #[arg(long, value_name = "TAG")]
+        tag: Option<String>,
         /// Override the catalog directory (else `$ODIN_RECIPES_DIR`, else the platform default).
         #[arg(long, value_name = "DIR")]
         recipes_dir: Option<PathBuf>,
@@ -277,6 +280,26 @@ enum RecipeSub {
         #[arg(long, value_name = "DIR")]
         recipes_dir: Option<PathBuf>,
     },
+}
+
+/// Dispatches an `odin recipe <SUBCOMMAND>` to its handler.
+fn dispatch_recipe(sub: RecipeSub) -> anyhow::Result<ExitCode> {
+    match sub {
+        RecipeSub::List {
+            tag,
+            recipes_dir,
+            json,
+        } => cmd::recipe::list(recipes_dir.as_deref(), tag.as_deref(), json),
+        RecipeSub::Init { recipes_dir, force } => cmd::recipe::init(recipes_dir.as_deref(), force),
+        RecipeSub::Add {
+            file,
+            as_name,
+            recipes_dir,
+            force,
+        } => cmd::recipe::add(&file, as_name.as_deref(), force, recipes_dir.as_deref()),
+        RecipeSub::Show { name, recipes_dir } => cmd::recipe::show(&name, recipes_dir.as_deref()),
+        RecipeSub::Path { name, recipes_dir } => cmd::recipe::path(&name, recipes_dir.as_deref()),
+    }
 }
 
 /// Maps a command result to a process exit code, printing any error.
@@ -356,26 +379,7 @@ fn main() -> ExitCode {
         Command::Approve(c) => finish(cmd::approval::approve(c.into())),
         Command::Reject(c) => finish(cmd::approval::reject(c.into())),
         Command::Prune(c) => finish(cmd::prune::run(c.into())),
-        Command::Recipe(c) => finish(match c.command {
-            RecipeSub::List { recipes_dir, json } => {
-                cmd::recipe::list(recipes_dir.as_deref(), json)
-            }
-            RecipeSub::Init { recipes_dir, force } => {
-                cmd::recipe::init(recipes_dir.as_deref(), force)
-            }
-            RecipeSub::Add {
-                file,
-                as_name,
-                recipes_dir,
-                force,
-            } => cmd::recipe::add(&file, as_name.as_deref(), force, recipes_dir.as_deref()),
-            RecipeSub::Show { name, recipes_dir } => {
-                cmd::recipe::show(&name, recipes_dir.as_deref())
-            }
-            RecipeSub::Path { name, recipes_dir } => {
-                cmd::recipe::path(&name, recipes_dir.as_deref())
-            }
-        }),
+        Command::Recipe(c) => finish(dispatch_recipe(c.command)),
         Command::Status {
             repo,
             db,

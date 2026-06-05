@@ -11,6 +11,7 @@
 
 name: local-review
 description: Review one PR's diff with Claude and write a markdown report to an absolute path.
+tags: [review]
 durable: false
 
 workspace:
