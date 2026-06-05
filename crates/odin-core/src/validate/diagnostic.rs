@@ -143,6 +143,10 @@ pub enum DiagCode {
     /// in-memory, so a run resumed after a restart may execute against a slot the fresh pool no
     /// longer knows is leased; prefer `worktree` for durable + bounded concurrency (warning).
     SlotPoolNotDurable,
+    /// ODIN045 — a `tags:` entry was malformed: empty after trimming (dropped), a case/whitespace
+    /// duplicate of an earlier tag (collapsed), or carrying characters outside `[a-z0-9._-]`
+    /// (kept, but may need shell-quoting on `--tag`). Tags never block a run (warning).
+    MalformedTag,
 }
 
 impl DiagCode {
@@ -194,6 +198,7 @@ impl DiagCode {
             DiagCode::LoopInertChecks => "ODIN042",
             DiagCode::LoopBodyScratch => "ODIN043",
             DiagCode::SlotPoolNotDurable => "ODIN044",
+            DiagCode::MalformedTag => "ODIN045",
         }
     }
 
@@ -213,7 +218,8 @@ impl DiagCode {
             | DiagCode::TriggerIntoShell
             | DiagCode::CaseInertChecks
             | DiagCode::LoopInertChecks
-            | DiagCode::SlotPoolNotDurable => Severity::Warning,
+            | DiagCode::SlotPoolNotDurable
+            | DiagCode::MalformedTag => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -409,13 +415,21 @@ mod tests {
             DiagCode::LoopInertChecks,
             DiagCode::LoopBodyScratch,
             DiagCode::SlotPoolNotDurable,
+            DiagCode::MalformedTag,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 44);
+        assert_eq!(seen.len(), 45);
+    }
+
+    #[test]
+    fn malformed_tag_is_a_warning_never_blocks() {
+        // The severity arm is NOT compile-enforced (the `_ => Error` catch-all), so guard it:
+        // a tag is metadata and a malformed one must never fail a run.
+        assert_eq!(DiagCode::MalformedTag.severity(), Severity::Warning);
     }
 
     #[test]

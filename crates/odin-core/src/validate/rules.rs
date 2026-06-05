@@ -753,6 +753,7 @@ pub(crate) fn root_unknown_fields(src: &str, d: &mut Vec<Diagnostic>) {
         "name",
         "version",
         "description",
+        "tags",
         "durable",
         "workspace",
         "triggers",
@@ -778,7 +779,73 @@ pub(crate) fn root_unknown_fields(src: &str, d: &mut Vec<Diagnostic>) {
     }
 }
 
+/// ODIN045 — warn about malformed workflow tags (never blocks a run).
+///
+/// Tags are normalized on parse (trim + lowercase + drop-empty + dedupe), so the typed
+/// [`Workflow`] no longer shows what was fixed. This re-reads the raw `tags:` sequence from
+/// source — like [`root_unknown_fields`] — and warns when a tag was **dropped** (empty after
+/// trim), **collapsed** (a case/whitespace duplicate of an earlier one), or carries characters
+/// outside the slug charset `[a-z0-9._-]` (kept, but odd characters may need shell-quoting on
+/// `--tag`). The message names the original token so the author can find it.
+pub(crate) fn tags(src: &str, d: &mut Vec<Diagnostic>) {
+    let Ok(val) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(src) else {
+        return;
+    };
+    let Some(seq) = val
+        .as_mapping()
+        .and_then(|m| m.get("tags"))
+        .and_then(serde_yaml_ng::Value::as_sequence)
+    else {
+        return;
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for (i, item) in seq.iter().enumerate() {
+        // Mirror serde's scalar coercion: a non-string scalar (number/bool) deserializes via its
+        // string form, so read the same way rather than skipping it.
+        let Some(raw) = scalar_str(item) else {
+            continue;
+        };
+        let norm = raw.trim().to_ascii_lowercase();
+        let ptr = format!("tags[{i}]");
+        if norm.is_empty() {
+            d.push(Diagnostic::new(
+                DiagCode::MalformedTag,
+                ptr,
+                format!("tag {raw:?} is empty after trimming and was dropped"),
+            ));
+        } else if seen.contains(&norm) {
+            d.push(Diagnostic::new(
+                DiagCode::MalformedTag,
+                ptr,
+                format!("tag {raw:?} duplicates an earlier tag ({norm:?}) and was collapsed"),
+            ));
+        } else {
+            if !norm.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            }) {
+                d.push(Diagnostic::new(
+                    DiagCode::MalformedTag,
+                    ptr,
+                    format!("tag {raw:?} has characters outside [a-z0-9._-] (kept, but may need shell-quoting on --tag)"),
+                ));
+            }
+            seen.push(norm);
+        }
+    }
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// The string form of a YAML scalar (string, number, or bool), matching how serde coerces a
+/// non-string scalar into `Vec<String>`. Returns `None` for a non-scalar (e.g. a nested sequence).
+fn scalar_str(v: &serde_yaml_ng::Value) -> Option<String> {
+    match v {
+        serde_yaml_ng::Value::String(s) => Some(s.clone()),
+        serde_yaml_ng::Value::Bool(b) => Some(b.to_string()),
+        serde_yaml_ng::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
 
 fn is_valid_id(s: &str) -> bool {
     let mut chars = s.chars();
