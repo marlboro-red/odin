@@ -6,6 +6,7 @@
 
 mod catalog;
 mod cmd;
+mod scaffold;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -242,16 +243,28 @@ enum RecipeSub {
         json: bool,
     },
     /// Scaffold a new workflow file from an existing recipe, bundled starter, or file.
+    ///
+    /// If the source declares a `# odin:template` header, fill its `@@VAR@@` placeholders with
+    /// `--set name=value` (defaults apply for the rest).
     New {
         /// The name for the new recipe (becomes its `name:` and the default filename stem).
         name: String,
         /// The source to copy from: a recipe name, a bundled starter name, or a file path.
         #[arg(long, value_name = "SOURCE")]
         from: String,
+        /// Fill a template variable (repeatable): `--set key=value`.
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
         /// Write here — a `.yaml`/`.yml` file, or a directory. Default: `./<name>.yaml`.
-        #[arg(long, short = 'o', value_name = "PATH")]
+        #[arg(long, short = 'o', value_name = "PATH", conflicts_with_all = ["catalog", "stdout"])]
         out: Option<PathBuf>,
-        /// Override the catalog directory used to resolve `--from`.
+        /// Install into the recipe catalog as `<name>` (then `odin run <name>`).
+        #[arg(long, conflicts_with = "stdout")]
+        catalog: bool,
+        /// Print the rendered workflow to stdout instead of writing a file.
+        #[arg(long)]
+        stdout: bool,
+        /// Override the catalog directory used to resolve `--from` (and `--catalog`).
         #[arg(long, value_name = "DIR")]
         recipes_dir: Option<PathBuf>,
         /// Overwrite the destination if it already exists.
@@ -310,10 +323,22 @@ fn dispatch_recipe(sub: RecipeSub) -> anyhow::Result<ExitCode> {
         RecipeSub::New {
             name,
             from,
+            set,
             out,
+            catalog,
+            stdout,
             recipes_dir,
             force,
-        } => cmd::recipe::new(&name, &from, out.as_deref(), force, recipes_dir.as_deref()),
+        } => cmd::recipe::new(&cmd::recipe::NewArgs {
+            name,
+            from,
+            set,
+            out,
+            catalog,
+            stdout,
+            recipes_dir,
+            force,
+        }),
         RecipeSub::Init { recipes_dir, force } => cmd::recipe::init(recipes_dir.as_deref(), force),
         RecipeSub::Add {
             file,

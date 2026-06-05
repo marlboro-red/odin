@@ -131,3 +131,141 @@ fn new_rejects_a_non_plain_name() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("invalid recipe name"));
 }
+
+const TEMPLATE: &str = concat!(
+    "# odin:template\n",
+    "#   provider: { default: claude }\n",
+    "#   base_branch: { required: true }\n",
+    "# end\n",
+    "name: tpl-src\n",
+    "description: a parameterized template\n",
+    "steps:\n",
+    "  - id: r\n",
+    "    run: \"git diff @@base_branch@@...HEAD\"\n",
+    "  - id: p\n",
+    "    provider: @@provider@@\n",
+    "    prompt: hi\n",
+    "    depends_on: [r]\n",
+);
+
+fn write_template(cwd: &Path) -> std::path::PathBuf {
+    let tpl = cwd.join("tpl.yaml");
+    std::fs::write(&tpl, TEMPLATE).unwrap();
+    tpl
+}
+
+#[test]
+fn new_fills_a_template_with_set_and_defaults() {
+    let cwd = tempfile::tempdir().unwrap();
+    let rc = tempfile::tempdir().unwrap();
+    let tpl = write_template(cwd.path());
+    let out = odin_in(
+        cwd.path(),
+        rc.path(),
+        &[
+            "recipe",
+            "new",
+            "filled",
+            "--from",
+            tpl.to_str().unwrap(),
+            "--set",
+            "base_branch=develop",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let written = std::fs::read_to_string(cwd.path().join("filled.yaml")).unwrap();
+    assert!(written.contains("name: filled"), "got:\n{written}");
+    assert!(
+        written.contains("git diff develop...HEAD"),
+        "--set not applied:\n{written}"
+    );
+    assert!(
+        written.contains("provider: claude"),
+        "default not applied:\n{written}"
+    );
+    assert!(
+        !written.contains("# odin:template"),
+        "header not stripped:\n{written}"
+    );
+    assert!(!written.contains("@@"), "markers remain:\n{written}");
+}
+
+#[test]
+fn new_template_missing_required_errors() {
+    let cwd = tempfile::tempdir().unwrap();
+    let rc = tempfile::tempdir().unwrap();
+    let tpl = write_template(cwd.path());
+    let out = odin_in(
+        cwd.path(),
+        rc.path(),
+        &["recipe", "new", "x", "--from", tpl.to_str().unwrap()],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing required"));
+}
+
+#[test]
+fn new_set_on_a_non_template_source_errors() {
+    let cwd = tempfile::tempdir().unwrap();
+    let rc = tempfile::tempdir().unwrap();
+    // `iterate` is a plain starter (no `# odin:template` header).
+    let out = odin_in(
+        cwd.path(),
+        rc.path(),
+        &["recipe", "new", "x", "--from", "iterate", "--set", "a=b"],
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("declares no template variables"));
+}
+
+#[test]
+fn new_stdout_prints_and_writes_no_file() {
+    let cwd = tempfile::tempdir().unwrap();
+    let rc = tempfile::tempdir().unwrap();
+    let out = odin_in(
+        cwd.path(),
+        rc.path(),
+        &["recipe", "new", "piped", "--from", "iterate", "--stdout"],
+    );
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("name: piped"));
+    assert!(
+        !cwd.path().join("piped.yaml").exists(),
+        "--stdout must not write a file"
+    );
+}
+
+#[test]
+fn new_catalog_installs_runnable_by_name() {
+    let cwd = tempfile::tempdir().unwrap();
+    let rc = tempfile::tempdir().unwrap();
+    let made = odin_in(
+        cwd.path(),
+        rc.path(),
+        &[
+            "recipe",
+            "new",
+            "installed",
+            "--from",
+            "iterate",
+            "--catalog",
+        ],
+    );
+    assert!(
+        made.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    // It now resolves in the catalog.
+    let path = odin_in(cwd.path(), rc.path(), &["recipe", "path", "installed"]);
+    assert!(path.status.success());
+    assert!(String::from_utf8_lossy(&path.stdout).contains("installed.yaml"));
+}

@@ -324,8 +324,9 @@ The catalog starts empty. `odin recipe init` seeds it with the bundled starter r
 
 | Subcommand | Meaning |
 |------------|---------|
-| `recipe list [--json]` | List the catalog: each recipe's name and `description:` (unparseable files are listed but flagged). |
+| `recipe list [--tag <T>] [--json]` | List the catalog: each recipe's name, `description:`, and tags (`--tag` filters; unparseable files are listed but flagged). |
 | `recipe init [--force]` | Write the bundled starters into the catalog, skipping ones already present (`--force` overwrites). Safe to re-run. |
+| `recipe new <NAME> --from <SRC> [--set k=v]…` | Scaffold a new workflow from a recipe/starter/file, optionally filling `@@VAR@@` template variables. Writes `./<NAME>.yaml`, or `--out <PATH>` / `--catalog` / `--stdout`. See [templating](recipe-templating.md). |
 | `recipe add <FILE> [--as <NAME>] [--force]` | Copy a workflow file into the catalog under its stem (or `--as <NAME>`). Validates it first; won't overwrite without `--force`. |
 | `recipe show <NAME>` | Print the recipe's YAML to stdout (provenance to stderr, so the output pipes cleanly). |
 | `recipe path <NAME>` | Print the recipe's resolved filesystem path (for scripting). |
