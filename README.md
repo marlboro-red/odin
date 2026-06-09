@@ -1,78 +1,76 @@
 # Odin
 
-**A durable, library-first workflow engine that orchestrates autonomous coding-agent
-CLIs** — Claude Code, OpenAI Codex, and the GitHub Copilot CLI — to perform
-software-engineering work without supervision.
+**Get a deeper code review than any single agent can give.** Odin fans a panel of coding agents
+out over your repo or PR — *in parallel, across providers (Claude Code, Codex, Copilot CLI)* — and
+synthesizes them with a cross-provider judge into one ranked report. It's built on a durable,
+crash-resumable workflow engine, so the same machinery also drives unattended issue→PR work on cron
+and GitHub webhooks.
 
-You describe a workflow in YAML (with code-hook escape hatches), pin a provider per
-step, and Odin runs it: planning, implementing, self-reviewing, and opening a PR — with
-every step checkpointed so a crashed run resumes where it left off.
+The sharpest thing it does today: a second opinion that a single `claude` call or a GitHub Action
+can't — several reviewers, each in its own isolated worktree, on different models, reconciled by a
+judge.
 
-> **Status: runs end-to-end, on a schedule and on events, in parallel.** The workflow IR,
-> the full validator (44 diagnostics), the templating/context model, the five integration
-> traits, the durable SQLite store, the worktree + slot-pool workspaces, all three provider
-> adapters (Claude / Codex / Copilot), the built-in actions (`shell.exec`, `git.commit`,
-> `git.push`, `github.open_pr`), LLM-as-judge + retry, the concurrent executor
-> (`max_parallel` + isolated `scratch:` steps for multi-agent fan-out), durable crash-resume
-> with per-step git snapshots, the `odin` CLI (`validate` / `run` / `list` / `show` / `logs`),
-> and the `odind` daemon — cron schedules *and* signed GitHub webhooks, with concurrent run
-> dispatch — are all implemented, tested, and documented. Refinements still open: codex/copilot
-> dollar-cost reporting (token usage is parsed) and provider routing/fallback.
+## See it in 30 seconds
 
-## Quickstart
+No agent CLI or authentication required — `--mock` makes the provider steps echo their prompts so
+the whole pipeline runs offline:
 
 ```sh
-# Build the workspace (Rust 1.85+, edition 2024).
-cargo build
+cargo build                                            # Rust 1.85+, edition 2024
 
-# Validate a workflow — reports every problem in one pass, with "did you mean" hints.
-cargo run -p odin-cli -- validate examples/issue-to-pr.yaml
-# ✓ examples/issue-to-pr.yaml is valid
+# Zero-dependency hello-world — watch the engine provision a worktree and walk a DAG:
+cargo run -p odin-cli -- run examples/quickstart.yaml --repo . --no-store
 
-# Machine-readable diagnostics:
-cargo run -p odin-cli -- validate --json examples/fix-flaky-test.yaml
-
-# Run a workflow against a git repo (provisions a worktree, checkpoints to SQLite).
-# Steps using `run:` execute for free; `provider:` steps invoke the real agent CLI.
-cargo run -p odin-cli -- run path/to/workflow.yaml --repo . --param issue_url=https://...
-
-# Serve a directory of workflows on their cron schedules + GitHub webhooks (resumes
-# crashed runs on start). The webhook server starts only if a workflow declares one.
-ODIN_WEBHOOK_SECRET=… cargo run -p odin-daemon -- \
-  --workflows examples --repo . --webhook-addr 127.0.0.1:9292
+# The wedge — a parallel, cross-provider, judged review of THIS repo, written to REVIEW.md
+# (offline via --mock; drop it once the agent CLIs are installed for a real review):
+cargo run -p odin-cli -- run examples/deep-review.yaml --repo . --no-store --mock \
+  --param out="$PWD/REVIEW.md"
 ```
 
-## A workflow at a glance
+[`examples/deep-review.yaml`](examples/deep-review.yaml) is four concurrent `scratch:` reviewers
+(correctness / robustness / concurrency / security) → a cross-provider lead reviewer that
+synthesizes a ranked P0/P1/P2 report. [`-codex`](examples/deep-review-codex.yaml) swaps the judge;
+[`branching-review.yaml`](examples/branching-review.yaml) classifies the codebase's top concern and
+deep-dives *only that one* via a `case:` branch.
+
+## Prerequisites
+
+- **Build:** Rust 1.85+ (`cargo build`). *(No prebuilt binaries yet — build from source.)*
+- **A git repo** to run against (`--repo .`).
+- **Agent CLIs** for `provider:` steps — whichever you reference: `claude` (Claude Code),
+  `codex` (OpenAI Codex), `copilot` (GitHub Copilot CLI) — installed, on `PATH`, and
+  **authenticated**. Or run with **`--mock`** to skip them entirely.
+- **`gh`** (authenticated) to read/post on PRs — the `repo` scope for the PR-opening / commenting
+  flows (`issue-to-pr`, `adversarial-review`); read-only for `local-review` (it only diffs a PR).
+
+## It's also a general workflow engine
+
+Review is the wedge, not the whole tool. The same engine runs durable, unattended software work —
+plan → implement → self-review → open a PR — checkpointed so a crashed run resumes where it left
+off, served on cron schedules and signed GitHub webhooks by the `odind` daemon:
 
 ```yaml
 name: issue-to-pr
 durable: true                      # checkpointed & crash-resumable
 workspace: { type: worktree }      # or { type: slot_pool, pool: 4 }
-
 params:
   issue_url: { type: string, required: true }
-
 steps:
-  - id: plan                       # provider step
+  - id: plan
     provider: claude
     prompt: "Read {{ params.issue_url }} and write a plan to plan.md."
     artifacts: { produces: [PLAN] }
-
   - id: implement                  # gated on a green build + tests
     provider: codex
     prompt: "Implement the plan in PLAN."
     depends_on: [plan]
     artifacts: { requires: [PLAN] }
-    gates:
-      build: "cargo build --workspace"
-      test:  "cargo test --workspace"
-
+    gates: { build: "cargo build --workspace", test: "cargo test --workspace" }
   - id: review                     # judged by a *different* provider
     provider: claude
     prompt: "Review this diff:\n{{ artifacts.DIFF }}"
     depends_on: [implement]
     judge: { provider: codex, criteria: "Implements PLAN, no regressions.", threshold: 0.7 }
-
   - id: open_pr                    # built-in action, runs only if review passed
     action: github.open_pr
     with: { title: "Implement {{ params.issue_url }}" }
@@ -80,78 +78,76 @@ steps:
     when: "steps.review.status == 'passed'"
 ```
 
-The snippet above is **abridged** — the full file adds `git.commit` + `git.push` steps before
-`open_pr`. See [`examples/`](examples/) for the fully-annotated workflows:
-[`issue-to-pr.yaml`](examples/issue-to-pr.yaml) (the canonical flow, six steps),
-[`fix-flaky-test.yaml`](examples/fix-flaky-test.yaml) (a kitchen-sink of step/trigger kinds),
-[`nightly-maintenance.yaml`](examples/nightly-maintenance.yaml) (cron-served),
-[`multi-agent-eval.yaml`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out),
-[`gated-deploy.yaml`](examples/gated-deploy.yaml) (a human `approval:` gate),
-[`self-correct.yaml`](examples/self-correct.yaml) (single-step `retry` with feedback),
-[`iterate.yaml`](examples/iterate.yaml) (a multi-step `loop:` until a check passes),
-[`triage.yaml`](examples/triage.yaml) (`case:` branching with a merge-back),
-[`ship-release.yaml`](examples/ship-release.yaml) (a `slot_pool` with `reset: reclone`, a `bool` param, and `shell.exec`),
-[`loop-with-case.yaml`](examples/loop-with-case.yaml) (a `case:` selector nested inside a `loop:`), and
-[`adversarial-review.yaml`](examples/adversarial-review.yaml) (**Odin reviewing its own PRs** — webhook-triggered, parallel reviewers, judge, approval gate), and
-[`local-review.yaml`](examples/local-review.yaml) (a one-shot local PR review → markdown report).
+Run a directory of workflows on their triggers (the webhook server starts only if a workflow
+declares one):
 
-## Why "library-first"?
+```sh
+ODIN_WEBHOOK_SECRET=… cargo run -p odin-daemon -- \
+  --workflows examples --repo . --webhook-addr 127.0.0.1:9292
+```
 
-The engine is the [`odin-core`](crates/odin-core) crate; the `odin` CLI and the `odind`
-daemon are thin runners on top. Everything you need to embed Odin in another program
-lives in the library:
+Workflows can also be kept in a **recipe catalog** and run by name (`odin recipe init`, then
+`odin run deep-review …`). See [`examples/`](examples/) for the fully-annotated set:
+[`quickstart`](examples/quickstart.yaml) (zero-dep hello-world),
+[`deep-review`](examples/deep-review.yaml) / [`-codex`](examples/deep-review-codex.yaml) /
+[`branching-review`](examples/branching-review.yaml) (the review wedge),
+[`issue-to-pr`](examples/issue-to-pr.yaml) (the canonical PR flow),
+[`fix-flaky-test`](examples/fix-flaky-test.yaml) (a kitchen-sink of step/trigger kinds),
+[`nightly-maintenance`](examples/nightly-maintenance.yaml) (cron-served),
+[`multi-agent-eval`](examples/multi-agent-eval.yaml) (parallel `scratch:` fan-out),
+[`gated-deploy`](examples/gated-deploy.yaml) (a human `approval:` gate),
+[`self-correct`](examples/self-correct.yaml) (`retry` with feedback),
+[`iterate`](examples/iterate.yaml) (a `loop:` until a check passes),
+[`triage`](examples/triage.yaml) (`case:` branching),
+[`ship-release`](examples/ship-release.yaml) (a `slot_pool` re-clone), and
+[`adversarial-review`](examples/adversarial-review.yaml) (**Odin reviewing its own PRs** —
+webhook-triggered, parallel reviewers, judge, approval gate).
 
-- **Data in** — [`RunInput`] carries the requirements: typed `params` (validated against
-  the workflow) plus a free-form `trigger_payload` for arbitrary event data.
-- **Data out** — [`RunSummary`] is plain serializable data: status, per-step results,
-  aggregate token/cost usage, and structured `side_effects` (PRs opened, branches
-  pushed) for downstream automation.
-- **Plug in your own** — five small, object-safe traits are the entire integration
-  surface. Implementing a new coding agent is one file:
+## Library-first
 
-  | Trait | Responsibility |
-  |-------|----------------|
-  | `Provider` | invoke a coding-agent CLI |
-  | `Workspace` | provision an isolated per-run working directory |
-  | `Store` | durably persist run state (crash-resume) |
-  | `Action` | perform a named side-effect (`github.open_pr`, …) |
-  | `Trigger` | emit run-starting events (manual, webhook, cron) |
+The engine is the [`odin-core`](crates/odin-core) crate; the `odin` CLI and the `odind` daemon are
+thin runners on top. Everything to embed Odin in another program lives in the library: [`RunInput`]
+carries typed `params` + a free-form `trigger_payload`; [`RunSummary`] is plain serializable data
+(status, per-step results, token/cost usage, structured `side_effects`); and **five small,
+object-safe traits are the entire integration surface** — implementing a new coding agent is one
+file.
 
-### Feature flags
-
-A parse-only embedder (a linter or an editor plugin) pays nothing for the async runtime:
-
-| Feature | Pulls in | Use it for |
-|---------|----------|------------|
-| `ir` | serde only | parse + validate workflows |
-| `templating` | minijinja | render prompts + statically check `{{ refs }}` |
-| `runtime` | tokio, async-trait, rusqlite, anyhow (+ futures) | the five traits, the registry, provider/store/workspace/action impls |
-| `mock` | (`runtime`) | in-memory test doubles (`EchoProvider`, `MemStore`, …) for downstream tests |
-| `full` *(default)* | `ir` + `templating` + `runtime` | running workflows, the CLI, the daemon |
-
-The `Engine` façade needs **both** `runtime` and `templating` (it renders prompts), so `full`
-bundles both. `mock` is opt-in and is *not* part of `full`.
+| Trait | Responsibility | | Feature | Pulls in / for |
+|-------|----------------|---|---------|----------------|
+| `Provider` | invoke a coding-agent CLI | | `ir` | serde — parse + validate |
+| `Workspace` | isolate a per-run working dir | | `templating` | minijinja — render + check `{{ refs }}` |
+| `Store` | persist run state (crash-resume) | | `runtime` | tokio/rusqlite — the traits + engine |
+| `Action` | a named side-effect (`github.open_pr`) | | `mock` | test doubles (`EchoProvider`, `MemStore`) |
+| `Trigger` | run-starting events (manual/webhook/cron) | | `full` *(default)* | `ir`+`templating`+`runtime` |
 
 ```toml
-# A linter that only parses and validates.
-# Not yet on crates.io (the `odin-core` there is an unrelated crate), so depend on git:
+# A linter that only parses + validates pays nothing for the async runtime.
+# Not yet on crates.io (the `odin-core` there is unrelated), so depend on git:
 odin-core = { git = "https://github.com/marlboro-red/odin", default-features = false, features = ["ir", "templating"] }
 ```
 
+See the [integration guide](docs/integration-guide.md) for the full embedding story.
+
 ## Documentation
 
-- [Getting started](docs/getting-started.md) — build → validate → run → serve.
-- [Workflow reference](docs/workflow-reference.md) — every YAML field and all 44 `ODIN###`
-  diagnostics.
-- [Integration guide](docs/integration-guide.md) — embed `odin-core`: the five traits,
-  `EngineBuilder`, custom plugins, data in/out, the daemon.
+- [Getting started](docs/getting-started.md) — build → validate → run → serve, the recipe catalog.
+- [Workflow reference](docs/workflow-reference.md) — every YAML field and all `ODIN###` diagnostics.
 - [`odin` CLI](docs/cli.md) and [`odind` daemon](docs/daemon.md) references.
-- [Webhook walkthrough](docs/webhook-walkthrough.md) — wire a GitHub webhook end-to-end (tunnel →
-  webhook → open-PR → review → approve → comment).
-- [Observability](docs/observability.md) — structured `tracing` logs (text/JSON), `$ODIN_LOG`
-  levels, and optional OpenTelemetry/OTLP span export.
-- [Architecture](docs/architecture.md) — the layered design and data-flow contracts.
+- [Webhook walkthrough](docs/webhook-walkthrough.md) — wire a GitHub webhook end-to-end.
+- [Scaffolding & templating](docs/recipe-templating.md) · [Integration guide](docs/integration-guide.md) · [Observability](docs/observability.md) · [Architecture](docs/architecture.md).
 - `cargo doc --open -p odin-core --all-features` — the API reference.
+
+## Status
+
+A capable v0.x engine, openly pre-1.0 and not yet validated by external users. Implemented, tested
+(~400 tests, clippy-pedantic, `unsafe`-forbidden), and documented: the workflow IR + full validator
+(45 diagnostics), the templating/context model, the five traits, the durable SQLite store, worktree
++ slot-pool workspaces, all three provider adapters, the built-in actions, LLM-as-judge + retry, the
+concurrent executor (`max_parallel` + `scratch:` fan-out), crash-resume with per-step git snapshots,
+`case:`/`loop:` control flow, default step timeouts + run cancellation, the recipe catalog, the
+`odin` CLI, and the `odind` daemon (cron + signed webhooks + concurrent dispatch). Known gaps:
+codex/copilot dollar-cost reporting (token usage is parsed), operator-facing cost/usage surfaces,
+and provider routing/fallback.
 
 ## Development
 
@@ -161,8 +157,7 @@ cargo clippy --workspace --all-features --all-targets   # -D warnings in CI
 cargo test --workspace --all-features                   # matches CI
 ```
 
-The workspace forbids `unsafe`, denies warnings in CI, and runs clippy at the `pedantic`
-level.
+The workspace forbids `unsafe`, denies warnings in CI, and runs clippy at the `pedantic` level.
 
 ## License
 
