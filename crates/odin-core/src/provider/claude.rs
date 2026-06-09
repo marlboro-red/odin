@@ -127,13 +127,27 @@ impl Provider for ClaudeProvider {
             return Err(ProviderError::Timeout(ctx.timeout.unwrap_or_default()));
         }
 
-        let (text, usage) = parse_result(&out.stdout);
+        let parsed = parse_result(&out.stdout);
+        let mut exit_code = out.exit_code;
+        let mut stderr = out.stderr;
+        // Claude can exit 0 while reporting `is_error: true` (max-turns, execution error). Normalize
+        // that to a non-zero exit so the engine fails the step instead of recording the error text
+        // as a successful result that flows downstream.
+        if let Some(reason) = parsed.error {
+            if exit_code == 0 {
+                exit_code = 1;
+            }
+            if !stderr.is_empty() {
+                stderr.push('\n');
+            }
+            stderr.push_str(&reason);
+        }
         Ok(InvocationOutcome {
-            exit_code: out.exit_code,
-            stdout: text,
-            stderr: out.stderr,
+            exit_code,
+            stdout: parsed.text,
+            stderr,
             outputs: IndexMap::new(),
-            usage,
+            usage: parsed.usage,
             produced: IndexMap::new(),
         })
     }
@@ -170,14 +184,27 @@ impl Provider for ClaudeProvider {
     }
 }
 
-/// Parses `claude --output-format json` output into `(result_text, usage)`.
-///
-/// Tolerant of schema drift: any parse failure or missing field falls back to the raw
-/// stdout as the result text and no usage.
+/// What Odin reads from a `claude --output-format json` document.
+struct ParsedResult {
+    text: String,
+    usage: Option<Usage>,
+    /// `Some(reason)` when claude reported `is_error: true` — even at process exit 0 (e.g.
+    /// `error_max_turns`, `error_during_execution`). The caller normalizes this to a non-zero exit
+    /// so the engine records a **failure**, not a success with a refusal/error as its output.
+    error: Option<String>,
+}
+
+/// Parses `claude --output-format json` output into [`ParsedResult`]. Tolerant of schema drift:
+/// any parse failure or missing field falls back to the raw stdout as the result text, no usage,
+/// and no error.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn parse_result(stdout: &str) -> (String, Option<Usage>) {
+fn parse_result(stdout: &str) -> ParsedResult {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
-        return (stdout.to_owned(), None);
+        return ParsedResult {
+            text: stdout.to_owned(),
+            usage: None,
+            error: None,
+        };
     };
     let text = v
         .get("result")
@@ -196,14 +223,26 @@ fn parse_result(stdout: &str) -> (String, Option<Usage>) {
         .get("total_cost_usd")
         .and_then(serde_json::Value::as_f64)
         .map_or(0, |d| (d.max(0.0) * 1_000_000.0).round() as u64);
-    (
+    let error = v
+        .get("is_error")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        .then(|| {
+            let subtype = v
+                .get("subtype")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("error");
+            format!("claude reported an error (is_error, subtype={subtype})")
+        });
+    ParsedResult {
         text,
-        Some(Usage {
+        usage: Some(Usage {
             input_tokens,
             output_tokens,
             cost_micros,
         }),
-    )
+        error,
+    }
 }
 
 #[cfg(test)]
@@ -256,19 +295,36 @@ mod tests {
     #[test]
     fn parses_json_result_and_usage() {
         let json = r#"{"type":"result","result":"all done","total_cost_usd":0.0123,"usage":{"input_tokens":100,"output_tokens":50}}"#;
-        let (text, usage) = parse_result(json);
-        assert_eq!(text, "all done");
-        let u = usage.unwrap();
+        let p = parse_result(json);
+        assert_eq!(p.text, "all done");
+        let u = p.usage.unwrap();
         assert_eq!(u.input_tokens, 100);
         assert_eq!(u.output_tokens, 50);
         assert_eq!(u.cost_micros, 12_300);
+        assert!(p.error.is_none(), "a successful result is not an error");
+    }
+
+    #[test]
+    fn is_error_result_is_surfaced_as_an_error() {
+        // claude exits 0 but reports an error (e.g. hit the turn limit) — Odin must not treat the
+        // error text as a successful result.
+        let json = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":"hit the limit","usage":{"input_tokens":10,"output_tokens":0}}"#;
+        let p = parse_result(json);
+        let reason = p.error.expect("is_error:true must surface an error reason");
+        assert!(
+            reason.contains("error_max_turns"),
+            "reason names the subtype: {reason}"
+        );
+        // usage is still captured (the call cost tokens even though it errored).
+        assert_eq!(p.usage.unwrap().input_tokens, 10);
     }
 
     #[test]
     fn falls_back_to_raw_stdout_on_non_json() {
-        let (text, usage) = parse_result("just plain text");
-        assert_eq!(text, "just plain text");
-        assert!(usage.is_none());
+        let p = parse_result("just plain text");
+        assert_eq!(p.text, "just plain text");
+        assert!(p.usage.is_none());
+        assert!(p.error.is_none());
     }
 
     /// Live smoke test against the real `claude` CLI. Double-gated so it never runs

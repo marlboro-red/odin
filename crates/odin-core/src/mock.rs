@@ -38,6 +38,60 @@ impl Provider for EchoProvider {
     }
 }
 
+/// How a [`FailingProvider`] fails — to exercise the engine's provider-failure paths, which the
+/// always-succeeding [`EchoProvider`] cannot.
+pub enum FailMode {
+    /// `invoke` returns a transport `Err` (a crashed/missing CLI, an API error).
+    Error,
+    /// `invoke` returns an `Ok` outcome with a non-zero exit code (the agent ran but reported
+    /// failure — e.g. an exit-0-but-`is_error` response normalized to non-zero).
+    Exit(i32),
+}
+
+/// A provider that always fails, in the chosen [`FailMode`] — for testing that a provider error or
+/// a non-zero exit fails the step (and its dependents), records a reason, and feeds `retry`.
+pub struct FailingProvider {
+    id: ProviderRef,
+    mode: FailMode,
+}
+
+impl FailingProvider {
+    /// A provider whose `invoke` returns a transport error.
+    pub fn error(id: impl Into<ProviderRef>) -> Self {
+        Self {
+            id: id.into(),
+            mode: FailMode::Error,
+        }
+    }
+
+    /// A provider whose `invoke` returns a non-zero-exit outcome with `code`.
+    pub fn exit(id: impl Into<ProviderRef>, code: i32) -> Self {
+        Self {
+            id: id.into(),
+            mode: FailMode::Exit(code),
+        }
+    }
+}
+
+#[async_trait]
+impl Provider for FailingProvider {
+    fn id(&self) -> ProviderRef {
+        self.id.clone()
+    }
+
+    async fn invoke(&self, _ctx: InvocationCtx) -> Result<InvocationOutcome, ProviderError> {
+        match self.mode {
+            FailMode::Error => Err(ProviderError::Exited {
+                code: 1,
+                stderr: "mock provider error".to_owned(),
+            }),
+            FailMode::Exit(code) => {
+                Ok(InvocationOutcome::failure(code).with_stderr("mock non-zero exit"))
+            }
+        }
+    }
+}
+
 /// A workspace that hands back a fixed path and never cleans up.
 pub struct TmpWorkspace(pub std::path::PathBuf);
 

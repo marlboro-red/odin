@@ -850,7 +850,7 @@ mod tests {
     use crate::api::RunInput;
     use crate::engine::{Engine, EngineBuilder};
     use crate::error::Error;
-    use crate::mock::EchoProvider;
+    use crate::mock::{EchoProvider, FailingProvider};
     use crate::storage::SqliteStore;
     use crate::traits::{AcquireCtx, LoopProgress, PrunePolicy};
     use crate::workspace::WorktreeWorkspace;
@@ -1093,6 +1093,62 @@ steps:
             StepStatus::Skipped,
             "dependent of a failed step is skipped"
         );
+    }
+
+    /// An engine over `repo` with both the `echo` provider and a `FailingProvider` registered under
+    /// `boom` — for exercising the provider-failure paths the always-succeeding echo can't reach.
+    fn engine_with_failing(
+        repo: &Path,
+        mode_provider: Arc<dyn crate::traits::Provider>,
+    ) -> Arc<dyn Engine> {
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut builder = EngineBuilder::new().repo(repo).store(store);
+        builder
+            .registry_mut()
+            .register_provider(Arc::new(EchoProvider::new("echo")))
+            .register_provider(mode_provider);
+        builder.build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_provider_error_fails_the_run_and_skips_dependents() {
+        // The provider's `invoke` returns Err (a crashed/missing CLI, an API error) — the engine
+        // must fail the step with the error surfaced, and skip its dependents.
+        let repo = init_repo().await;
+        let eng = engine_with_failing(repo.path(), Arc::new(FailingProvider::error("boom")));
+        let wf = parse(
+            "name: pf\nworkspace: { type: worktree }\nsteps:\n  - {id: bad, provider: boom, prompt: hi}\n  - {id: after, run: \"true\", depends_on: [bad]}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let bad = s.steps.iter().find(|x| x.id.as_str() == "bad").unwrap();
+        assert_eq!(bad.status, StepStatus::Failed);
+        assert!(
+            s.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("provider error"),
+            "the run error should name the provider failure: {:?}",
+            s.error
+        );
+        let after = s.steps.iter().find(|x| x.id.as_str() == "after").unwrap();
+        assert_eq!(after.status, StepStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn a_provider_nonzero_exit_fails_the_step() {
+        // The provider returns Ok but a non-zero exit (the agent ran and reported failure — e.g. a
+        // normalized claude is_error) — the engine must still fail the step.
+        let repo = init_repo().await;
+        let eng = engine_with_failing(repo.path(), Arc::new(FailingProvider::exit("boom", 3)));
+        let wf = parse(
+            "name: pe\nworkspace: { type: worktree }\nsteps:\n  - {id: bad, provider: boom, prompt: hi}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let bad = s.steps.iter().find(|x| x.id.as_str() == "bad").unwrap();
+        assert_eq!(bad.status, StepStatus::Failed);
+        assert_eq!(bad.exit_code, Some(3), "the non-zero exit code is recorded");
     }
 
     #[tokio::test]
