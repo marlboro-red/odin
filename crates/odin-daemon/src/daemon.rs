@@ -167,8 +167,10 @@ impl Daemon {
 
     /// Resumes incomplete runs, then services every trigger until each is exhausted (for
     /// cron, that is "forever") or the [cancellation token](Daemon::cancellation_token)
-    /// fires. On cancellation each trigger stops fetching new events, but a run already in
-    /// flight is awaited to completion — a **graceful drain** — before `run` returns.
+    /// fires. On cancellation each trigger stops fetching new events and **cancels its in-flight
+    /// runs** (killing the running step's subprocess) so shutdown is prompt rather than blocking on
+    /// a long agentic step; a `durable` run is checkpointed and resumes via `resume_all` on the
+    /// next start, a non-durable one is abandoned. `run` returns once the cancelled runs drain.
     ///
     /// Crash recovery applies to **durable** workflows (`durable: true`): their state is
     /// checkpointed at each step, so a run lost to a hard kill resumes via `resume_all` on
@@ -276,7 +278,17 @@ impl Daemon {
                         }
                     }
                 }
-                // Drain in-flight dispatches before this trigger task ends (graceful).
+                // On shutdown, cancel in-flight runs so a long agentic run can't hold up ctrl-c
+                // (otherwise the drain below waits out the per-step timeout). A `durable` run is
+                // checkpointed and resumes on the next start; a non-durable one is abandoned. This
+                // is best-effort — a dispatch that hadn't yet registered its run still drains.
+                if shutdown.is_cancelled() {
+                    let n = engine.cancel_all_active();
+                    if n > 0 {
+                        tracing::info!(%kind, cancelled = n, "shutdown: cancelling in-flight runs");
+                    }
+                }
+                // Drain in-flight dispatches before this trigger task ends.
                 while dispatches.join_next().await.is_some() {}
             });
         }

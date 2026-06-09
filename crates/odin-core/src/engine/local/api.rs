@@ -87,6 +87,9 @@ impl Engine for LocalEngine {
         );
         tracing::info!(parent: &run_span, "run started");
         let cancel = CancelToken::new();
+        // Register the token so `cancel_run`/`cancel_all_active` can fire it; the guard removes it
+        // when this method returns (completed, failed, or suspended at a gate).
+        let _cancel_guard = self.register_cancel(run_id, cancel.clone());
         let exec = self
             .execute(workflow, &mut state, &workdir, &params, &cancel)
             .instrument(run_span.clone())
@@ -134,7 +137,17 @@ impl Engine for LocalEngine {
         };
         // A step failure leaves `error` None here; `summarize` derives the run-level error
         // from the first failed step's recorded reason (single source of truth).
-        let (status, summary) = Self::summarize(run_id, workflow, exec, error, started_at);
+        let (mut status, mut summary) = Self::summarize(run_id, workflow, exec, error, started_at);
+        // A fired cancel token ends the run as `Cancelled` regardless of how the cut-short steps
+        // settled — whether the running step was killed (Failed) or cancel landed before the next
+        // step even launched (the loop guard skips it, so nothing failed). The token is only
+        // reachable while the run is registered/in-flight (the guard removes it on finish), so an
+        // `is_cancelled()` here always means the run was interrupted, never a clean completion.
+        if cancel.is_cancelled() {
+            status = RunStatus::Cancelled;
+            summary.status = RunStatus::Cancelled;
+            summary.error = Some("run cancelled".to_owned());
+        }
         state.status = status;
         state.error = summary.error.clone();
         state.updated_at = Utc::now();
@@ -160,6 +173,24 @@ impl Engine for LocalEngine {
         );
 
         Ok(summary)
+    }
+
+    fn cancel_run(&self, run_id: RunId) -> bool {
+        match self.active_cancels.lock().unwrap().get(&run_id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn cancel_all_active(&self) -> usize {
+        let map = self.active_cancels.lock().unwrap();
+        for token in map.values() {
+            token.cancel();
+        }
+        map.len()
     }
 
     async fn resume_all(&self, workflows: &[Workflow]) -> Result<Vec<RunSummary>> {
@@ -456,6 +487,7 @@ impl LocalEngine {
             match Self::resolve_params(workflow, &state.input) {
                 Ok(params) => {
                     let cancel = CancelToken::new();
+                    let _cancel_guard = self.register_cancel(state.run_id, cancel.clone());
                     let run_span = tracing::info_span!(
                         "run",
                         run_id = %state.run_id,
@@ -498,13 +530,18 @@ impl LocalEngine {
                                 Ok(result) => {
                                     // `summarize` derives the run-level error from the first
                                     // failed step's recorded reason (single source of truth).
-                                    let (status, summary) = Self::summarize(
+                                    let (mut status, mut summary) = Self::summarize(
                                         state.run_id,
                                         workflow,
                                         result,
                                         None,
                                         started_at,
                                     );
+                                    if cancel.is_cancelled() {
+                                        status = RunStatus::Cancelled;
+                                        summary.status = RunStatus::Cancelled;
+                                        summary.error = Some("run cancelled".to_owned());
+                                    }
                                     state.status = status;
                                     state.error = summary.error.clone();
                                     state.updated_at = Utc::now();
