@@ -6,6 +6,10 @@ program see the [integration guide](integration-guide.md).
 
 ## Build
 
+> **Prefer a prebuilt binary?** Each [tagged release](../../releases) attaches `odin` / `odind`
+> binaries for Linux, macOS, and Windows (x86_64 + arm64). Download, unpack, put them on your
+> `PATH`, and skip to [§1](#1-validate-a-workflow). (Building from source is below.)
+
 Odin is a Rust workspace (edition 2024, MSRV 1.85). Build the two binaries:
 
 ```sh

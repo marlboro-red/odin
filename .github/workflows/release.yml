@@ -1,0 +1,86 @@
+name: release
+
+# Cut a release by pushing a tag (e.g. `git tag v0.0.1 && git push origin v0.0.1`). This builds the
+# `odin` + `odind` binaries for the major desktop/CI targets and attaches them (plus a SHA-256) to
+# the GitHub release. `workflow_dispatch` lets you re-run against an existing tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build binaries for"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create-release:
+    name: create release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Idempotent: create the release once (draft, with generated notes) so the matrix build jobs
+      # have something to upload to. Re-runs against an existing release are a no-op.
+      - name: Ensure the release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes --draft
+
+  build:
+    name: ${{ matrix.target }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, linker: gcc-aarch64-linux-gnu }
+          - { target: x86_64-apple-darwin,        os: macos-latest }
+          - { target: aarch64-apple-darwin,       os: macos-latest }
+          - { target: x86_64-pc-windows-msvc,     os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+      # aarch64 Linux is cross-compiled on an x86_64 runner, so it needs a cross linker.
+      - name: Cross linker (aarch64 linux)
+        if: matrix.linker
+        run: |
+          sudo apt-get update && sudo apt-get install -y ${{ matrix.linker }}
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build odin + odind
+        run: cargo build --release --target ${{ matrix.target }} -p odin-cli -p odin-daemon
+      - name: Package and upload
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          DIR="target/${{ matrix.target }}/release"
+          NAME="odin-${TAG}-${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "${NAME}.zip" "./${DIR}/odin.exe" "./${DIR}/odind.exe"
+            ASSET="${NAME}.zip"
+          else
+            tar -czf "${NAME}.tar.gz" -C "$DIR" odin odind
+            ASSET="${NAME}.tar.gz"
+          fi
+          # SHA-256 sidecar (sha256sum on Linux/Git-bash, shasum on macOS).
+          (sha256sum "$ASSET" 2>/dev/null || shasum -a 256 "$ASSET") > "${ASSET}.sha256"
+          gh release upload "$TAG" "$ASSET" "${ASSET}.sha256" --clobber
