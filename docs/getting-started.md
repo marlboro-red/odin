@@ -45,6 +45,23 @@ IR and intentionally trips two documented warnings (ODIN023 and ODIN044) so you 
 free; `provider:` steps invoke the real coding-agent CLI (so `claude` / `codex` / `copilot`
 must be installed, on `PATH`, and authenticated).
 
+The fastest way to see the engine work — **zero dependencies**, no agent CLI or auth — is the
+provider-free [`quickstart`](../examples/quickstart.yaml) (it runs in any git repo, e.g. this one):
+
+```sh
+odin run quickstart --repo . --no-store
+# ✓ hello  ✓ write  ✓ check  — provisions a worktree, runs the DAG, captures the diff
+```
+
+To run a **provider-using** workflow offline too, add `--mock` — `provider:` steps echo their
+prompt instead of invoking a real agent CLI:
+
+```sh
+odin run deep-review --repo . --no-store --mock --param out="$PWD/REVIEW.md"
+```
+
+Then the real thing — a provider workflow with the agent CLIs installed:
+
 ```sh
 odin run examples/issue-to-pr.yaml \
   --repo . \
@@ -141,6 +158,7 @@ verification and dedup, and the fail-closed security model.
 | [`triage.yaml`](../examples/triage.yaml) | **Branching** with `case:`: classify an issue, then take exactly one labeled branch's steps, with a merge-back. |
 | [`self-correct.yaml`](../examples/self-correct.yaml) | **Single-step self-correct**: `retry` with `feedback`, re-prompting one step with the prior failure (gates as the verifier). |
 | [`iterate.yaml`](../examples/iterate.yaml) | **Multi-step loop** with `loop:`: iterate edit → test until the test passes, feeding each failure back as `loop.feedback`. |
+| [`quickstart.yaml`](../examples/quickstart.yaml) | **Zero-dependency hello-world**: plain `run:` steps (no agent CLI, no `gh`, no auth) — provision a worktree, walk the DAG, capture the diff, print a RunSummary. The fastest first run after a clone. |
 | [`deep-review.yaml`](../examples/deep-review.yaml) | **Whole-codebase deep review**: four concurrent `scratch:` dimension reviewers (correctness/robustness/concurrency/security) fan in to a cross-provider lead reviewer that synthesizes a ranked report, written to an absolute path via a safe quoted heredoc. ([`-codex`](../examples/deep-review-codex.yaml) swaps the synthesizer to codex.) Verified end-to-end against a real repo. |
 
 ## Where next

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use odin_core::{
-    EngineBuilder, Error, RunInput, RunStatus, RunSummary, SqliteStore, StepKind, StepStatus,
+    EngineBuilder, Error, RunInput, RunStatus, RunSummary, SqliteStore, Step, StepKind, StepStatus,
     Workflow,
 };
 
@@ -21,6 +21,9 @@ pub(crate) struct RunArgs {
     pub db: Option<PathBuf>,
     pub no_store: bool,
     pub json: bool,
+    /// Replace `provider:` steps with a mock that echoes their rendered prompt, so a
+    /// provider-using workflow runs with no real agent CLI or authentication.
+    pub mock: bool,
 }
 
 /// Runs the workflow named by `args.file` (a path or a recipe name). Exit: `0` succeeded,
@@ -73,6 +76,14 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
         let store = SqliteStore::open(&db).context("opening the run state database")?;
         builder = builder.store(Arc::new(store));
     }
+
+    if args.mock {
+        register_mock_providers(&mut builder, workflow);
+        eprintln!(
+            "note: --mock — provider steps echo their rendered prompt; no real agent CLI is invoked"
+        );
+    }
+
     let engine = builder.build()?;
 
     let mut input = RunInput::manual();
@@ -176,5 +187,36 @@ pub(crate) fn print_summary(summary: &RunSummary) {
     }
     if !summary.side_effects.is_empty() {
         println!("side-effects: {}", summary.side_effects.len());
+    }
+}
+
+/// Registers a prompt-echoing [`odin_core::mock::EchoProvider`] for every provider the workflow
+/// references (provider steps, their judges, and loop-body steps), overriding the real CLI
+/// adapters — so `--mock` runs the whole workflow with no agent CLI or authentication.
+fn register_mock_providers(builder: &mut EngineBuilder, workflow: &Workflow) {
+    let mut names = std::collections::BTreeSet::new();
+    for step in &workflow.steps {
+        add_provider_names(step, &mut names);
+        if let StepKind::Loop(l) = &step.kind {
+            for inner in &l.steps {
+                add_provider_names(inner, &mut names);
+            }
+        }
+    }
+    for name in &names {
+        builder
+            .registry_mut()
+            .register_provider(Arc::new(odin_core::mock::EchoProvider::new(name.as_str())));
+    }
+}
+
+/// Collects the provider names a single step references (a provider step's `provider:` and any
+/// `judge:` provider) into `names`.
+fn add_provider_names(step: &Step, names: &mut std::collections::BTreeSet<String>) {
+    if let StepKind::Provider(p) = &step.kind {
+        names.insert(p.provider.as_str().to_owned());
+    }
+    if let Some(judge) = &step.judge {
+        names.insert(judge.provider.as_str().to_owned());
     }
 }

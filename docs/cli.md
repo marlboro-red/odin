@@ -75,6 +75,7 @@ Run a workflow to completion against a git repository. Steps using `run:` execut
 | `--repo <DIR>` | `.` | The git repository to provision workspaces from. |
 | `--db <FILE>` | `<repo>/.odin/state.db` | The run-state SQLite database. |
 | `--no-store` | off | Don't persist run state (no durability / resume). Ignores `--db`. |
+| `--mock` | off | Replace `provider:` steps with a mock that echoes their rendered prompt, so a provider-using workflow runs with **no** real agent CLI or authentication — a demo/offline aid (`run:`/`action:` steps still execute for real). |
 | `--json` | off | Emit the run summary as JSON. |
 
 ```sh

@@ -114,3 +114,42 @@ fn run_exits_nonzero_on_failure() {
     ]);
     assert_eq!(out.status.code(), Some(1), "a failed run must exit 1");
 }
+
+#[test]
+fn mock_runs_a_provider_workflow_with_no_real_cli() {
+    // `--mock` swaps `provider:` steps for a prompt-echoing mock, so a provider workflow runs
+    // offline with no claude/codex/copilot install or auth — on CI (no agent CLI) this could only
+    // pass via the mock, and locally the mock deterministically overrides the real adapter.
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let wf = repo.path().join("p.yaml");
+    std::fs::write(
+        &wf,
+        "name: m\nworkspace: { type: worktree }\nsteps:\n  - {id: ask, provider: claude, prompt: \"hello mock\"}\n",
+    )
+    .unwrap();
+
+    let out = odin(&[
+        "run",
+        wf.to_str().unwrap(),
+        "--repo",
+        repo.path().to_str().unwrap(),
+        "--no-store",
+        "--mock",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit={:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        out.status.code()
+    );
+    assert!(
+        stdout.contains("✓ ask"),
+        "the provider step should pass:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("--mock"),
+        "the mock note should be printed:\n{stderr}"
+    );
+}
