@@ -61,6 +61,22 @@ pub(crate) fn dir_create(override_dir: Option<&Path>) -> anyhow::Result<PathBuf>
 /// the example's filename stem (kept in sync with `examples/`). `recipe init` writes these out.
 pub(crate) const STARTERS: &[(&str, &str)] = &[
     (
+        "quickstart",
+        include_str!("../../../examples/quickstart.yaml"),
+    ),
+    (
+        "deep-review",
+        include_str!("../../../examples/deep-review.yaml"),
+    ),
+    (
+        "deep-review-codex",
+        include_str!("../../../examples/deep-review-codex.yaml"),
+    ),
+    (
+        "branching-review",
+        include_str!("../../../examples/branching-review.yaml"),
+    ),
+    (
         "adversarial-review",
         include_str!("../../../examples/adversarial-review.yaml"),
     ),
