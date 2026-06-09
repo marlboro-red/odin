@@ -28,7 +28,9 @@ use crate::traits::CancelToken;
 /// `2>&1`), so Odin always runs them through a POSIX shell rather than translating to `cmd`/
 /// PowerShell. On Unix that shell is plain `sh` (always on `PATH`). On Windows — where `sh` is
 /// usually *not* on `PATH` even though Git for Windows ships `sh.exe` — it is resolved by probing
-/// `ODIN_SHELL`, then `sh`/`bash` on `PATH`, then Git-for-Windows install locations. A missing
+/// `ODIN_SHELL`, then `sh`/`bash` on `PATH` (**skipping the WSL launcher `System32\bash.exe`**,
+/// which is not a POSIX shell — invoking it with no installed distro fails with "Windows Subsystem
+/// for Linux has no installed distributions"), then Git-for-Windows install locations. A missing
 /// shell yields a [`ProviderError::ShellNotFound`] with an actionable
 /// message, so the first shell step fails clearly instead of with a cryptic `sh: not found`.
 ///
@@ -76,6 +78,28 @@ fn sh_beside_git(git_exe: &std::path::Path) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
+/// True if `exe` sits directly in a Windows system directory (`System32` / `SysWOW64` /
+/// `Sysnative` under `system_root`). The only `bash.exe`/`wsl.exe` there is the **WSL launcher**,
+/// which is not a POSIX shell — so a `sh`/`bash` resolved to that path must be rejected. Compares
+/// separator- and case-insensitively (Windows paths). Pure + testable cross-platform (like
+/// [`sh_beside_git`]); tests pass forward-slash paths so `Path::parent` splits on every host.
+#[cfg(any(windows, test))]
+fn is_in_windows_system_dir(exe: &std::path::Path, system_root: &std::path::Path) -> bool {
+    fn norm(p: &std::path::Path) -> String {
+        p.as_os_str()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    }
+    let Some(parent) = exe.parent() else {
+        return false;
+    };
+    let parent = norm(parent);
+    ["System32", "SysWOW64", "Sysnative"]
+        .iter()
+        .any(|sub| parent == norm(&system_root.join(sub)))
+}
+
 // Always `Some` on Unix, but the signature mirrors the Windows version (which can be `None`).
 #[cfg(not(windows))]
 #[allow(clippy::unnecessary_wraps)]
@@ -85,10 +109,12 @@ fn resolve_shell_platform() -> Option<String> {
 
 #[cfg(windows)]
 fn resolve_shell_platform() -> Option<String> {
-    // A shell already on PATH (Git Bash put on PATH, or any other sh/bash) wins.
+    // A real `sh`/`bash` already on PATH wins — but `which_on_path` skips the WSL launcher
+    // `System32\bash.exe` (not a POSIX shell). Return the resolved FULL path, not the bare name:
+    // `Command::new("bash")` would let Windows re-search PATH and land back on that launcher.
     for name in ["sh", "bash"] {
-        if which_on_path(name).is_some() {
-            return Some(name.to_owned());
+        if let Some(exe) = which_on_path(name) {
+            return Some(exe.to_string_lossy().into_owned());
         }
     }
     // Otherwise probe the sh.exe Git for Windows ships — derived from `git` on PATH (the user is
@@ -107,13 +133,22 @@ fn resolve_shell_platform() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Finds `name.exe` on `PATH`, returning the first match.
+/// Finds `name.exe` on `PATH`, returning the first match — but never one in a Windows system
+/// directory, so a probe for `bash` can't resolve to the WSL launcher `System32\bash.exe`.
 #[cfg(windows)]
 fn which_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
+    let system_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(PathBuf::from);
     std::env::split_paths(&path)
         .map(|dir| dir.join(format!("{name}.exe")))
-        .find(|exe| exe.is_file())
+        .find(|exe| {
+            exe.is_file()
+                && system_root
+                    .as_deref()
+                    .is_none_or(|root| !is_in_windows_system_dir(exe, root))
+        })
 }
 
 /// Well-known Git-for-Windows install roots (per-machine and per-user).
@@ -543,6 +578,40 @@ mod shell_resolution_tests {
     #[test]
     fn the_unix_shell_is_plain_sh() {
         assert_eq!(super::resolve_shell_platform().as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn the_wsl_launcher_in_a_system_dir_is_not_a_shell() {
+        use super::is_in_windows_system_dir;
+        // Forward slashes so `Path::parent` splits on every host (see the helper's doc).
+        let root = std::path::Path::new("C:/Windows");
+        // `System32\bash.exe` (and the WOW64 / Sysnative aliases) is the WSL launcher Odin must
+        // never pick as a POSIX shell — even spelled in a different case.
+        assert!(is_in_windows_system_dir(
+            std::path::Path::new("C:/Windows/System32/bash.exe"),
+            root
+        ));
+        assert!(is_in_windows_system_dir(
+            std::path::Path::new("c:/windows/system32/bash.exe"),
+            root
+        ));
+        assert!(is_in_windows_system_dir(
+            std::path::Path::new("C:/Windows/SysWOW64/wsl.exe"),
+            root
+        ));
+        assert!(is_in_windows_system_dir(
+            std::path::Path::new("C:/Windows/Sysnative/bash.exe"),
+            root
+        ));
+        // A real Git-for-Windows shell (or any non-system-dir bash) is accepted.
+        assert!(!is_in_windows_system_dir(
+            std::path::Path::new("C:/Program Files/Git/bin/sh.exe"),
+            root
+        ));
+        assert!(!is_in_windows_system_dir(
+            std::path::Path::new("C:/tools/bash.exe"),
+            root
+        ));
     }
 }
 
