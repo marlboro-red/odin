@@ -86,6 +86,13 @@ pub(crate) struct LocalEngine {
     /// refused, so an approval racing another approval — or a sweep — can't double-run a run's
     /// side effects.
     running: std::sync::Mutex<HashSet<RunId>>,
+    /// Cancel tokens of runs currently executing, keyed by run id, so an external
+    /// [`cancel_run`](crate::traits::Engine::cancel_run) /
+    /// [`cancel_all_active`](crate::traits::Engine::cancel_all_active) can fire a run's token —
+    /// killing its in-flight step's subprocess and ending the run as `Cancelled`. Each execute
+    /// pass registers its token for its duration (see [`LocalEngine::register_cancel`]) and the
+    /// guard removes it on completion, so the map holds exactly the in-flight runs.
+    active_cancels: std::sync::Mutex<HashMap<RunId, CancelToken>>,
 }
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
@@ -98,6 +105,23 @@ struct RunClaim<'a> {
 impl Drop for RunClaim<'_> {
     fn drop(&mut self) {
         self.engine.running.lock().unwrap().remove(&self.run_id);
+    }
+}
+
+/// A registration of a run's cancel token in [`LocalEngine::active_cancels`], removed when dropped
+/// — so a completed/suspended/failed run is no longer cancellable and the map can't leak entries.
+struct CancelGuard<'a> {
+    engine: &'a LocalEngine,
+    run_id: RunId,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        self.engine
+            .active_cancels
+            .lock()
+            .unwrap()
+            .remove(&self.run_id);
     }
 }
 
@@ -207,6 +231,17 @@ impl LocalEngine {
             worktree_lock: tokio::sync::Mutex::new(()),
             workspaces: std::sync::Mutex::new(HashMap::new()),
             running: std::sync::Mutex::new(HashSet::new()),
+            active_cancels: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registers `token` as `run_id`'s cancel handle for an execute pass, returning a guard that
+    /// deregisters it on drop. Held across the whole pass so `cancel_run` can reach the run.
+    fn register_cancel(&self, run_id: RunId, token: CancelToken) -> CancelGuard<'_> {
+        self.active_cancels.lock().unwrap().insert(run_id, token);
+        CancelGuard {
+            engine: self,
+            run_id,
         }
     }
 
@@ -464,8 +499,14 @@ impl LocalEngine {
         let mut suspended_gate: Option<StepId> = None;
 
         loop {
-            // Fill the ready-set up to the concurrency limit, honoring the exclusivity rule.
-            while in_flight.len() < max_parallel && !exclusive_running && suspended_gate.is_none() {
+            // Fill the ready-set up to the concurrency limit, honoring the exclusivity rule. A
+            // fired cancel token stops launching NEW steps (like a suspended gate); the in-flight
+            // ones are killed by the token in the process layer and settle, then the loop drains.
+            while in_flight.len() < max_parallel
+                && !exclusive_running
+                && suspended_gate.is_none()
+                && !cancel.is_cancelled()
+            {
                 let Some(step) = order
                     .iter()
                     .filter_map(|id| by_id.get(id.as_str()).copied())
@@ -854,6 +895,58 @@ steps:
     /// interpolation, no fragile shell syntax. Runs wherever a POSIX shell resolves (Unix `sh`,
     /// Git Bash on Windows), so the Windows CI lane uses it to prove the full
     /// workflow → engine → shell → git path works there.
+    #[tokio::test]
+    async fn cancel_all_active_stops_a_running_step_as_cancelled() {
+        let repo = init_repo().await;
+        let eng = engine(
+            repo.path(),
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+        );
+        assert_eq!(eng.cancel_all_active(), 0, "nothing running yet");
+        assert!(
+            !eng.cancel_run(RunId::new()),
+            "an unknown run id can't be cancelled"
+        );
+
+        // A long-sleeping step; cancel it mid-flight and assert the run ends Cancelled promptly.
+        let wf = parse(
+            "name: c\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf, RunInput::manual()).await });
+
+        // Poll until the run registers as active, then fire its token.
+        let mut fired = 0;
+        for _ in 0..120 {
+            fired = eng.cancel_all_active();
+            if fired >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            fired >= 1,
+            "the run should have been active and cancellable"
+        );
+
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("a cancelled run must finish promptly, not wait out the step")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Cancelled,
+            "error: {:?}",
+            summary.error
+        );
+        assert_eq!(
+            eng.cancel_all_active(),
+            0,
+            "the registry is empty after the run ends"
+        );
+    }
+
     #[tokio::test]
     async fn smoke_a_run_step_executes_cross_platform() {
         let repo = init_repo().await;

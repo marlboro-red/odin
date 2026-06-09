@@ -53,7 +53,7 @@ idempotently. Set `ODIN_SQLITE_SYNCHRONOUS=full` for zero-loss at higher write l
 4. Derive a cron trigger per `cron` declaration.
 5. **Resume** any incomplete (durable) runs found in the store — crash recovery comes first.
 6. Serve the HTTP server and all triggers, dispatching runs concurrently, until `ctrl-c` — which
-   **drains** in-flight runs before exiting.
+   **cancels** in-flight runs (durable ones resume on the next start) and exits promptly.
 
 All logging goes to stderr.
 
@@ -67,9 +67,12 @@ queue for a free slot rather than spawning unbounded runs. Each run gets its own
 worktree, so concurrent runs don't interfere.
 
 A failing run never takes the daemon down (the error is logged; the trigger keeps firing). On
-`ctrl-c`, triggers stop accepting new events and the daemon **awaits in-flight runs to
-completion** before exiting. Durable runs that *are* interrupted (e.g. a hard kill) resume
-from their last checkpoint on the next start.
+`ctrl-c`, triggers stop accepting new events and the daemon **cancels its in-flight runs** —
+killing the running step's subprocess so shutdown is prompt instead of blocking on a long agentic
+step (a stalled provider is otherwise bounded only by the [step timeout](workflow-reference.md)).
+A `durable` run is checkpointed and **resumes from its last step** via crash-recovery on the next
+start; a non-durable run is abandoned. (The engine exposes the same mechanism per-run as
+`Engine::cancel_run` / `cancel_all_active` for embedders.)
 
 ---
 

@@ -31,6 +31,19 @@ pub trait Engine: Send + Sync {
     /// persistence fails.
     async fn run(&self, workflow: &Workflow, input: RunInput) -> Result<RunSummary>;
 
+    /// Requests cancellation of an in-flight run: fires its cancel token so the running step's
+    /// subprocess is killed and the run ends as
+    /// [`RunStatus::Cancelled`](crate::api::RunStatus::Cancelled). Cooperative — the run stops
+    /// launching new steps at the next scheduling boundary. Returns `true` if a matching in-flight
+    /// run was found and signalled, `false` for an unknown id or a run that is already
+    /// terminal/paused.
+    fn cancel_run(&self, run_id: RunId) -> bool;
+
+    /// Cancels **every** in-flight run (see [`cancel_run`](Engine::cancel_run)) and returns how
+    /// many were signalled. The daemon uses this to stop in-flight work promptly on shutdown;
+    /// `durable` runs resume on the next start.
+    fn cancel_all_active(&self) -> usize;
+
     /// Resumes any incomplete runs found in the [`Store`] (crash recovery).
     ///
     /// # Errors
