@@ -1,0 +1,122 @@
+# Conditional branching (`case:`) on a real codebase: an agent classifies the single most pressing
+# concern, a `case:` selector routes to exactly ONE dimension-specific deep-dive, the other branches
+# skip (skip-propagation), and a merge-back reports which path was taken. The focused report is
+# written to an absolute path via a safe quoted heredoc.
+#
+#   odin validate examples/branching-review.yaml
+#   odin run examples/branching-review.yaml --repo ../tui-bridge --no-store \
+#     --param out="$PWD/../tui-bridge/REVIEW-branch.md"
+
+schema_version: "1.0"
+name: branching-review
+description: Classify a codebase's top concern, then deep-dive only that dimension via a case branch, writing a focused report.
+durable: false
+workspace:
+  type: worktree
+
+params:
+  out:
+    type: string
+    required: true # ABSOLUTE path for the focused report (written outside the throwaway worktree)
+
+steps:
+  - id: classify
+    provider: claude
+    prompt: |
+      Read this repository — its entry points and main runtime flows. Decide the SINGLE most
+      pressing area to deep-dive right now. Reply with EXACTLY ONE word, lowercase, no punctuation:
+      `security`, `reliability`, or `performance`. Output only that one word.
+
+  # The selector: records the first matching branch (or `else`) as steps.route.outputs.selected.
+  # It always passes — branching is a decision, not a failure.
+  - id: route
+    depends_on: [classify]
+    case:
+      branches:
+        - label: security
+          when: "steps.classify.outputs.stdout | trim | lower == 'security'"
+        - label: reliability
+          when: "steps.classify.outputs.stdout | trim | lower == 'reliability'"
+        - label: performance
+          when: "steps.classify.outputs.stdout | trim | lower == 'performance'"
+      else: general # fallback branch if the classifier says something unexpected
+
+  # --- security branch (entry carries the guard; the report step skips with it) ---
+  - id: dig_security
+    provider: claude
+    depends_on: [route]
+    when: "steps.route.outputs.selected == 'security'"
+    prompt: |
+      Deep-dive the SECURITY of this codebase: command/argument injection, path traversal, any
+      network/IPC trust boundary and its authentication, input validation, unsafe, and secret
+      handling. State the attacker model for each issue. Produce a ranked markdown report (P0/P1/P2)
+      with `file:line` and a concrete fix per finding. Output ONLY the markdown report.
+  - id: report_security
+    depends_on: [dig_security]
+    run: |
+      cat > {{ params.out }} <<'ODIN_BRANCH_EOF_4d8a1f7c2e'
+      # Focused review — SECURITY (selected branch)
+
+      {{ steps.dig_security.outputs.stdout }}
+      ODIN_BRANCH_EOF_4d8a1f7c2e
+
+  # --- reliability branch ---
+  - id: dig_reliability
+    provider: claude
+    depends_on: [route]
+    when: "steps.route.outputs.selected == 'reliability'"
+    prompt: |
+      Deep-dive the RELIABILITY of this codebase: error handling (panics/unwraps on fallible
+      paths), process/resource lifecycle (leaks, missing cleanup, EOF handling), concurrency
+      (races, deadlocks, blocking), and timeout/shutdown behavior. Produce a ranked markdown report
+      (P0/P1/P2) with `file:line` and a concrete fix per finding. Output ONLY the markdown report.
+  - id: report_reliability
+    depends_on: [dig_reliability]
+    run: |
+      cat > {{ params.out }} <<'ODIN_BRANCH_EOF_4d8a1f7c2e'
+      # Focused review — RELIABILITY (selected branch)
+
+      {{ steps.dig_reliability.outputs.stdout }}
+      ODIN_BRANCH_EOF_4d8a1f7c2e
+
+  # --- performance branch ---
+  - id: dig_performance
+    provider: claude
+    depends_on: [route]
+    when: "steps.route.outputs.selected == 'performance'"
+    prompt: |
+      Deep-dive the PERFORMANCE of this codebase: hot-path allocations/clones, unnecessary copies
+      or work per frame/request, lock contention, blocking on hot paths, and algorithmic costs.
+      Produce a ranked markdown report (P0/P1/P2) with `file:line` and a concrete fix per finding.
+      Output ONLY the markdown report.
+  - id: report_performance
+    depends_on: [dig_performance]
+    run: |
+      cat > {{ params.out }} <<'ODIN_BRANCH_EOF_4d8a1f7c2e'
+      # Focused review — PERFORMANCE (selected branch)
+
+      {{ steps.dig_performance.outputs.stdout }}
+      ODIN_BRANCH_EOF_4d8a1f7c2e
+
+  # --- general branch (the `else` fallback) ---
+  - id: dig_general
+    provider: claude
+    depends_on: [route]
+    when: "steps.route.outputs.selected == 'general'"
+    prompt: |
+      Do a broad deep-dive of this codebase across correctness, reliability, security, and
+      performance. Produce a ranked markdown report (P0/P1/P2) with `file:line` and a concrete fix
+      per finding. Output ONLY the markdown report.
+  - id: report_general
+    depends_on: [dig_general]
+    run: |
+      cat > {{ params.out }} <<'ODIN_BRANCH_EOF_4d8a1f7c2e'
+      # Focused review — GENERAL (else branch)
+
+      {{ steps.dig_general.outputs.stdout }}
+      ODIN_BRANCH_EOF_4d8a1f7c2e
+
+  # Merge-back: depends on the always-passing selector, so it runs whichever branch was taken.
+  - id: summary
+    depends_on: [route]
+    run: "echo 'branching-review deep-dived: {{ steps.route.outputs.selected }} -> {{ params.out }}'"
