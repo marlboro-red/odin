@@ -35,7 +35,9 @@ deep-dives *only that one* via a `case:` branch.
 
 ## Prerequisites
 
-- **Build:** Rust 1.85+ (`cargo build`). *(No prebuilt binaries yet — build from source.)*
+- **Install:** prebuilt `odin` / `odind` binaries (Linux / macOS / Windows · x86_64 + arm64) are
+  attached to each [tagged release](../../releases); or build from source with Rust 1.85+
+  (`cargo build`).
 - **A git repo** to run against (`--repo .`).
 - **Agent CLIs** for `provider:` steps — whichever you reference: `claude` (Claude Code),
   `codex` (OpenAI Codex), `copilot` (GitHub Copilot CLI) — installed, on `PATH`, and
