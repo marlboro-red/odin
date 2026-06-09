@@ -14,6 +14,7 @@ use crate::api::{Decision, RerunOutcome, RunInput, RunSummary};
 use crate::error::Result;
 use crate::ids::RunId;
 use crate::ir::Workflow;
+use crate::provider::StreamMux;
 use crate::registry::Registry;
 use crate::traits::{PrunePolicy, PruneReport, Store};
 
@@ -106,6 +107,7 @@ pub struct EngineBuilder {
     registry: Registry,
     store: Option<Arc<dyn Store>>,
     repo_root: Option<PathBuf>,
+    stream: Option<StreamMux>,
 }
 
 impl EngineBuilder {
@@ -116,6 +118,7 @@ impl EngineBuilder {
             registry: Registry::with_builtins(),
             store: None,
             repo_root: None,
+            stream: None,
         }
     }
 
@@ -130,6 +133,17 @@ impl EngineBuilder {
     #[must_use]
     pub fn store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// Tees each provider / `run:` / gate step's live subprocess output to `mux` (prefixed by
+    /// step id) as it runs — the `odin run --stream` view — in addition to capturing it. Build
+    /// the mux with [`StreamMux::to_stderr`](crate::StreamMux::to_stderr) (or
+    /// [`to_writer`](crate::StreamMux::to_writer) to redirect it). Off by default; leave it unset
+    /// for unattended/daemon runs, where interleaved live output isn't wanted.
+    #[must_use]
+    pub fn stream(mut self, mux: StreamMux) -> Self {
+        self.stream = Some(mux);
         self
     }
 
@@ -155,6 +169,7 @@ impl EngineBuilder {
             self.registry,
             self.store,
             repo_root,
+            self.stream,
         )))
     }
 }

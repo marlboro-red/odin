@@ -89,6 +89,21 @@ so `--param attempts=3` is a number and `--param dry_run=true` is a bool. Runs a
 **durable** by default: state is checkpointed to `<repo>/.odin/state.db`, so a crashed run
 resumes. Add `--no-store` to disable persistence.
 
+By default a run prints only its final summary. Add **`--stream`** to watch it work — each
+`provider:` / `run:` / gate step's output is teed to stderr live, prefixed by step id (so
+concurrent `scratch:` steps stay legible):
+
+```sh
+odin run examples/quickstart.yaml --repo . --no-store --stream
+# hello │ hello from odin
+# check │ verifying
+# Run 83cc… — succeeded   (the summary still lands on stdout)
+```
+
+Live output goes to **stderr**; the summary (and `--json`) stay on stdout, so
+`odin run … --stream 1>summary.txt 2>run.log` keeps them apart. See the
+[`--stream` notes](cli.md#--stream-watch-steps-as-they-run) for the headless-provider caveat.
+
 The [`odin` CLI reference](cli.md) documents every command, flag, exit code, and `--json`
 shape.
 

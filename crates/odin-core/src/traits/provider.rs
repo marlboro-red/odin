@@ -59,6 +59,10 @@ pub struct InvocationCtx {
     pub timeout: Option<Duration>,
     /// Fires on run cancel/timeout. Honor it and return promptly.
     pub cancel: CancelToken,
+    /// Live-output sink for this invocation. When `Some`, the provider should pass it into its
+    /// [`ProcessOptions::stream`](crate::provider::ProcessOptions::stream) so the agent CLI's
+    /// output is teed to the terminal as it runs. `None` (the default) = capture only.
+    pub stream: Option<crate::provider::process::StreamSink>,
 }
 
 /// What a provider produced.

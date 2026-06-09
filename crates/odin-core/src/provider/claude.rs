@@ -121,6 +121,7 @@ impl Provider for ClaudeProvider {
             timeout: ctx.timeout,
             env: Vec::new(),
             stdin: None,
+            stream: ctx.stream.clone(),
         };
         let out = run_process(&self.program, &args, &opts, &ctx.cancel).await?;
         if out.timed_out {
@@ -359,6 +360,7 @@ mod tests {
             inputs: IndexMap::new(),
             timeout: Some(std::time::Duration::from_secs(120)),
             cancel: CancelToken::new(),
+            stream: None,
         };
         let out = provider
             .invoke(ctx)

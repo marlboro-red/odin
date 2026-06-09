@@ -33,6 +33,10 @@ synthesizes a ranked P0/P1/P2 report. [`-codex`](examples/deep-review-codex.yaml
 [`branching-review.yaml`](examples/branching-review.yaml) classifies the codebase's top concern and
 deep-dives *only that one* via a `case:` branch.
 
+Add **`--stream`** to any run to watch the steps work — each `provider:` / `run:` / gate step's
+output is teed to stderr live, prefixed by step id (the summary still lands on stdout). See the
+[`--stream` notes](docs/cli.md#--stream-watch-steps-as-they-run).
+
 ## Prerequisites
 
 - **Install:** prebuilt `odin` / `odind` binaries (Linux / macOS / Windows · x86_64 + arm64) are
@@ -146,8 +150,9 @@ A capable v0.x engine, openly pre-1.0 and not yet validated by external users. I
 (45 diagnostics), the templating/context model, the five traits, the durable SQLite store, worktree
 + slot-pool workspaces, all three provider adapters, the built-in actions, LLM-as-judge + retry, the
 concurrent executor (`max_parallel` + `scratch:` fan-out), crash-resume with per-step git snapshots,
-`case:`/`loop:` control flow, default step timeouts + run cancellation, the recipe catalog, the
-`odin` CLI, and the `odind` daemon (cron + signed webhooks + concurrent dispatch). Known gaps:
+`case:`/`loop:` control flow, default step timeouts + run cancellation, live step-output
+streaming (`--stream`), the recipe catalog, the `odin` CLI, and the `odind` daemon (cron + signed
+webhooks + concurrent dispatch). Known gaps:
 codex/copilot dollar-cost reporting (token usage is parsed), operator-facing cost/usage surfaces,
 and provider routing/fallback.
 

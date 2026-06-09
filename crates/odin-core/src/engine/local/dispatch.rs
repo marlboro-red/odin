@@ -24,7 +24,7 @@ use crate::context::render::{eval_when, render_template};
 use crate::error::{Error, Result};
 use crate::ids::{RunId, StepId};
 use crate::ir::{JudgeSpec, RetrySpec, Step, StepKind, Workflow};
-use crate::provider::process::{ProcessOptions, run_process};
+use crate::provider::process::{ProcessOptions, StreamSink, run_process};
 use crate::traits::{ActionCtx, CancelToken, InvocationCtx, RunEvent};
 
 impl LocalEngine {
@@ -134,6 +134,7 @@ impl LocalEngine {
                     inputs,
                     timeout,
                     cancel: cancel.clone(),
+                    stream: self.step_stream(step.id.as_str()),
                 };
                 match provider.invoke(ictx).await {
                     Ok(o) => {
@@ -153,7 +154,11 @@ impl LocalEngine {
                     Ok(s) => s,
                     Err(e) => return StepOutcome::failed(e.to_string()),
                 };
-                match self.shell(&cmd, workdir, timeout, cancel).await {
+                let stream = self.step_stream(step.id.as_str());
+                match self
+                    .shell(&cmd, workdir, timeout, cancel, stream.as_ref())
+                    .await
+                {
                     Ok((code, stdout, stderr)) => {
                         let mut outputs = IndexMap::new();
                         outputs.insert("stdout".to_owned(), Value::String(stdout));
@@ -270,6 +275,7 @@ impl LocalEngine {
         // Gates: every named command must exit 0. Capture BOTH streams — most verifiers put the
         // actionable detail on stdout (test runners: which assertion failed) while compilers use
         // stderr — so `retry.feedback` needs both to be useful.
+        let gate_stream = self.step_stream(step.id.as_str());
         for (name, command) in &step.gates {
             let cmd = match render_template(command, ctx, "gate") {
                 Ok(s) => s,
@@ -279,7 +285,10 @@ impl LocalEngine {
                     return outcome;
                 }
             };
-            let (passed, gate_output) = match self.shell(&cmd, workdir, timeout, cancel).await {
+            let (passed, gate_output) = match self
+                .shell(&cmd, workdir, timeout, cancel, gate_stream.as_ref())
+                .await
+            {
                 Ok((code, stdout, stderr)) => (code == 0, join_streams(&stdout, &stderr)),
                 Err(e) => (false, e.to_string()),
             };
@@ -358,6 +367,7 @@ impl LocalEngine {
             inputs: IndexMap::new(),
             timeout,
             cancel: cancel.clone(),
+            stream: self.step_stream(&format!("{} judge", step.id.as_str())),
         };
         let out = provider.invoke(ictx).await.map_err(|e| e.to_string())?;
         parse_score(&out.stdout).ok_or_else(|| {
@@ -511,19 +521,22 @@ impl LocalEngine {
         outcome
     }
 
-    /// Runs a shell command in `workdir`, returning `(exit_code, stdout)`.
+    /// Runs a shell command in `workdir`, returning `(exit_code, stdout, stderr)`. With a
+    /// `stream` sink (the `--stream` view) the command's output is teed to the terminal live.
     async fn shell(
         &self,
         command: &str,
         workdir: &Path,
         timeout: Option<Duration>,
         cancel: &CancelToken,
+        stream: Option<&StreamSink>,
     ) -> Result<(i32, String, String)> {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             timeout,
             env: Vec::new(),
             stdin: None,
+            stream: stream.cloned(),
         };
         let args = vec!["-c".to_owned(), command.to_owned()];
         let out = run_process(crate::provider::posix_shell()?, &args, &opts, cancel).await?;

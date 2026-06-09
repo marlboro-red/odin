@@ -7,10 +7,11 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use odin_core::{
     EngineBuilder, Error, RunInput, RunStatus, RunSummary, SqliteStore, Step, StepKind, StepStatus,
-    Workflow,
+    StreamMux, Workflow,
 };
 
 /// Parsed arguments for `odin run`.
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct RunArgs {
     /// The workflow to run: a file path or a recipe name (see [`crate::catalog::resolve_arg`]).
     pub file: PathBuf,
@@ -24,6 +25,9 @@ pub(crate) struct RunArgs {
     /// Replace `provider:` steps with a mock that echoes their rendered prompt, so a
     /// provider-using workflow runs with no real agent CLI or authentication.
     pub mock: bool,
+    /// Tee each provider / `run:` / gate step's subprocess output to stderr live (prefixed by
+    /// step id) as the run proceeds, instead of only capturing it for the final summary.
+    pub stream: bool,
 }
 
 /// Runs the workflow named by `args.file` (a path or a recipe name). Exit: `0` succeeded,
@@ -64,6 +68,16 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
     }
 
     let mut builder = EngineBuilder::new().repo(&repo);
+
+    if args.stream {
+        // Live step output goes to stderr (stdout stays the clean summary / `--json` channel),
+        // prefixed by step id so concurrent `scratch:` steps stay legible.
+        builder = builder.stream(StreamMux::to_stderr());
+        eprintln!(
+            "note: --stream — provider/run/gate step output is teed live below (stderr), prefixed \
+             by step"
+        );
+    }
 
     if !args.no_store {
         let db = args

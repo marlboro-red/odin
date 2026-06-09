@@ -215,6 +215,7 @@ mod tests {
             inputs: IndexMap::new(),
             timeout: None,
             cancel: CancelToken::new(),
+            stream: None,
         }
     }
 
