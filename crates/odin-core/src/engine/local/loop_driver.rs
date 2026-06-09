@@ -14,7 +14,7 @@ use chrono::Utc;
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use super::ctx::{FEEDBACK_MAX, build_ctx_with, clip_tail};
+use super::ctx::{FEEDBACK_MAX, build_ctx_with, clip_tail, effective_timeout};
 use super::{LocalEngine, StepOutcome};
 use crate::api::{SideEffect, StepStatus};
 use crate::context::render::eval_when;
@@ -112,10 +112,7 @@ impl LocalEngine {
                         Some(StepStatus::Passed)
                     )
                 });
-                let timeout = inner
-                    .timeout
-                    .or(workflow.defaults.timeout)
-                    .map(crate::ir::HumanDuration::as_duration);
+                let timeout = effective_timeout(inner, &workflow.defaults);
                 let (_, o) = self
                     .run_one(
                         run_id,

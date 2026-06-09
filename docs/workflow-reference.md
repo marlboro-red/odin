@@ -108,7 +108,7 @@ Declaring zero or more than one kind is a **parse error**, as is putting a provi
 | `gates` | map name → shell command | `{}` | After the body, every gate command must exit `0` or the step **fails**. Order preserved. |
 | `judge` | [`JudgeSpec`](#judge) | — | Score the step's output with an LLM and fail it below a threshold. |
 | `retry` | [`RetrySpec`](#retry) | no retry | Re-attempt the step on failure. |
-| `timeout` | duration string | workflow `defaults.timeout`, else none | Wall-clock limit for the body (e.g. `"15m"`). |
+| `timeout` | duration string | workflow `defaults.timeout`, else a built-in **30m** for `provider`/`run`/`action` steps | Wall-clock limit for the body (e.g. `"15m"`). A subprocess-executing step that sets no `timeout:` and whose workflow sets no `defaults.timeout` falls back to a built-in 30-minute cap, so a hung agent or command can't run forever; set an explicit value for tighter control. (`approval`/`case`/`loop` steps get **no** implicit timeout — a human gate may wait far longer, and a loop's inner steps carry their own.) |
 | `artifacts` | [`Artifacts`](#artifacts) | empty | Named data-flow on top of the shared workdir. |
 | `scratch` | bool | `false` | Run in an **isolated** throwaway worktree instead of the shared one (see [concurrency](#concurrency)). |
 

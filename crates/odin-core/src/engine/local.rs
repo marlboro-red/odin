@@ -63,7 +63,7 @@ mod dispatch;
 mod gitio;
 mod loop_driver;
 mod provision;
-use ctx::{build_ctx, collect_side_effects, skipped_outcome, step_result};
+use ctx::{build_ctx, collect_side_effects, effective_timeout, skipped_outcome, step_result};
 
 /// The reserved, auto-captured artifact name.
 const DIFF: &str = "DIFF";
@@ -572,10 +572,7 @@ impl LocalEngine {
                     continue;
                 }
 
-                let timeout = step
-                    .timeout
-                    .or(workflow.defaults.timeout)
-                    .map(crate::ir::HumanDuration::as_duration);
+                let timeout = effective_timeout(step, &workflow.defaults);
                 let ctx = build_ctx(
                     params,
                     &state.input.trigger_payload,
@@ -3106,6 +3103,50 @@ steps:
         assert_eq!(
             super::ctx::parse_score(r#"{"result": {"score": 0.7}}"#),
             Some(0.7)
+        );
+    }
+
+    #[test]
+    fn effective_timeout_applies_a_default_only_to_subprocess_kinds() {
+        use super::ctx::{DEFAULT_STEP_TIMEOUT, effective_timeout};
+        use std::time::Duration;
+
+        // No step/defaults timeout: subprocess kinds (run/provider/action) get the built-in
+        // default; an approval gate gets none (it may wait for a human for hours).
+        let wf = parse(
+            "name: t\nsteps:\n  - {id: r, run: x}\n  - {id: p, provider: claude, prompt: hi}\n  - {id: c, action: git.commit, with: {message: m}}\n  - id: g\n    approval: { message: ok }\n    depends_on: [r]\n",
+        );
+        let by_id = |id: &str| wf.steps.iter().find(|s| s.id.as_str() == id).unwrap();
+        assert_eq!(
+            effective_timeout(by_id("r"), &wf.defaults),
+            Some(DEFAULT_STEP_TIMEOUT)
+        );
+        assert_eq!(
+            effective_timeout(by_id("p"), &wf.defaults),
+            Some(DEFAULT_STEP_TIMEOUT)
+        );
+        assert_eq!(
+            effective_timeout(by_id("c"), &wf.defaults),
+            Some(DEFAULT_STEP_TIMEOUT)
+        );
+        assert_eq!(
+            effective_timeout(by_id("g"), &wf.defaults),
+            None,
+            "an approval gate must never get an implicit timeout"
+        );
+
+        // Explicit step timeout wins; otherwise the workflow `defaults.timeout` applies.
+        let wf2 = parse(
+            "name: t\ndefaults: { timeout: \"5s\" }\nsteps:\n  - {id: a, run: x, timeout: \"2s\"}\n  - {id: b, run: y}\n",
+        );
+        let s = |id: &str| wf2.steps.iter().find(|st| st.id.as_str() == id).unwrap();
+        assert_eq!(
+            effective_timeout(s("a"), &wf2.defaults),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(
+            effective_timeout(s("b"), &wf2.defaults),
+            Some(Duration::from_secs(5))
         );
     }
 

@@ -15,9 +15,38 @@ use super::{DIFF, StepOutcome};
 use crate::api::{SideEffect, StepResult, StepStatus};
 use crate::context::render::build_context;
 use crate::ids::StepId;
-use crate::ir::{Backoff, FeedbackMode, RetrySpec, Workflow};
+use crate::ir::{
+    Backoff, FeedbackMode, HumanDuration, RetrySpec, Step, StepKind, Workflow, WorkflowDefaults,
+};
 use crate::traits::{RunState, StepState};
 use crate::usage::Usage;
+
+/// The built-in timeout applied to a subprocess-executing step (`provider` / `run` / `action`) that
+/// sets no `timeout:` and whose workflow sets no `defaults.timeout`. Without it, such a step awaits
+/// a timeout future that never resolves (the process layer's `sleep_opt(None)`), so a **hung agent
+/// or command runs forever** — blocking the run and the daemon's shutdown drain. It's generous so
+/// it bounds a genuine hang without cutting off a legitimately long step; override it per-step
+/// (`timeout:`) or workflow-wide (`defaults.timeout`).
+pub(crate) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Resolves a step's effective timeout: its own `timeout:`, else the workflow `defaults.timeout`,
+/// else — for subprocess-executing kinds only — [`DEFAULT_STEP_TIMEOUT`].
+///
+/// Human-waiting (`approval`) and coordinating/instant (`case` / `loop`) steps get **no** implicit
+/// timeout: an approval gate may legitimately pause for hours, a `case` selector is instant, and a
+/// `loop`'s inner steps each carry their own effective timeout.
+pub(crate) fn effective_timeout(step: &Step, defaults: &WorkflowDefaults) -> Option<Duration> {
+    step.timeout
+        .or(defaults.timeout)
+        .map(HumanDuration::as_duration)
+        .or_else(|| {
+            matches!(
+                step.kind,
+                StepKind::Provider(_) | StepKind::Run(_) | StepKind::Action(_)
+            )
+            .then_some(DEFAULT_STEP_TIMEOUT)
+        })
+}
 
 pub(crate) fn skipped_outcome() -> StepOutcome {
     StepOutcome {
