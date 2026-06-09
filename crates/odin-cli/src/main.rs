@@ -62,6 +62,10 @@ enum Command {
         /// Do not persist run state (no durability / resume).
         #[arg(long)]
         no_store: bool,
+        /// Replace `provider:` steps with a mock that echoes their prompt, so a provider-using
+        /// workflow runs with **no** real agent CLI or authentication (a demo/offline aid).
+        #[arg(long)]
+        mock: bool,
         /// Emit the run summary as JSON.
         #[arg(long)]
         json: bool,
@@ -397,6 +401,7 @@ fn main() -> ExitCode {
             repo,
             db,
             no_store,
+            mock,
             json,
         } => {
             let args = cmd::run::RunArgs {
@@ -408,6 +413,7 @@ fn main() -> ExitCode {
                 db,
                 no_store,
                 json,
+                mock,
             };
             match cmd::run::run(args) {
                 Ok(code) => code,

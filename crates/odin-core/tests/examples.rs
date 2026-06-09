@@ -17,6 +17,7 @@ const ADVERSARIAL_REVIEW: &str = include_str!("../../../examples/adversarial-rev
 const LOCAL_REVIEW: &str = include_str!("../../../examples/local-review.yaml");
 const DEEP_REVIEW: &str = include_str!("../../../examples/deep-review.yaml");
 const DEEP_REVIEW_CODEX: &str = include_str!("../../../examples/deep-review-codex.yaml");
+const QUICKSTART: &str = include_str!("../../../examples/quickstart.yaml");
 
 #[test]
 fn issue_to_pr_is_completely_clean() {
@@ -337,6 +338,25 @@ fn deep_review_validates_and_fans_out_then_synthesizes() {
         "synthesize fans in all reviewers"
     );
     assert!(matches!(synth.kind, StepKind::Provider(_)));
+}
+
+#[test]
+fn quickstart_validates_and_is_provider_free() {
+    use odin_core::StepKind;
+    // The whole point: a stranger can run this with NO agent CLI or auth, so it must have zero
+    // provider steps and validate clean.
+    let wf = Workflow::from_yaml_str(QUICKSTART).expect("parses");
+    assert!(
+        validate_source(QUICKSTART, &wf, &KnownNames::builtin()).is_empty(),
+        "quickstart should validate clean"
+    );
+    assert!(!wf.durable, "a stateless one-shot (run with --no-store)");
+    assert!(
+        !wf.steps
+            .iter()
+            .any(|s| matches!(s.kind, StepKind::Provider(_))),
+        "the quickstart must run with no agent CLI — no provider steps"
+    );
 }
 
 #[test]

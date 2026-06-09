@@ -1,0 +1,33 @@
+# The zero-dependency hello-world. Every step is a plain `run:` (shell) — no agent CLI, no `gh`,
+# no authentication. Watch Odin provision a per-run worktree, walk the step DAG, capture the diff,
+# and print a RunSummary. The fastest way to see the engine actually work after a clone:
+#
+#   odin run quickstart --repo . --no-store
+#   # or, without installing: cargo run -p odin-cli -- run examples/quickstart.yaml --repo . --no-store
+#
+# To run a PROVIDER-using workflow offline too (agent steps echo their prompt, no real CLI/auth):
+#   odin run deep-review --repo . --no-store --mock
+schema_version: "1.0"
+name: quickstart
+description: "A zero-dependency hello-world — plain run: steps, no agent CLI or auth required."
+tags: [demo]
+durable: false
+
+workspace:
+  type: worktree
+
+steps:
+  - id: hello
+    run: "echo hello from odin"
+
+  # Writes a file in the worktree; the engine captures the resulting diff as DIFF.
+  - id: write
+    run: "echo built with odin > GREETING.txt"
+    depends_on: [hello]
+
+  # A gate: this command must exit 0 or the step (and run) fails.
+  - id: check
+    run: "echo verifying"
+    depends_on: [write]
+    gates:
+      file_written: "test -f GREETING.txt"
