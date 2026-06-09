@@ -30,7 +30,8 @@ uuid = { version = "1.23.2", features = ["v4", "serde"] }
 minijinja = { version = "2.20.0", optional = true }
 async-trait = { version = "0.1.89", optional = true }
 anyhow = { version = "1.0.102", optional = true }
-tokio = { version = "1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "process", "time", "sync", "macros", "io-util", "fs"], optional = true }
+# `io-std` is for `tokio::io::stderr()` in `StreamMux::to_stderr()` (the `--stream` live view).
+tokio = { version = "1.52.3", default-features = false, features = ["rt", "rt-multi-thread", "process", "time", "sync", "macros", "io-util", "io-std", "fs"], optional = true }
 tokio-util = { version = "0.7.18", features = ["rt"], optional = true }
 futures-core = { version = "0.3.32", optional = true }
 futures-util = { version = "0.3.32", default-features = false, optional = true }

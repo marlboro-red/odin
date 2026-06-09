@@ -66,6 +66,11 @@ enum Command {
         /// workflow runs with **no** real agent CLI or authentication (a demo/offline aid).
         #[arg(long)]
         mock: bool,
+        /// Stream each provider / `run:` / gate step's output to stderr live (prefixed by step
+        /// id) as the run proceeds, instead of only the final summary. Agent CLIs run headless,
+        /// so a provider's streamed stdout is its raw JSON(L); `run:`/gate output is plain text.
+        #[arg(long)]
+        stream: bool,
         /// Emit the run summary as JSON.
         #[arg(long)]
         json: bool,
@@ -402,6 +407,7 @@ fn main() -> ExitCode {
             db,
             no_store,
             mock,
+            stream,
             json,
         } => {
             let args = cmd::run::RunArgs {
@@ -414,6 +420,7 @@ fn main() -> ExitCode {
                 no_store,
                 json,
                 mock,
+                stream,
             };
             match cmd::run::run(args) {
                 Ok(code) => code,

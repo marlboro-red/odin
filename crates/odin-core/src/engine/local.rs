@@ -53,6 +53,7 @@ use crate::api::{
 use crate::error::Result;
 use crate::ids::{RunId, StepId};
 use crate::ir::{Step, StepKind, Workflow};
+use crate::provider::StreamMux;
 use crate::registry::Registry;
 use crate::traits::{CancelToken, RunEvent, RunState, StepState, Store, Workspace};
 use crate::usage::Usage;
@@ -93,6 +94,10 @@ pub(crate) struct LocalEngine {
     /// pass registers its token for its duration (see [`LocalEngine::register_cancel`]) and the
     /// guard removes it on completion, so the map holds exactly the in-flight runs.
     active_cancels: std::sync::Mutex<HashMap<RunId, CancelToken>>,
+    /// When set, each provider / `run:` / gate step tees its live subprocess output to this mux
+    /// (prefixed by step id), in addition to capturing it — the `odin run --stream` view. `None`
+    /// (the default, and always for the daemon) keeps output capture-only.
+    stream: Option<StreamMux>,
 }
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
@@ -223,6 +228,7 @@ impl LocalEngine {
         registry: Registry,
         store: Option<Arc<dyn Store>>,
         repo_root: PathBuf,
+        stream: Option<StreamMux>,
     ) -> Self {
         Self {
             registry,
@@ -232,7 +238,14 @@ impl LocalEngine {
             workspaces: std::sync::Mutex::new(HashMap::new()),
             running: std::sync::Mutex::new(HashSet::new()),
             active_cancels: std::sync::Mutex::new(HashMap::new()),
+            stream,
         }
+    }
+
+    /// The live-output sink for `step`, derived from the engine's [`StreamMux`] (the `--stream`
+    /// view) — `None` when streaming is off, so the capture-only fast path stays the default.
+    fn step_stream(&self, label: &str) -> Option<crate::provider::StreamSink> {
+        self.stream.as_ref().map(|m| m.sink(label))
     }
 
     /// Registers `token` as `run_id`'s cancel handle for an execute pass, returning a guard that
@@ -890,6 +903,31 @@ steps:
     prompt: "diff is:\n{{ artifacts.DIFF }}"
     depends_on: [edit]
 "#;
+
+    /// `--stream` (an engine [`StreamMux`]) tees a `run:` step's live output to the sink as it
+    /// runs, prefixed by step id — while the output is still captured for the final summary.
+    #[tokio::test]
+    async fn stream_mux_tees_run_step_output_prefixed_by_step() {
+        let repo = init_repo().await;
+        let (mux, captured) = crate::provider::StreamMux::capturing();
+        let eng = EngineBuilder::new()
+            .repo(repo.path())
+            .store(Arc::new(SqliteStore::open_in_memory().unwrap()))
+            .stream(mux)
+            .build()
+            .unwrap();
+        let wf = parse(
+            "name: s\nworkspace: { type: worktree }\n\
+             steps:\n  - {id: emit, run: \"echo streamed-marker\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Succeeded);
+        let teed = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            teed.contains("emit │ streamed-marker"),
+            "the step's output should be teed live, prefixed by step id: {teed:?}"
+        );
+    }
 
     /// A deliberately portable end-to-end canary: a single `echo` `run:` step — no path
     /// interpolation, no fragile shell syntax. Runs wherever a POSIX shell resolves (Unix `sh`,
@@ -3750,7 +3788,12 @@ steps:
         // carried-forward DIFF isn't clobbered with empty. A valid base with no changes is a
         // real empty diff and stays Some("").
         let repo = init_repo().await;
-        let eng = LocalEngine::new(Registry::with_builtins(), None, repo.path().to_path_buf());
+        let eng = LocalEngine::new(
+            Registry::with_builtins(),
+            None,
+            repo.path().to_path_buf(),
+            None,
+        );
         let cancel = CancelToken::new();
         let bogus = "0".repeat(40);
         assert!(

@@ -11,11 +11,12 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::ProviderError;
 use crate::traits::CancelToken;
@@ -153,8 +154,121 @@ pub(crate) const GIT_PORTABLE_ENV: &[(&str, &str)] = &[
     ("GIT_CONFIG_VALUE_1", "false"),
 ];
 
+/// A writer shared by every [`StreamSink`] minted from one [`StreamMux`].
+type SharedWriter = Arc<AsyncMutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+
+/// The origin of per-step [`StreamSink`]s: one shared, lock-guarded writer (typically the
+/// terminal's stderr) that every sink locks before emitting a line — so the live output of
+/// concurrently-running steps never interleaves mid-line. Cheap to clone (shared `Arc`); all
+/// clones target the same underlying writer.
+#[derive(Clone)]
+pub struct StreamMux {
+    writer: SharedWriter,
+}
+
+impl std::fmt::Debug for StreamMux {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamMux").finish_non_exhaustive()
+    }
+}
+
+impl StreamMux {
+    /// A mux that tees live output to the process's **stderr** — stdout stays a clean data
+    /// channel (the run summary / `--json`).
+    #[must_use]
+    pub fn to_stderr() -> Self {
+        Self::to_writer(tokio::io::stderr())
+    }
+
+    /// A mux that tees to an arbitrary async writer. Lets an embedder redirect live step output
+    /// (e.g. to a log file or a UI pane) instead of the terminal.
+    #[must_use]
+    pub fn to_writer(writer: impl AsyncWrite + Send + Unpin + 'static) -> Self {
+        Self {
+            writer: Arc::new(AsyncMutex::new(Box::new(writer))),
+        }
+    }
+
+    /// Derives a [`StreamSink`] that prefixes each emitted line with `label`. All sinks from one
+    /// mux share its writer, so their lines serialize.
+    #[must_use]
+    pub fn sink(&self, label: impl Into<Arc<str>>) -> StreamSink {
+        StreamSink {
+            label: label.into(),
+            writer: Arc::clone(&self.writer),
+        }
+    }
+}
+
+/// A per-step live-output sink. When set on [`ProcessOptions::stream`], [`run_process`] tees each
+/// completed line of the child's stdout/stderr to it as the bytes arrive (in addition to capturing
+/// the full output in [`ProcessOutput`]), prefixed with the step's label so concurrent steps stay
+/// legible. Cloning shares the underlying writer.
+#[derive(Clone)]
+pub struct StreamSink {
+    label: Arc<str>,
+    writer: SharedWriter,
+}
+
+impl std::fmt::Debug for StreamSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamSink")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Cap on a single un-terminated streamed line. A pathological newline-free stream — a huge
+/// one-line JSON blob, or a `\r`-only progress bar — would otherwise let `pending` grow until
+/// EOF; past this we flush it as a partial line so the live buffer stays bounded and the output
+/// still appears as it arrives. (The full output is still captured intact in [`ProcessOutput`].)
+const MAX_STREAM_LINE: usize = 64 * 1024;
+
+impl StreamSink {
+    /// Feeds a chunk of child output: splits on `\n`, emits each completed line, and buffers any
+    /// trailing partial line in `pending` for the next chunk — flushing early if it grows past
+    /// [`MAX_STREAM_LINE`] so a newline-free stream can't buffer unbounded.
+    async fn feed(&self, bytes: &[u8], pending: &mut Vec<u8>) {
+        let mut start = 0;
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' {
+                pending.extend_from_slice(&bytes[start..i]);
+                self.emit_line(pending).await;
+                pending.clear();
+                start = i + 1;
+            }
+        }
+        pending.extend_from_slice(&bytes[start..]);
+        if pending.len() >= MAX_STREAM_LINE {
+            self.emit_line(pending).await;
+            pending.clear();
+        }
+    }
+
+    /// Emits any buffered trailing partial line — called once at EOF.
+    async fn flush(&self, pending: &mut Vec<u8>) {
+        if !pending.is_empty() {
+            self.emit_line(pending).await;
+            pending.clear();
+        }
+    }
+
+    /// Writes one framed line — `<label> │ <text>` — under the shared writer lock, so it can't
+    /// interleave with another sink's line.
+    async fn emit_line(&self, line: &[u8]) {
+        let text = String::from_utf8_lossy(line);
+        // Drop a trailing CR so CRLF output isn't double-spaced on the terminal.
+        let text = text.strip_suffix('\r').unwrap_or(&text);
+        let framed = format!("{} │ {text}\n", self.label);
+        let mut w = self.writer.lock().await;
+        let _ = w.write_all(framed.as_bytes()).await;
+        let _ = w.flush().await;
+    }
+}
+
 /// Knobs for a single [`run_process`] invocation.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ProcessOptions {
     /// Working directory to run in. Defaults to the current directory.
     pub workdir: Option<PathBuf>,
@@ -165,6 +279,9 @@ pub struct ProcessOptions {
     pub env: Vec<(String, String)>,
     /// Optional stdin to feed the child (then close).
     pub stdin: Option<String>,
+    /// Live-stream the child's stdout/stderr to this sink as it arrives (in addition to capturing
+    /// it in [`ProcessOutput`]). `None` (the default) = capture only.
+    pub stream: Option<StreamSink>,
 }
 
 /// The captured result of a finished (or killed) subprocess.
@@ -245,19 +362,12 @@ pub async fn run_process(
         });
     }
 
-    // Drain stdout/stderr concurrently with the wait, so pipes never fill and block.
-    let mut out_pipe = child.stdout.take().expect("stdout piped");
-    let mut err_pipe = child.stderr.take().expect("stderr piped");
-    let out_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = out_pipe.read_to_end(&mut buf).await;
-        buf
-    });
-    let err_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = err_pipe.read_to_end(&mut buf).await;
-        buf
-    });
+    // Drain stdout/stderr concurrently with the wait, so pipes never fill and block. With a
+    // stream sink set, each pipe is also teed line-by-line to it as the bytes arrive.
+    let out_pipe = child.stdout.take().expect("stdout piped");
+    let err_pipe = child.stderr.take().expect("stderr piped");
+    let out_task = tokio::spawn(drain_pipe(out_pipe, opts.stream.clone()));
+    let err_task = tokio::spawn(drain_pipe(err_pipe, opts.stream.clone()));
 
     let waited = tokio::select! {
         status = child.wait() => match status {
@@ -304,6 +414,33 @@ pub async fn run_process(
     })
 }
 
+/// Reads `pipe` to EOF and returns all of its bytes. With a [`StreamSink`] it also tees each
+/// completed line to the sink as it arrives (the live path); without one it does a single
+/// `read_to_end` (the capture-only fast path, byte-identical to the pre-streaming behavior).
+async fn drain_pipe<R>(mut pipe: R, sink: Option<StreamSink>) -> Vec<u8>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let mut buf = Vec::new();
+    let Some(sink) = sink else {
+        let _ = pipe.read_to_end(&mut buf).await;
+        return buf;
+    };
+    let mut chunk = [0_u8; 8192];
+    let mut pending = Vec::new();
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                sink.feed(&chunk[..n], &mut pending).await;
+            }
+        }
+    }
+    sink.flush(&mut pending).await;
+    buf
+}
+
 /// Sleeps for `d`, or never resolves if `d` is `None`.
 async fn sleep_opt(d: Option<Duration>) {
     match d {
@@ -331,6 +468,44 @@ async fn collect(task: tokio::task::JoinHandle<Vec<u8>>, killed: bool) -> String
         task.await.unwrap_or_default()
     };
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+impl StreamMux {
+    /// A mux that captures everything teed through it into a shared buffer, for assertions.
+    /// Crate-visible so engine tests (not just this module) can assert on streamed output.
+    pub(crate) fn capturing() -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let buf = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (Self::to_writer(CaptureWriter(Arc::clone(&buf))), buf)
+    }
+}
+
+/// A test [`AsyncWrite`] that appends everything written into a shared `Vec` for inspection.
+#[cfg(test)]
+struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl AsyncWrite for CaptureWriter {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        std::task::Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +761,66 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.stdout.trim(), "CLEAN:kept");
+    }
+
+    #[tokio::test]
+    async fn streams_lines_live_while_capturing() {
+        let sh = shell_or_skip!();
+        let (mux, captured) = super::StreamMux::capturing();
+        let opts = ProcessOptions {
+            stream: Some(mux.sink("step1")),
+            ..Default::default()
+        };
+        let out = run_process(
+            sh,
+            // Two complete lines (one per stream) plus a trailing line with no newline.
+            &args(&["-c", "echo line-a; echo line-b 1>&2; printf 'no-newline'"]),
+            &opts,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        // The full output is still captured, exactly as without streaming.
+        assert!(out.stdout.contains("line-a"));
+        assert!(out.stderr.contains("line-b"));
+        assert!(out.stdout.contains("no-newline"));
+        // ...and each line was teed live to the mux, framed with the step label.
+        let teed = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(teed.contains("step1 │ line-a"), "teed: {teed:?}");
+        assert!(teed.contains("step1 │ line-b"), "teed: {teed:?}");
+        // The trailing partial line (no newline) is flushed at EOF, not dropped.
+        assert!(teed.contains("step1 │ no-newline"), "teed: {teed:?}");
+    }
+
+    #[tokio::test]
+    async fn streaming_survives_a_timeout_kill() {
+        // Stream a line, then hang past the timeout: the kill must still return promptly (the
+        // drain task — possibly mid-emit, holding the writer lock — is aborted without deadlock),
+        // and the line emitted before the kill must have been teed live.
+        let sh = shell_or_skip!();
+        let (mux, captured) = super::StreamMux::capturing();
+        let opts = ProcessOptions {
+            timeout: Some(Duration::from_millis(200)),
+            stream: Some(mux.sink("slow")),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let out = run_process(
+            sh,
+            &args(&["-c", "echo early-line; sleep 5"]),
+            &opts,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(out.timed_out, "expected a timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "must return promptly after the kill, took {:?}",
+            started.elapsed()
+        );
+        let teed = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(teed.contains("slow │ early-line"), "teed: {teed:?}");
     }
 
     #[tokio::test]

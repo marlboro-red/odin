@@ -76,7 +76,32 @@ Run a workflow to completion against a git repository. Steps using `run:` execut
 | `--db <FILE>` | `<repo>/.odin/state.db` | The run-state SQLite database. |
 | `--no-store` | off | Don't persist run state (no durability / resume). Ignores `--db`. |
 | `--mock` | off | Replace `provider:` steps with a mock that echoes their rendered prompt, so a provider-using workflow runs with **no** real agent CLI or authentication — a demo/offline aid (`run:`/`action:` steps still execute for real). |
+| `--stream` | off | Tee each `provider:` / `run:` / gate step's subprocess output to **stderr** live (prefixed by step id) as the run proceeds, instead of only the final summary. See below. |
 | `--json` | off | Emit the run summary as JSON. |
+
+### `--stream`: watch steps as they run
+
+By default `odin run` prints only a final summary; the diagnostic stream on stderr reports
+*step finished* events but not the steps' own output. `--stream` tees every subprocess Odin
+spawns — for `provider:`, `run:`, and gate steps — to **stderr** as the bytes arrive, line by
+line, each prefixed with the step id so concurrent `scratch:` steps stay legible:
+
+```text
+emit │ alpha-line-1
+emit │ alpha-line-2
+review │ cargo test output…
+```
+
+Output goes to stderr so stdout stays a clean channel for the summary / `--json`
+(`odin run … --stream 1>summary.txt 2>run.log` separates them). Lines never interleave
+mid-line across steps. Caveats: `action:` steps (git/PR) and Odin's internal git calls are not
+streamed; and because agent CLIs run **headless** (JSON output mode), a `provider:` step's
+streamed stdout is its raw JSON(L) — `codex`/`copilot` show incremental activity, `claude`
+emits one final document — so the cleanest live view is `run:`/gate output (builds, tests).
+With `--mock`, `provider:` steps echo inline without spawning a subprocess, so they produce
+**no** streamed output (only `run:`/gate steps stream). A newline-free stream (a huge one-line
+blob, or a `\r`-only progress bar) is flushed in 64 KiB chunks rather than buffered to the end.
+Streaming is off by default and never enabled by the daemon.
 
 ```sh
 odin run examples/issue-to-pr.yaml --repo . --param issue_url=https://github.com/owner/repo/issues/1
