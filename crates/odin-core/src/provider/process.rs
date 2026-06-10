@@ -486,6 +486,9 @@ where
 /// direct-child kill and keep running (and writing into the workspace). We shell out to `kill`
 /// because the crate forbids `unsafe`, so it can't call `libc::killpg` directly; `start_kill` is a
 /// belt-and-suspenders fallback (and the only step on non-Unix).
+// On non-Unix the `#[cfg(unix)]` group-kill is compiled out, leaving a body with no `.await` —
+// allow that rather than splitting into two platform-specific functions.
+#[cfg_attr(not(unix), allow(clippy::unused_async))]
 async fn kill_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {

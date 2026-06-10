@@ -213,13 +213,13 @@ mod tests {
         assert!(validate_push_arg("remote", "origin").is_ok());
         // Force-push, retarget, option, URL, whitespace, and empty are all rejected.
         for bad in [
-            "+work:main",            // force-push refspec
-            "HEAD:refs/heads/main",  // retarget another branch
-            "--upload-pack=evil",    // option injection
-            "https://evil/x.git",    // URL remote (contains ':')
-            "git@host:owner/repo",   // scp-like URL (contains ':')
-            "a branch",              // whitespace
-            "",                      // empty
+            "+work:main",           // force-push refspec
+            "HEAD:refs/heads/main", // retarget another branch
+            "--upload-pack=evil",   // option injection
+            "https://evil/x.git",   // URL remote (contains ':')
+            "git@host:owner/repo",  // scp-like URL (contains ':')
+            "a branch",             // whitespace
+            "",                     // empty
         ] {
             assert!(
                 validate_push_arg("branch", bad).is_err(),

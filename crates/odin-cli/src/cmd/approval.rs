@@ -58,8 +58,8 @@ fn resolve(args: &ApprovalArgs) -> anyhow::Result<Resolved> {
     // Accept a recipe name as well as a file path for `--workflow`, matching `odin run` — so a run
     // started by name (`odin run gated-deploy`) can be approved by name too.
     let file = crate::catalog::resolve_arg(&args.workflow, args.recipes_dir.as_deref())?;
-    let src = std::fs::read_to_string(&file)
-        .with_context(|| format!("reading {}", file.display()))?;
+    let src =
+        std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let workflow = Workflow::from_yaml_str(&src)
         .map_err(|e| anyhow::anyhow!("{}: parse error\n  {e}", file.display()))?;
 

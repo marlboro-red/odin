@@ -1139,12 +1139,7 @@ steps:
             .iter()
             .find(|s| s.run_id == suspended.run_id)
             .expect("resume_all must complete the suspended run");
-        assert_eq!(
-            done.status,
-            RunStatus::Succeeded,
-            "error: {:?}",
-            done.error
-        );
+        assert_eq!(done.status, RunStatus::Succeeded, "error: {:?}", done.error);
         assert!(
             store
                 .load_incomplete()
@@ -1196,7 +1191,12 @@ steps:
             .expect("the watcher must cancel the run within a poll interval")
             .unwrap()
             .unwrap();
-        assert_eq!(summary.status, RunStatus::Cancelled, "error: {:?}", summary.error);
+        assert_eq!(
+            summary.status,
+            RunStatus::Cancelled,
+            "error: {:?}",
+            summary.error
+        );
     }
 
     /// `resume_all` recovers MULTIPLE incomplete runs (concurrently) and completes them all — the
@@ -1216,7 +1216,9 @@ steps:
         for _ in 0..2 {
             let e = eng.clone();
             let w = wf.clone();
-            handles.push(tokio::spawn(async move { e.run(&w, RunInput::manual()).await }));
+            handles.push(tokio::spawn(
+                async move { e.run(&w, RunInput::manual()).await },
+            ));
         }
         let killer = {
             let e = eng.clone();
@@ -1242,7 +1244,10 @@ steps:
         assert!(
             resumed.iter().all(|s| s.status == RunStatus::Succeeded),
             "every recovered run completes: {:?}",
-            resumed.iter().map(|s| (s.run_id, s.status)).collect::<Vec<_>>()
+            resumed
+                .iter()
+                .map(|s| (s.run_id, s.status))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1306,7 +1311,10 @@ steps:
             "a user-cancelled run is terminal and never resumed"
         );
         assert!(
-            eng.resume_all(std::slice::from_ref(&wf)).await.unwrap().is_empty(),
+            eng.resume_all(std::slice::from_ref(&wf))
+                .await
+                .unwrap()
+                .is_empty(),
             "resume_all must not pick up a user-cancelled run"
         );
     }

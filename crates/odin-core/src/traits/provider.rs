@@ -211,6 +211,10 @@ impl CancelToken {
 
     /// True when cancellation was a graceful [`shutdown`](Self::shutdown) (not a user
     /// [`cancel`](Self::cancel)) — the engine uses this to leave a durable run resumable.
+    ///
+    /// Only the engine (gated on `runtime` + `templating`) reads this; allow it to be unused in a
+    /// runtime-without-templating build so the per-feature clippy pass stays clean.
+    #[cfg_attr(not(feature = "templating"), allow(dead_code))]
     #[must_use]
     pub(crate) fn is_shutdown(&self) -> bool {
         self.0.is_cancelled()
