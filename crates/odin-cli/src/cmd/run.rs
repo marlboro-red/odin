@@ -48,6 +48,7 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     runtime.block_on(execute(&workflow, args))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode> {
     let repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
 
@@ -118,7 +119,31 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
         input.params.insert(key.to_owned(), parse_value(value));
     }
 
-    match engine.run(workflow, input).await {
+    // Run, but stay responsive to ctrl-C. The engine now puts each agent in its own process group
+    // (so a kill reaps the whole tree), which means the terminal's SIGINT no longer reaches the
+    // agent — we must translate ctrl-C into an engine cancellation here. First ctrl-C stops the
+    // in-flight run gracefully (its subprocess + group are killed, the run settles); a second
+    // forces an immediate exit in case it doesn't.
+    let run_fut = engine.run(workflow, input);
+    tokio::pin!(run_fut);
+    let mut interrupts = 0_u8;
+    let result = loop {
+        tokio::select! {
+            outcome = &mut run_fut => break outcome,
+            _ = tokio::signal::ctrl_c() => {
+                interrupts += 1;
+                if interrupts == 1 {
+                    eprintln!("\n⏹ interrupting — stopping the run (ctrl-c again to force quit)…");
+                    engine.cancel_all_active();
+                } else {
+                    eprintln!("\n⏹ force quit");
+                    return Ok(ExitCode::from(130));
+                }
+            }
+        }
+    };
+
+    match result {
         Ok(summary) => {
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&summary)?);
