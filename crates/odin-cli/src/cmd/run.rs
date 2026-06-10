@@ -85,7 +85,11 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
             .clone()
             .unwrap_or_else(|| repo.join(".odin").join("state.db"));
         if let Some(parent) = db.parent() {
-            std::fs::create_dir_all(parent).ok();
+            // Propagate a mkdir failure (e.g. a permission error on `.odin/`) instead of
+            // swallowing it — otherwise `SqliteStore::open` fails next with the misleading
+            // "opening the run state database" rather than the real cause.
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating the state directory {}", parent.display()))?;
         }
         let store = SqliteStore::open(&db).context("opening the run state database")?;
         builder = builder.store(Arc::new(store));

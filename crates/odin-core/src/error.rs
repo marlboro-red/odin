@@ -51,13 +51,6 @@ pub enum Error {
     #[error("invalid run input: {0}")]
     Input(String),
 
-    /// A frozen-API surface whose implementation is a later milestone was invoked.
-    #[error("{feature} is not implemented yet")]
-    Unimplemented {
-        /// The not-yet-implemented feature.
-        feature: &'static str,
-    },
-
     /// Template render/eval failure at run time (only with the `templating` feature).
     #[cfg(feature = "templating")]
     #[error("template error in {context}: {source}")]
@@ -120,9 +113,6 @@ pub enum WorkspaceError {
     /// A git operation failed.
     #[error("git error: {0}")]
     Git(String),
-    /// A finite slot pool had no free slot.
-    #[error("no free slot in pool")]
-    PoolExhausted,
     /// An I/O failure while provisioning the workspace.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),

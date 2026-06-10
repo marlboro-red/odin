@@ -63,7 +63,6 @@
 //!
 //! A parse-only embedder (a linter or LSP) can depend on `odin-core` with
 //! `default-features = false, features = ["ir"]` and pull in none of `tokio`.
-#![doc(html_root_url = "https://docs.rs/odin-core/0.0.1")]
 
 #[cfg(feature = "runtime")]
 pub mod action;
