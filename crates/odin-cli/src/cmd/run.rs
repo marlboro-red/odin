@@ -262,6 +262,16 @@ fn glyph(status: StepStatus) -> char {
     }
 }
 
+/// A compact human duration: `ms` under a second, else `s` with one decimal (e.g. `340ms`, `1.2s`).
+/// Integer math (no float cast) — a few ms of rounding is irrelevant for a display string.
+fn fmt_duration_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else {
+        format!("{}.{}s", ms / 1000, (ms % 1000) / 100)
+    }
+}
+
 pub(crate) fn print_summary(summary: &RunSummary) {
     let status = match summary.status {
         RunStatus::Succeeded => "succeeded",
@@ -274,7 +284,13 @@ pub(crate) fn print_summary(summary: &RunSummary) {
         let exit = step
             .exit_code
             .map_or(String::new(), |c| format!(" (exit {c})"));
-        println!("  {} {}{exit}", glyph(step.status), step.id);
+        let dur = match (step.started_at, step.finished_at) {
+            (Some(s), Some(f)) => {
+                format!(" [{}]", fmt_duration_ms((f - s).num_milliseconds().max(0)))
+            }
+            _ => String::new(),
+        };
+        println!("  {} {}{exit}{dur}", glyph(step.status), step.id);
         // Surface why a step failed (first line of the recorded reason) right under it.
         if step.status == StepStatus::Failed {
             if let Some(reason) = step.error.as_deref().and_then(|e| e.lines().next()) {
@@ -298,6 +314,12 @@ pub(crate) fn print_summary(summary: &RunSummary) {
         summary.usage.output_tokens,
         summary.usage.cost_usd()
     );
+    if let Some(finished) = summary.finished_at {
+        println!(
+            "took: {}",
+            fmt_duration_ms((finished - summary.started_at).num_milliseconds().max(0))
+        );
+    }
     if let Some(error) = &summary.error {
         println!("error: {error}");
     }

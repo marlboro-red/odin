@@ -214,6 +214,10 @@ pub(crate) struct StepOutcome {
     raw_stdout: String,
     attempts: u8,
     judge_score: Option<f32>,
+    /// When the step began / settled, stamped by `run_one` around the whole per-step execution
+    /// (provisioning + retries). Folded into the persisted [`StepState`] for the timing surface.
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl StepOutcome {
@@ -231,6 +235,8 @@ impl StepOutcome {
             raw_stdout: String::new(),
             attempts: 1,
             judge_score: None,
+            started_at: None,
+            finished_at: None,
         }
     }
 
@@ -248,6 +254,8 @@ impl StepOutcome {
             raw_stdout: String::new(),
             attempts: 1,
             judge_score: None,
+            started_at: None,
+            finished_at: None,
         }
     }
 
@@ -263,6 +271,8 @@ impl StepOutcome {
             judge_score: self.judge_score,
             side_effects: self.side_effects.clone(),
             error: self.error.clone(),
+            started_at: self.started_at,
+            finished_at: self.finished_at,
         }
     }
 }
@@ -443,6 +453,8 @@ impl LocalEngine {
                         judge_score: st.judge_score,
                         side_effects: st.side_effects.clone(),
                         error: st.error.clone(),
+                        started_at: st.started_at,
+                        finished_at: st.finished_at,
                     },
                 )
             })
@@ -712,6 +724,10 @@ impl LocalEngine {
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                // The execution start (run_one re-stamps the precise window when it settles; this
+                // value stands for a step interrupted while still Running).
+                started_at: Some(Utc::now()),
+                finished_at: None,
             },
         );
         state.updated_at = Utc::now();
@@ -747,6 +763,8 @@ impl LocalEngine {
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         state.status = RunStatus::AwaitingApproval;
@@ -1062,7 +1080,20 @@ impl LocalEngine {
             side_effects.extend(outcome.side_effects.iter().cloned());
             // The persisted projection; side effects are kept so a later resume can reconstruct
             // the run's full set without re-running the step (see the resume seed below).
-            let step_state = outcome.to_state();
+            let mut step_state = outcome.to_state();
+            // Complete the timings for a step the executor didn't stamp itself — a `loop:` step
+            // (run by the scheduler, not `run_one`) and an instantly-decided approval gate. Their
+            // outcomes carry no timing, so without this the longest step in a run shows none. Keep
+            // the `started_at` that `mark_running` already recorded and stamp the settle time;
+            // a Skipped step never ran, so it stays untimed.
+            if step_state.status != StepStatus::Skipped {
+                if step_state.started_at.is_none() {
+                    step_state.started_at = state.steps.get(&id).and_then(|prev| prev.started_at);
+                }
+                if step_state.finished_at.is_none() {
+                    step_state.finished_at = Some(Utc::now());
+                }
+            }
             state.steps.insert(id.clone(), step_state.clone());
             if matches!(
                 outcome.status,
@@ -2114,6 +2145,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2206,6 +2239,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2291,6 +2326,8 @@ steps:
                 judge_score: None,
                 side_effects: vec![SideEffect::commit("abc123", Some("main".to_owned()))],
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2364,6 +2401,8 @@ steps:
             judge_score: None,
             side_effects: Vec::new(),
             error: None,
+            started_at: None,
+            finished_at: None,
         };
         steps.insert(StepId::new("a"), passed(0));
         steps.insert(
@@ -2378,6 +2417,8 @@ steps:
                 judge_score: None,
                 side_effects: vec![SideEffect::commit("def456", Some("main".to_owned()))],
                 error: Some("boom".to_owned()),
+                started_at: None,
+                finished_at: None,
             },
         );
         steps.insert(
@@ -2392,6 +2433,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: Some("an upstream dependency did not pass".to_owned()),
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2482,6 +2525,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2567,6 +2612,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2684,6 +2731,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -2755,6 +2804,8 @@ steps:
                     judge_score: None,
                     side_effects: Vec::new(),
                     error: None,
+                    started_at: None,
+                    finished_at: None,
                 },
             );
         }
@@ -3307,6 +3358,7 @@ steps:
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn loop_resumes_from_the_last_completed_iteration() {
         let repo = init_repo().await;
         let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
@@ -3370,6 +3422,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         let state = RunState {
@@ -3661,6 +3715,52 @@ steps:
                 .iter()
                 .any(|e| matches!(e, RunEvent::RunResumed { .. })),
             "missing RunResumed: {events:?}"
+        );
+    }
+
+    /// Per-step and run-level timings are recorded and surface through `RunSummary`/`RunView`.
+    #[tokio::test]
+    async fn step_and_run_timings_are_recorded() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: t\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let step = &s.steps[0];
+        let (started, finished) = (
+            step.started_at.expect("step started_at"),
+            step.finished_at.expect("step finished_at"),
+        );
+        assert!(finished >= started, "finished must be >= started");
+        // …and through the RunView (the list/dashboard projection), round-tripped via the store.
+        let views = eng.recent(5).await.unwrap();
+        let v = views
+            .iter()
+            .find(|v| v.run_id == s.run_id.to_string())
+            .expect("run in recent()");
+        assert!(v.duration_ms.is_some(), "a terminal run has a duration_ms");
+        assert!(v.steps[0].duration_ms.is_some(), "step has a duration_ms");
+    }
+
+    /// A `loop:` step — run by the scheduler, not `run_one` — is timed too (the longest step in a
+    /// run is exactly the one you want timed). Regression for the fold-clobber bug.
+    #[tokio::test]
+    async fn a_loop_step_is_timed() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: lt\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.check.status == 'passed'\"\n      max: 2\n      steps:\n        - {id: check, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let loop_step = s.steps.iter().find(|st| st.id.as_str() == "fix").unwrap();
+        assert!(
+            loop_step.started_at.is_some() && loop_step.finished_at.is_some(),
+            "a loop step must be timed: {loop_step:?}"
         );
     }
 
@@ -4034,6 +4134,8 @@ steps:
                 judge_score: None,
                 side_effects: Vec::new(),
                 error: None,
+                started_at: None,
+                finished_at: None,
             },
         );
         state.artifacts.insert(DIFF.into(), "Y".repeat(2_000_000));

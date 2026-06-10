@@ -23,8 +23,13 @@ pub struct RunView {
     pub workflow: String,
     /// The run status, lowercase serde string.
     pub status: String,
+    /// When the run was created/started (RFC 3339).
+    pub created_at: String,
     /// When the run state was last updated (RFC 3339).
     pub updated_at: String,
+    /// Wall-clock run duration in milliseconds, for a **terminal** run (`updated_at - created_at`);
+    /// `None` while the run is still in flight or paused.
+    pub duration_ms: Option<i64>,
     /// Per-step progress, in execution order.
     pub steps: Vec<StepView>,
     /// For an `awaiting_approval` run: the gate step + its message. `None` otherwise.
@@ -43,6 +48,8 @@ pub struct StepView {
     pub exit_code: Option<i32>,
     /// Why the step failed/was skipped (the recorded reason), if any.
     pub error: Option<String>,
+    /// The step's wall-clock duration in milliseconds, if it ran (`finished_at - started_at`).
+    pub duration_ms: Option<i64>,
 }
 
 /// The approval gate of a paused run.
@@ -89,6 +96,10 @@ impl RunView {
                 status: tag(&st.status),
                 exit_code: st.exit_code,
                 error: st.error.clone(),
+                duration_ms: match (st.started_at, st.finished_at) {
+                    (Some(s), Some(f)) => Some((f - s).num_milliseconds().max(0)),
+                    _ => None,
+                },
             })
             .collect();
         // The gate parked at `awaiting_approval`, if any (matched by serde tag so it can't drift
@@ -105,11 +116,22 @@ impl RunView {
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
             });
+        // A terminal run's duration is settled (updated_at ≈ when it finished); an in-flight or
+        // paused run has no final duration yet. Keyed on the enum (not the serde string) so a new
+        // status variant can't silently make this `None` forever. `.max(0)` guards a backwards
+        // wall-clock step (NTP) from yielding a negative duration.
+        let duration_ms = state.status.is_terminal().then(|| {
+            (state.updated_at - state.created_at)
+                .num_milliseconds()
+                .max(0)
+        });
         Self {
             run_id: state.run_id.to_string(),
             workflow: state.workflow.as_str().to_owned(),
             status: tag(&state.status),
+            created_at: state.created_at.to_rfc3339(),
             updated_at: state.updated_at.to_rfc3339(),
+            duration_ms,
             steps,
             gate,
         }
@@ -160,6 +182,8 @@ mod tests {
             judge_score: None,
             side_effects: Vec::new(),
             error: None,
+            started_at: None,
+            finished_at: None,
         }
     }
 

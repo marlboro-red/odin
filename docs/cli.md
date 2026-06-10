@@ -426,18 +426,20 @@ available), the catalog directory can't be resolved/created, or a file can't be 
   set) for a malformed file, `error` for an IO/engine failure, else `validate`.
 - **`run --json`** → a `RunSummary`: `{ "run_id", "workflow", "status", "steps": [ {
   "id", "status", "attempts", "exit_code", "outputs", "gates", "judge_score", "usage",
-  "error" } ], "usage": { "input_tokens", "output_tokens", "cost_micros" }, "side_effects",
-  "diff", "error", "started_at", "finished_at" }`. A failed step's `error` carries the exit
-  code + a stderr tail (or the failed gate / sub-threshold judge), and the run-level `error`
-  names the first failed step and its reason.
+  "error", "started_at", "finished_at" } ], "usage": { "input_tokens", "output_tokens",
+  "cost_micros" }, "side_effects", "diff", "error", "started_at", "finished_at" }`. Each step's
+  `started_at`/`finished_at` (RFC 3339; absent for a skipped step or a run recorded before this
+  field existed) give its wall-clock duration — to see where a run's time went. A failed step's `error` carries the exit code + a stderr tail
+  (or the failed gate / sub-threshold judge), and the run-level `error` names the first failed step.
 - **`show --json`** → the full `RunState` (the persisted checkpoint).
 - **`list --json`** → `[{ "run_id", "workflow", "status", "updated_at" }, …]`.
 - **`logs --json`** → an array of `RunEvent` (each tagged by `kind`).
 - **`status --json`** → `[ RunView, … ]`, a `RunView` being `{ "run_id", "workflow", "status",
-  "updated_at", "steps": [ { "id", "status", "exit_code", "error" } ], "gate": { "step",
-  "message" } | null }`. This is the **same shape** the daemon's
-  [`GET /api/runs`](daemon.md#dashboard) returns (and `/api/runs/{id}` adds `"diff"` + `"error"`),
-  so one schema serves the CLI, the API, and the dashboard.
+  "created_at", "updated_at", "duration_ms", "steps": [ { "id", "status", "exit_code", "error",
+  "duration_ms" } ], "gate": { "step", "message" } | null }`. `duration_ms` is the run's wall-clock
+  for a terminal run (`null` while in flight); each step carries its own `duration_ms`. This is the
+  **same shape** the daemon's [`GET /api/runs`](daemon.md#dashboard) returns (and `/api/runs/{id}`
+  adds `"diff"` + `"error"`), so one schema serves the CLI, the API, and the dashboard.
 
 Statuses serialize snake_case (`pending`, `running`, `awaiting_approval`, `succeeded`, `failed`,
 `cancelled` for a run; `pending`, `running`, `awaiting_approval`, `passed`, `failed`, `skipped` for
