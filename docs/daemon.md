@@ -268,6 +268,10 @@ odin_step_duration_seconds_count 203
 - **`odin_webhook_deliveries_total{result}`** (counter) — `/webhook` deliveries by outcome:
   `accepted` (signed/valid and enqueued, a 202), `duplicate` (a deduped retry, a 200), or `rejected`
   (bad/missing signature, bad body, no event header, or a full queue). In-memory (resets on restart).
+- **`odin_steps_in_flight`** (gauge) — steps in an active execution segment right now, across all
+  runs (fed by the event hook; no store equivalent). Run-level activity is the store-backed
+  `odin_runs_in_flight` / `odin_runs_pending` gauges above — pair them with `--max-concurrent-runs`
+  to read executor saturation. In-memory (resets on restart).
 
 `/metrics` (like `/health`) is **unauthenticated** — it's read-only operational data and
 Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the same reverse
