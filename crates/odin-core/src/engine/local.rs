@@ -321,6 +321,10 @@ impl LocalEngine {
 
     /// Spools a step attempt's full output to `<logs_dir>/<run_id>/<step>.<attempt>.log` when a
     /// `logs_dir` is configured. Best-effort: a spool failure is a WARN, never fails the step.
+    ///
+    /// If that filename already exists — a loop body re-running the same step on a later iteration,
+    /// whose attempt counter resets to 1 — a `.1`/`.2`/… suffix is appended so an earlier
+    /// iteration's log is never clobbered (each run of the step keeps its own file).
     async fn spool_step_log(
         &self,
         run_id: RunId,
@@ -333,8 +337,15 @@ impl LocalEngine {
         if outcome.raw_stdout.is_empty() && outcome.stderr.is_empty() {
             return;
         }
+        // Defence in depth: a step id is validated to `[A-Za-z_][A-Za-z0-9_]*` (ODIN004) before any
+        // run, so it can't hold a path separator — but never build a write path from an id that
+        // somehow does (e.g. a future path that skips validation), to rule out traversal.
+        let id = step.as_str();
+        if id.contains(['/', '\\']) || id.contains("..") {
+            tracing::warn!(run_id = %run_id, step = %step, "refusing to spool a step log for an id containing a path separator");
+            return;
+        }
         let dir = base.join(run_id.to_string());
-        let path = dir.join(format!("{}.{attempt}.log", step.as_str()));
         let mut body = outcome.raw_stdout.clone();
         if !outcome.stderr.is_empty() {
             if !body.is_empty() && !body.ends_with('\n') {
@@ -345,12 +356,36 @@ impl LocalEngine {
         }
         let write = async {
             tokio::fs::create_dir_all(&dir).await?;
-            tokio::fs::write(&path, body.as_bytes()).await
+            // First free filename, so a loop re-running the same step doesn't clobber its earlier
+            // logs. The same (run, step, attempt) is never written concurrently (retries are
+            // sequential, distinct steps have distinct ids), so this check-then-write can't race.
+            let mut suffix = 0u32;
+            let path = loop {
+                let name = if suffix == 0 {
+                    format!("{id}.{attempt}.log")
+                } else {
+                    format!("{id}.{attempt}.{suffix}.log")
+                };
+                let path = dir.join(name);
+                if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                    break path;
+                }
+                suffix += 1;
+                if suffix > 100_000 {
+                    break path; // absurd; give up rather than spin
+                }
+            };
+            tokio::fs::write(&path, body.as_bytes())
+                .await
+                .map(|()| path)
         };
-        if let Err(e) = write.await {
-            tracing::warn!(run_id = %run_id, step = %step, error = %e, "failed to spool step log");
-        } else {
-            tracing::debug!(run_id = %run_id, step = %step, path = %path.display(), "spooled step log");
+        match write.await {
+            Ok(path) => {
+                tracing::debug!(run_id = %run_id, step = %step, path = %path.display(), "spooled step log");
+            }
+            Err(e) => {
+                tracing::warn!(run_id = %run_id, step = %step, error = %e, "failed to spool step log");
+            }
         }
     }
 
@@ -3675,6 +3710,89 @@ steps:
         let body = std::fs::read_to_string(&logfile)
             .unwrap_or_else(|e| panic!("reading {}: {e}", logfile.display()));
         assert!(body.contains("hello-spool"), "log body: {body:?}");
+    }
+
+    /// A FAILING step is spooled too (its stderr survives on disk).
+    #[tokio::test]
+    async fn a_failing_step_is_spooled() {
+        let repo = init_repo().await;
+        let logs = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = EngineBuilder::new()
+            .repo(repo.path())
+            .store(store)
+            .logs_dir(logs.path())
+            .build()
+            .unwrap();
+        let wf = parse(
+            "name: f\nworkspace: { type: worktree }\nsteps:\n  - {id: bad, run: \"echo oops-stderr >&2; exit 1\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let body =
+            std::fs::read_to_string(logs.path().join(s.run_id.to_string()).join("bad.1.log"))
+                .expect("a failing step should still be spooled");
+        assert!(body.contains("oops-stderr"), "log body: {body:?}");
+    }
+
+    /// A loop body re-running the same step on each iteration keeps a distinct log per iteration
+    /// (suffixed), instead of clobbering.
+    #[tokio::test]
+    async fn loop_iterations_do_not_clobber_step_logs() {
+        let repo = init_repo().await;
+        let logs = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = EngineBuilder::new()
+            .repo(repo.path())
+            .store(store)
+            .logs_dir(logs.path())
+            .build()
+            .unwrap();
+        // `until: false` never satisfies, so the loop runs all `max` iterations.
+        let wf = parse(
+            "name: lp\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"false\"\n      max: 3\n      steps:\n        - {id: inner, run: \"echo iter-{{ loop.counter }}\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let dir = logs.path().join(s.run_id.to_string());
+        let inner_logs = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("inner."))
+            .count();
+        assert!(
+            inner_logs >= 3,
+            "expected one inner-step log per iteration (≥3), got {inner_logs}"
+        );
+    }
+
+    /// A DRY-RUN prune keeps the spooled logs (it deletes nothing).
+    #[tokio::test]
+    async fn dry_run_prune_keeps_spooled_logs() {
+        let repo = init_repo().await;
+        let logs = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = EngineBuilder::new()
+            .repo(repo.path())
+            .store(store)
+            .logs_dir(logs.path())
+            .build()
+            .unwrap();
+        let wf = parse(
+            "name: dp\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"echo x\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let run_dir = logs.path().join(s.run_id.to_string());
+        eng.prune(
+            &PrunePolicy {
+                max_age: None,
+                keep_last: Some(0),
+                workflow: None,
+            },
+            true, // dry-run
+        )
+        .await
+        .unwrap();
+        assert!(run_dir.exists(), "a dry-run prune must not delete logs");
     }
 
     /// Pruning a run also removes its spooled step logs.

@@ -72,10 +72,12 @@ fn resolve(args: &ApprovalArgs) -> anyhow::Result<Resolved> {
         .clone()
         .unwrap_or_else(|| repo.join(".odin").join("state.db"));
     let store = SqliteStore::open(&db).context("opening the run state database")?;
-    let engine = EngineBuilder::new()
-        .repo(&repo)
-        .store(Arc::new(store))
-        .build()?;
+    let mut builder = EngineBuilder::new().repo(&repo).store(Arc::new(store));
+    // Continue spooling step logs when the run resumes (or reruns), beside `odin run`'s logs.
+    if let Some(logs) = crate::cmd::logs_dir_for(&db) {
+        builder = builder.logs_dir(logs);
+    }
+    let engine = builder.build()?;
     let runtime = Runtime::new().context("starting the async runtime")?;
     Ok(Resolved {
         run_id,

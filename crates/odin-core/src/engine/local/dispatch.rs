@@ -152,7 +152,11 @@ impl LocalEngine {
                             .entry("stdout".to_owned())
                             .or_insert(Value::String(clip_middle(&o.stdout, STDOUT_MAX)));
                         let mut outcome = StepOutcome::passing(o.exit_code, outputs, o.usage);
-                        outcome.raw_stdout = o.stdout; // full, for the on-disk step log
+                        // Retain the full (un-clipped) stdout for the on-disk log ONLY when spooling
+                        // is enabled — otherwise it's pure memory overhead over the clipped copy.
+                        if self.logs_dir.is_some() {
+                            outcome.raw_stdout = o.stdout;
+                        }
                         outcome.stderr = o.stderr;
                         outcome
                     }
@@ -180,7 +184,9 @@ impl LocalEngine {
                             Value::String(clip_middle(&out.stdout, STDOUT_MAX)),
                         );
                         let mut outcome = StepOutcome::passing(out.exit_code, outputs, None);
-                        outcome.raw_stdout = out.stdout; // full, for the on-disk step log
+                        if self.logs_dir.is_some() {
+                            outcome.raw_stdout = out.stdout; // full, for the on-disk step log
+                        }
                         outcome.stderr = out.stderr;
                         if let Some(reason) = reason {
                             outcome.status = StepStatus::Failed;

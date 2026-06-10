@@ -36,10 +36,12 @@ pub(crate) fn run(args: PruneArgs) -> anyhow::Result<ExitCode> {
         .db
         .unwrap_or_else(|| repo.join(".odin").join("state.db"));
     let store = SqliteStore::open(&db).context("opening the run state database")?;
-    let engine = EngineBuilder::new()
-        .repo(&repo)
-        .store(Arc::new(store))
-        .build()?;
+    let mut builder = EngineBuilder::new().repo(&repo).store(Arc::new(store));
+    // Point at the same spool dir `odin run` writes to, so pruning a run also removes its logs.
+    if let Some(logs) = crate::cmd::logs_dir_for(&db) {
+        builder = builder.logs_dir(logs);
+    }
+    let engine = builder.build()?;
     let runtime = tokio::runtime::Runtime::new().context("starting the async runtime")?;
 
     // An explicit dry run: report what would go, delete nothing.
