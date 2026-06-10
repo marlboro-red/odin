@@ -40,9 +40,12 @@ pub trait Engine: Send + Sync {
     /// terminal/paused.
     fn cancel_run(&self, run_id: RunId) -> bool;
 
-    /// Cancels **every** in-flight run (see [`cancel_run`](Engine::cancel_run)) and returns how
-    /// many were signalled. The daemon uses this to stop in-flight work promptly on shutdown;
-    /// `durable` runs resume on the next start.
+    /// Signals a **graceful shutdown** of every in-flight run and returns how many were signalled.
+    /// Each run's in-flight step subprocess is killed promptly (like
+    /// [`cancel_run`](Engine::cancel_run)), but — unlike a user cancel — a `durable` run is
+    /// checkpointed **non-terminal** and resumes via [`resume_all`](Engine::resume_all) on the
+    /// next start (a non-durable run is abandoned). The daemon calls this on shutdown so a redeploy
+    /// or ctrl-C does not strand durable work as terminally `Cancelled`.
     fn cancel_all_active(&self) -> usize;
 
     /// Resumes any incomplete runs found in the [`Store`] (crash recovery).

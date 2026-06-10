@@ -55,6 +55,22 @@ pub trait Store: Send + Sync {
     /// Returns a [`StoreError`] if the backend read fails.
     async fn load_run(&self, run_id: RunId) -> Result<Option<RunState>, StoreError>;
 
+    /// Atomically claims an `awaiting_approval` run for resumption, flipping its status column to
+    /// `running` and returning `true` iff **this** caller won the flip (the row existed and was
+    /// `awaiting_approval`). Lets two processes that share one store — e.g. the CLI `odin approve`
+    /// and the daemon's HTTP `/approve` — fence a decision: only the winner resumes the run, so its
+    /// downstream side effects run once. The default implementation returns `true` (no
+    /// cross-process compare-and-swap); a backend with atomic updates should override it. The
+    /// caller still re-checks the loaded state's status, so a `true` default stays correct
+    /// in-process.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backend write fails.
+    async fn claim_awaiting(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let _ = run_id;
+        Ok(true)
+    }
+
     /// Reads the event log for a run (for replay/inspection). Defaults to empty, so an
     /// audit log is an optional capability.
     ///

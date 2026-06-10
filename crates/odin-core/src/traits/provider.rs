@@ -153,8 +153,25 @@ impl InvocationOutcome {
 
 /// A clonable cancellation handle wrapping a `tokio_util` cancellation token, so the
 /// public signatures do not leak that dependency. Clones share one cancellation state.
+///
+/// Cancellation carries a *reason* so the engine can tell a user-initiated cancel (the run
+/// ends terminally `Cancelled`) from a graceful-shutdown interrupt (a `durable` run is left
+/// resumable, not killed). The reason is shared across clones alongside the token.
 #[derive(Clone, Debug, Default)]
-pub struct CancelToken(pub(crate) tokio_util::sync::CancellationToken);
+pub struct CancelToken(
+    pub(crate) tokio_util::sync::CancellationToken,
+    std::sync::Arc<std::sync::atomic::AtomicU8>,
+);
+
+/// Reason values stored in the token's shared `AtomicU8`.
+mod reason {
+    /// Not cancelled (or cancelled with no recorded reason).
+    pub(super) const NONE: u8 = 0;
+    /// User-initiated cancel — the run ends terminally `Cancelled`.
+    pub(super) const CANCEL: u8 = 1;
+    /// Graceful-shutdown interrupt — a durable run is left resumable.
+    pub(super) const SHUTDOWN: u8 = 2;
+}
 
 impl CancelToken {
     /// A fresh, un-cancelled token.
@@ -163,15 +180,41 @@ impl CancelToken {
         Self::default()
     }
 
-    /// Requests cancellation for this token and all of its clones.
+    /// Requests cancellation for this token and all of its clones (user-initiated): the run
+    /// ends terminally [`Cancelled`](crate::api::RunStatus::Cancelled). A user cancel takes
+    /// precedence over a prior shutdown reason (terminating is always safe).
     pub fn cancel(&self) {
+        self.1
+            .store(reason::CANCEL, std::sync::atomic::Ordering::SeqCst);
         self.0.cancel();
     }
 
-    /// True once cancellation has been requested.
+    /// Requests cancellation as a **graceful shutdown**: the in-flight step's subprocess is
+    /// killed promptly (like [`cancel`](Self::cancel)), but a durable run is checkpointed
+    /// non-terminal so it resumes on the next start rather than dying as `Cancelled`. Does not
+    /// override a reason already set by [`cancel`](Self::cancel).
+    pub fn shutdown(&self) {
+        let _ = self.1.compare_exchange(
+            reason::NONE,
+            reason::SHUTDOWN,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.0.cancel();
+    }
+
+    /// True once cancellation has been requested (for any reason).
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.0.is_cancelled()
+    }
+
+    /// True when cancellation was a graceful [`shutdown`](Self::shutdown) (not a user
+    /// [`cancel`](Self::cancel)) — the engine uses this to leave a durable run resumable.
+    #[must_use]
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.0.is_cancelled()
+            && self.1.load(std::sync::atomic::Ordering::SeqCst) == reason::SHUTDOWN
     }
 
     /// Resolves when cancellation is requested. Cancel-safe.
