@@ -223,6 +223,21 @@ impl Metrics {
                 counter.load(Relaxed)
             );
         }
+        // A live gauge of steps in an ACTIVE execution segment right now (the step-start map tracks
+        // exactly these). Run-level in-flight is already covered by the store-snapshot
+        // `odin_runs_in_flight`/`odin_runs_pending` gauges, so only the step-level view (which has
+        // no store equivalent) is added here. Pair with `max_concurrent_runs` + the run gauges to
+        // read executor activity.
+        let _ = writeln!(
+            out,
+            "# HELP odin_steps_in_flight Steps currently executing (first attempt to settle)."
+        );
+        let _ = writeln!(out, "# TYPE odin_steps_in_flight gauge");
+        let _ = writeln!(
+            out,
+            "odin_steps_in_flight {}",
+            lock(&self.step_starts).len()
+        );
         out
     }
 }
@@ -336,6 +351,20 @@ mod tests {
         assert!(out.contains("odin_webhook_deliveries_total{result=\"rejected\"} 1"));
         // Always emits the zero series too, for a stable set.
         assert!(out.contains("odin_webhook_deliveries_total{result=\"duplicate\"} 0"));
+    }
+
+    #[test]
+    fn steps_in_flight_gauge_renders() {
+        // A fresh registry has nothing in flight; the gauge is still emitted (a stable series),
+        // typed as a gauge. The non-zero value is exercised live (a run driving the on_event hook).
+        // Must NOT collide with the store-snapshot `odin_runs_in_flight` gauge.
+        let out = Metrics::new().render();
+        assert!(out.contains("# TYPE odin_steps_in_flight gauge"), "{out}");
+        assert!(out.contains("odin_steps_in_flight 0"), "{out}");
+        assert!(
+            !out.contains("odin_runs_in_flight"),
+            "the live render must not duplicate the store's odin_runs_in_flight: {out}"
+        );
     }
 
     #[test]
