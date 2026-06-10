@@ -85,6 +85,14 @@ impl LocalEngine {
         let mut iteration: u32 = start;
         let mut outcome = loop {
             iteration += 1;
+            // Stop promptly on cancel/shutdown — don't spawn another iteration (each inner
+            // subprocess would be killed instantly) or run more checkpoint cycles. The run-level
+            // handler turns the fired token into terminal `Cancelled` or, for graceful shutdown of
+            // a durable run, rewinds this loop step to `Running` so resume continues from the last
+            // checkpointed iteration.
+            if cancel.is_cancelled() {
+                break StepOutcome::failed("loop cancelled");
+            }
             // Per-iteration inner states (transient): each inner step sees the outer run plus the
             // earlier inner steps of THIS iteration.
             let mut inner_states: IndexMap<StepId, StepState> = IndexMap::new();

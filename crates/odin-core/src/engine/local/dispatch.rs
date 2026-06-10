@@ -504,6 +504,14 @@ impl LocalEngine {
                 outcome.attempts = u8::try_from(attempt).unwrap_or(u8::MAX);
                 break outcome;
             }
+            // Stop retrying the instant a cancel/shutdown fires: the next attempt's subprocess
+            // would be killed immediately anyway, so burning the backoff sleep and spawning doomed
+            // attempts only delays the run settling. Without this a cancelled step can churn
+            // through every remaining retry's backoff before it stops.
+            if cancel.is_cancelled() {
+                outcome.attempts = u8::try_from(attempt).unwrap_or(u8::MAX);
+                break outcome;
+            }
             // Feed the *un-wrapped* diagnostic forward (so `concise` sees real content, not a
             // synthetic headline); fall back to the summary `error` for failure kinds without a
             // dedicated detail (judge/provider/action errors are already single-line).

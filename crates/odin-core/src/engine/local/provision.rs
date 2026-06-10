@@ -41,13 +41,14 @@ impl LocalEngine {
         // in-memory and per-instance — a fresh instance per run would defeat them entirely.
         let cfg_json = serde_json::to_string(cfg).unwrap_or_default();
         let key = format!("{kind}|{cfg_json}");
-        if let Some(workspace) = self.workspaces.lock().unwrap().get(&key) {
-            return Arc::clone(workspace);
-        }
-        let workspace: Arc<dyn Workspace> = match cfg {
-            WorkspaceConfig::Worktree(_) => {
-                Arc::new(WorktreeWorkspace::new(self.repo_root.clone()))
-            }
+        // Hold the cache lock across the (synchronous) construction so a cold-cache miss can't
+        // race: two concurrent first runs of a slot-pool workflow must NOT each build their own
+        // `SlotPoolWorkspace` over the same on-disk slot dirs — each would get a full set of
+        // permits and hand the same slot to a different run (two agents in one checkout, the
+        // ODIN016 failure the cache exists to prevent). The closure runs only on a miss.
+        let mut cache = self.workspaces.lock().unwrap();
+        let workspace = cache.entry(key).or_insert_with(|| match cfg {
+            WorkspaceConfig::Worktree(_) => Arc::new(WorktreeWorkspace::new(self.repo_root.clone())),
             WorkspaceConfig::SlotPool(c) => {
                 // The on-disk pool dir is keyed by the config (a hash of the same JSON the
                 // instance cache uses), so two DISTINCT slot-pool configs never share physical
@@ -69,12 +70,8 @@ impl LocalEngine {
                     c.base.clone(),
                 ))
             }
-        };
-        self.workspaces
-            .lock()
-            .unwrap()
-            .insert(key, Arc::clone(&workspace));
-        workspace
+        });
+        Arc::clone(workspace)
     }
 
     /// Acquires a workspace, serializing `worktree` acquisition under the same lock as scratch
