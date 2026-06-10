@@ -104,15 +104,25 @@ fn submit(decision: Decision, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
             }
             Ok(exit_for(summary.status))
         }
-        Ok(None) => {
-            eprintln!("✗ no run {} found in the store", r.run_id);
-            Ok(ExitCode::from(2))
-        }
-        Err(e) => {
-            eprintln!("✗ {e}");
-            Ok(ExitCode::from(2))
-        }
+        Ok(None) => fail(json, &format!("no run {} found in the store", r.run_id)),
+        Err(e) => fail(json, &e.to_string()),
     }
+}
+
+/// The error/not-found arm: a `{ok:false, phase:"error", error}` envelope on stdout under
+/// `--json` (so a bot never gets empty stdout), else a human line on stderr. Exit `2`.
+fn fail(json: bool, error: &str) -> anyhow::Result<ExitCode> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::cmd::validate::json_error_envelope(
+                "error", error
+            ))?
+        );
+    } else {
+        eprintln!("✗ {error}");
+    }
+    Ok(ExitCode::from(2))
 }
 
 fn reject_rerun(note: String, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
@@ -137,14 +147,8 @@ fn reject_rerun(note: String, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
             // The rerun's outcome is the actionable one (it may pause again at the gate).
             Ok(exit_for(outcome.rerun.status))
         }
-        Ok(None) => {
-            eprintln!("✗ no run {} found in the store", r.run_id);
-            Ok(ExitCode::from(2))
-        }
-        Err(e) => {
-            eprintln!("✗ {e}");
-            Ok(ExitCode::from(2))
-        }
+        Ok(None) => fail(json, &format!("no run {} found in the store", r.run_id)),
+        Err(e) => fail(json, &e.to_string()),
     }
 }
 

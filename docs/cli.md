@@ -28,11 +28,14 @@ that path. An existing file path always wins.
 Every command that produces a result takes `--json` for machine-readable output on **stdout** —
 `validate`, `run`, `list`, `show`, `logs`, `status`, `prune`, `recipe list`, **`approve`**,
 **`reject`**, and **`cancel`** (the `recipe init/add/show/path/new` management commands have no
-`--json`). On a **validation or parse failure**, `validate --json` and `run --json` both emit the
-same envelope on stdout — `{ "ok": false, "phase": "validate" | "parse", "diagnostics": [...],
-"error": <string|null> }` — so a script never gets empty stdout. Diagnostics and `error` go to
-**stderr** in the non-`--json` mode (`✗ <file>: parse error`, `error: …`); either way the process
-exits non-zero.
+`--json`). Under `--json`, stdout is **always** the JSON document and nothing else — including on
+failures: `validate --json` and `run --json` emit the same envelope `{ "ok": false, "phase":
+"validate" | "parse" | "error", "diagnostics": [...], "error": <string|null> }`, `approve`/`reject`
+emit `{ "ok": false, "error": … }` on a not-found/error, and `cancel` emits `{ "run_id", "requested":
+false }` — so a script never gets empty stdout, and `… --json | jq` is always safe. (The non-`--json`
+human report differs by command: `validate` prints its diagnostics to **stdout** as its primary
+output, while `run`'s per-step diagnostics and `✗ … error` lines go to **stderr** so stdout stays
+the summary channel; a parse error always goes to stderr.) Either way a failure exits non-zero.
 
 ---
 
@@ -51,10 +54,13 @@ $ odin validate examples/issue-to-pr.yaml
 ✓ examples/issue-to-pr.yaml is valid
 
 $ odin validate examples/fix-flaky-test.yaml
+warning[ODIN044]: workflow is `durable` but uses a `slot_pool` workspace, whose lease state is in-memory and lost on restart …
+  --> workspace
+
 warning[ODIN023]: on_fallback_provider is declared but routing/fallback is not implemented in v1; this field is inert
   --> steps[1].retry.on_fallback_provider
 
-✓ examples/fix-flaky-test.yaml is valid (1 warning(s))
+✓ examples/fix-flaky-test.yaml is valid (2 warning(s))
 ```
 
 `--json` emits a single envelope: `{ "ok": <bool>, "phase": "validate" | "parse", "diagnostics":
@@ -145,8 +151,9 @@ sub-threshold judge. The run-level `error:` line is `step "<id>" failed: <that r
 Step glyphs: `✓` passed, `✗` failed, `⊘` skipped, `·` other. `--json` emits the full
 [`RunSummary`](#json-shapes).
 
-**Exit codes:** `0` the run succeeded; `1` the run failed/was cancelled, or the workflow had
-validation errors; `2` a parse/IO/engine-build/other runtime error.
+**Exit codes:** `0` the run succeeded **or paused at an approval gate** (awaiting input, not a
+failure); `1` the run failed/was cancelled, or the workflow had validation errors; `2` a
+parse/IO/engine-build/other runtime error.
 
 ---
 
@@ -412,8 +419,11 @@ available), the catalog directory can't be resolved/created, or a file can't be 
 
 `--json` output is stable, serializable data with no engine internals:
 
-- **`validate --json`** → a `ValidationReport`: `{ "diagnostics": [ { "severity", "code"
-  ("ODIN0NN"), "message", "pointer", "help" }, … ] }`.
+- **`validate --json`** (and `run --json` on a workflow that fails to parse/validate) → the
+  envelope `{ "ok": <bool>, "phase": "validate" | "parse" | "error", "diagnostics": [ { "severity",
+  "code" ("ODIN0NN"), "message", "pointer", "help" }, … ], "error": <string|null> }`. `ok` is true
+  iff there are no error-severity diagnostics; `phase` is `parse` (then `diagnostics: []`, `error`
+  set) for a malformed file, `error` for an IO/engine failure, else `validate`.
 - **`run --json`** → a `RunSummary`: `{ "run_id", "workflow", "status", "steps": [ {
   "id", "status", "attempts", "exit_code", "outputs", "gates", "judge_score", "usage",
   "error" } ], "usage": { "input_tokens", "output_tokens", "cost_micros" }, "side_effects",

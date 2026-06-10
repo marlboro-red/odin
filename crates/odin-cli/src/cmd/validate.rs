@@ -63,15 +63,22 @@ pub(crate) fn json_validation_envelope(report: &ValidationReport) -> serde_json:
     })
 }
 
-/// The unified `--json` envelope for a parse failure: `{ ok: false, phase: "parse", diagnostics:
-/// [], error }`. Same top-level keys as [`json_validation_envelope`] so one consumer handles both.
-pub(crate) fn json_parse_envelope(error: &str) -> serde_json::Value {
+/// The unified `--json` failure envelope: `{ ok: false, phase, diagnostics: [], error }`. Same
+/// top-level keys as [`json_validation_envelope`] so one consumer handles success and every
+/// failure mode (`parse` / `io` / `error`). `odin run --json` reuses this so it never produces
+/// empty stdout on a failure.
+pub(crate) fn json_error_envelope(phase: &str, error: &str) -> serde_json::Value {
     serde_json::json!({
         "ok": false,
-        "phase": "parse",
+        "phase": phase,
         "diagnostics": [],
         "error": error,
     })
+}
+
+/// The parse-failure envelope (`phase: "parse"`); a thin alias over [`json_error_envelope`].
+pub(crate) fn json_parse_envelope(error: &str) -> serde_json::Value {
+    json_error_envelope("parse", error)
 }
 
 fn print_human(file: &Path, report: &ValidationReport) {

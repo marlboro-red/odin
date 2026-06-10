@@ -139,8 +139,8 @@ enum Command {
         /// Maximum number of runs to show.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Live-refresh every 2s until ctrl-c.
-        #[arg(long)]
+        /// Live-refresh every 2s until ctrl-c. (Mutually exclusive with `--json`.)
+        #[arg(long, conflicts_with = "json")]
         watch: bool,
         /// Emit the runs as JSON (the same shape as the daemon's `/api/runs`).
         #[arg(long)]
