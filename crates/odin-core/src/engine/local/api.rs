@@ -100,6 +100,8 @@ impl Engine for LocalEngine {
         // Register the token so `cancel_run`/`cancel_all_active` can fire it; the guard removes it
         // when this method returns (completed, failed, or suspended at a gate).
         let _cancel_guard = self.register_cancel(run_id, cancel.clone());
+        // Also watch the store for a cross-process `odin cancel` request (durable runs only).
+        let _cancel_watcher = self.spawn_cancel_watcher(run_id, workflow.durable, cancel.clone());
         let exec = self
             .execute(workflow, &mut state, &workdir, &params, &cancel)
             .instrument(run_span.clone())
@@ -574,6 +576,8 @@ impl LocalEngine {
                 Ok(params) => {
                     let cancel = CancelToken::new();
                     let _cancel_guard = self.register_cancel(state.run_id, cancel.clone());
+                    let _cancel_watcher =
+                        self.spawn_cancel_watcher(state.run_id, workflow.durable, cancel.clone());
                     let run_span = tracing::info_span!(
                         "run",
                         run_id = %state.run_id,

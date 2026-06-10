@@ -16,6 +16,7 @@ Commands:
   status                   At-a-glance status of recent runs (--watch to live-refresh)
   approve <RUN_ID>         Approve a run paused at an approval gate
   reject  <RUN_ID>         Reject a paused run (optionally rerun with feedback)
+  cancel  <RUN_ID>         Request cancellation of an in-flight run
   prune                    Delete old/excess terminal runs from the store
   recipe <SUBCOMMAND>      Manage the by-name workflow recipe catalog
 ```
@@ -282,6 +283,23 @@ Run 9f2c… — awaiting approval
 A long-running [`odind`](daemon.md) can also be decided over HTTP — a signed
 [`POST /approve`](daemon.md#approving-a-paused-run-over-http) is the daemon-side equivalent of
 these commands.
+
+---
+
+## `odin cancel <RUN_ID> [--repo DIR | --db FILE]`
+
+Requests cancellation of an **in-flight** run. Because the run may be executing inside a separate
+`odind` process (whose in-memory cancel tokens this command can't reach), the request is written to
+the shared run-state store; the engine running the run polls for it and stops the run terminally
+(`cancelled`), killing its current step's subprocess. Cancellation takes effect within a few
+seconds. Only **durable** runs (which have a store row) can be cancelled this way — a foreground
+`odin run` is instead stopped with ctrl-C.
+
+```sh
+odin cancel 6f1c…   # → ⏹ cancel requested for run 6f1c…
+```
+
+Exit codes: `0` requested; `2` no cancellable (non-terminal) run with that id, or a store error.
 
 ---
 

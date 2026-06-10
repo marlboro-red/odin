@@ -10,7 +10,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use chrono::Utc;
 use indexmap::IndexMap;
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension as _, params, params_from_iter};
 use tokio::sync::Mutex;
 
 use crate::api::RunStatus;
@@ -69,6 +69,16 @@ CREATE TABLE IF NOT EXISTS pruned_counts (
 const SCHEMA_V4_UPDATED_AT_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS runs_updated_at ON runs(updated_at DESC, run_id DESC);";
 
+/// A tiny signal table for cross-process cancellation: `odin cancel <id>` (a separate process from
+/// the daemon executing the run) inserts the run id here, and the engine's per-run watcher polls it
+/// and fires the run's cancel token. A separate `IF NOT EXISTS` table (rather than a `runs` column)
+/// keeps the migration idempotent and the transient signal out of the durable run-state blob.
+const SCHEMA_V5_CANCEL_REQUESTS: &str = "
+CREATE TABLE IF NOT EXISTS cancel_requests (
+    run_id TEXT PRIMARY KEY
+);
+";
+
 /// Ordered migrations tracked by SQLite's `PRAGMA user_version`. The entry at index `i`
 /// upgrades the database from version `i` to `i + 1` (so `MIGRATIONS.len()` is the current
 /// version). **Append** new migrations; never edit or reorder a released one — an in-place
@@ -78,6 +88,7 @@ const MIGRATIONS: &[&str] = &[
     SCHEMA_V2_METRICS_INDEX,
     SCHEMA_V3_PRUNED_COUNTS,
     SCHEMA_V4_UPDATED_AT_INDEX,
+    SCHEMA_V5_CANCEL_REQUESTS,
 ];
 
 /// A durable run store backed by a SQLite database.
@@ -277,6 +288,44 @@ impl Store for SqliteStore {
             Some(row) => Ok(Some(serde_json::from_str(&db(row.get::<_, String>(0))?)?)),
             None => Ok(None),
         }
+    }
+
+    async fn request_cancel(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let id = run_id.to_string();
+        let terminal = terminal_statuses();
+        let in_terminal = placeholders(terminal.len());
+        let conn = self.conn.lock().await;
+        // Only mark a run that exists and is NOT terminal — a finished run can't be cancelled, and
+        // an unknown id should report "not found" rather than leave an orphan signal.
+        let cancellable: bool = db(conn.query_row(
+            &format!(
+                "SELECT 1 FROM runs WHERE run_id = ?1 AND status NOT IN ({in_terminal})"
+            ),
+            params_from_iter(std::iter::once(id.clone()).chain(terminal)),
+            |_| Ok(true),
+        )
+        .optional())?
+        .unwrap_or(false);
+        if cancellable {
+            db(conn.execute(
+                "INSERT OR IGNORE INTO cancel_requests(run_id) VALUES (?1)",
+                params![id],
+            ))?;
+        }
+        Ok(cancellable)
+    }
+
+    async fn is_cancel_requested(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let id = run_id.to_string();
+        let conn = self.conn.lock().await;
+        Ok(db(conn
+            .query_row(
+                "SELECT 1 FROM cancel_requests WHERE run_id = ?1",
+                params![id],
+                |_| Ok(true),
+            )
+            .optional())?
+        .unwrap_or(false))
     }
 
     async fn claim_awaiting(&self, run_id: RunId) -> Result<bool, StoreError> {
@@ -487,6 +536,11 @@ fn prune_locked(
             &format!("DELETE FROM runs WHERE run_id IN ({id_ph}) AND status IN ({in_terminal})"),
             params_from_iter(with_terminal()),
         )?;
+        // Reclaim any leftover cross-process cancel signals for the pruned runs (harmless if absent).
+        conn.execute(
+            &format!("DELETE FROM cancel_requests WHERE run_id IN ({id_ph})"),
+            params_from_iter(ids.iter().map(|s| (*s).clone())),
+        )?;
         Ok(events_pruned)
     })();
     let events_pruned = match applied {
@@ -649,6 +703,37 @@ mod tests {
             store.recent(10).await.unwrap().len(),
             1,
             "recent skips the poison row too"
+        );
+    }
+
+    /// `request_cancel`/`is_cancel_requested` carry a cross-process cancel signal: it marks only a
+    /// non-terminal run, and a terminal/unknown run reports "not cancellable".
+    #[tokio::test]
+    async fn cancel_request_round_trips() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let running = run_state(RunStatus::Running);
+        store.checkpoint(&running).await.unwrap();
+        assert!(
+            !store.is_cancel_requested(running.run_id).await.unwrap(),
+            "no request yet"
+        );
+        assert!(
+            store.request_cancel(running.run_id).await.unwrap(),
+            "a running run is cancellable"
+        );
+        assert!(
+            store.is_cancel_requested(running.run_id).await.unwrap(),
+            "the request is recorded"
+        );
+        assert!(
+            !store.request_cancel(RunId::new()).await.unwrap(),
+            "an unknown run is not cancellable"
+        );
+        let done = run_state(RunStatus::Succeeded);
+        store.checkpoint(&done).await.unwrap();
+        assert!(
+            !store.request_cancel(done.run_id).await.unwrap(),
+            "a terminal run can't be cancelled"
         );
     }
 
