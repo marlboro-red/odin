@@ -182,6 +182,13 @@ pub(crate) fn clip_middle(s: &str, max: usize) -> String {
 /// recent bytes, with no synthetic headline so its *first* line is real content), or the `headline`
 /// alone when there is no detail. Distinct from [`with_stderr_tail`], which keeps the headline for a
 /// human/log summary.
+/// The first line of a (possibly multi-line) message — for a tracing field, so a `reason`/`error`
+/// that ends in a multi-line `stderr:` tail doesn't inject raw newlines into one log event (which
+/// breaks line-oriented log shippers). The full detail is still in the run's stored error.
+pub(crate) fn first_line(s: &str) -> &str {
+    s.lines().next().unwrap_or("")
+}
+
 pub(crate) fn failure_detail(headline: &str, detail: &str) -> String {
     let detail = detail.trim();
     if detail.is_empty() {

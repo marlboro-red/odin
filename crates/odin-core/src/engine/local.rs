@@ -64,7 +64,9 @@ mod dispatch;
 mod gitio;
 mod loop_driver;
 mod provision;
-use ctx::{build_ctx, collect_side_effects, effective_timeout, skipped_outcome, step_result};
+use ctx::{
+    build_ctx, collect_side_effects, effective_timeout, first_line, skipped_outcome, step_result,
+};
 
 /// The reserved, auto-captured artifact name.
 const DIFF: &str = "DIFF";
@@ -120,6 +122,24 @@ const MIRROR_CAP: usize = 256;
 /// Max serialized size of a single param value retained in a mirror [`light_snapshot`]; larger
 /// values (e.g. a webhook param mapped from a big payload field) are replaced with a placeholder.
 const MIRROR_PARAM_CAP: usize = 4096;
+
+/// A stable, human-readable kind name for a [`RunEvent`] — for log fields. (`std::mem::discriminant`
+/// only Debug-prints an opaque `Discriminant(N)` whose number silently shifts if variants are
+/// reordered, so it's useless in a log.)
+fn event_kind(event: &RunEvent) -> &'static str {
+    match event {
+        RunEvent::RunStarted { .. } => "run_started",
+        RunEvent::StepStarted { .. } => "step_started",
+        RunEvent::GateResult { .. } => "gate_result",
+        RunEvent::JudgeResult { .. } => "judge_result",
+        RunEvent::StepFinished { .. } => "step_finished",
+        RunEvent::ApprovalDecided { .. } => "approval_decided",
+        RunEvent::RunCancelled { .. } => "run_cancelled",
+        RunEvent::RunSuspended { .. } => "run_suspended",
+        RunEvent::RunResumed { .. } => "run_resumed",
+        RunEvent::RunFinished { .. } => "run_finished",
+    }
+}
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
 /// executes once even under concurrent decisions. See [`LocalEngine::claim_run`].
@@ -478,12 +498,21 @@ impl LocalEngine {
             let fired =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(run_id, &event)));
             if fired.is_err() {
-                tracing::warn!(run_id = %run_id, event = ?std::mem::discriminant(&event), "on_event callback panicked; event dropped");
+                tracing::warn!(run_id = %run_id, event = event_kind(&event), "on_event callback panicked; event dropped");
             }
         }
         if durable {
             if let Some(store) = &self.store {
-                let _ = store.append_event(run_id, &event).await;
+                // A dropped audit event isn't fatal to the run, but silently swallowing the store
+                // error hides a failing/full disk — surface it at WARN with the event kind.
+                if let Err(e) = store.append_event(run_id, &event).await {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        event = event_kind(&event),
+                        error = %e,
+                        "failed to append run event to the store; event dropped"
+                    );
+                }
             }
         }
     }
@@ -896,13 +925,31 @@ impl LocalEngine {
             };
             exclusive_running = false; // an exclusive step ran alone, so this clears it
 
-            tracing::info!(
-                step = %id,
-                status = ?outcome.status,
-                exit_code = outcome.exit_code,
-                attempts = outcome.attempts,
-                "step finished"
-            );
+            // A step killed by a graceful shutdown comes back `Failed` but is about to be rewound
+            // to `Running` and resumed — it's a routine interruption, NOT a failure, so don't log
+            // it as one (that would make every daemon stop look like a pile of step failures).
+            let shutdown_rewind =
+                workflow.durable && cancel.is_shutdown() && outcome.status == StepStatus::Failed;
+            // A genuinely failed step is logged at WARN (with its first-line reason) so it's visible
+            // at the default log level — debugging shouldn't require turning on DEBUG.
+            if outcome.status == StepStatus::Failed && !shutdown_rewind {
+                tracing::warn!(
+                    step = %id,
+                    status = ?outcome.status,
+                    exit_code = outcome.exit_code,
+                    attempts = outcome.attempts,
+                    reason = outcome.error.as_deref().map_or("(none)", first_line),
+                    "step failed"
+                );
+            } else if outcome.status != StepStatus::Failed {
+                tracing::info!(
+                    step = %id,
+                    status = ?outcome.status,
+                    exit_code = outcome.exit_code,
+                    attempts = outcome.attempts,
+                    "step finished"
+                );
+            }
 
             // Graceful-shutdown rewind: a durable run interrupted by `shutdown` (daemon stop)
             // had this step's subprocess killed, so it came back `Failed`. Leave it back at
@@ -911,10 +958,7 @@ impl LocalEngine {
             // don't fold its partial usage/side-effects, don't emit `StepFinished`: the re-run
             // produces the real outcome. A USER cancel keeps the kill terminal (the run won't
             // resume), and a non-durable run can't resume regardless — both fall through.
-            if workflow.durable
-                && cancel.is_shutdown()
-                && matches!(outcome.status, StepStatus::Failed)
-            {
+            if shutdown_rewind {
                 if let Some(st) = state.steps.get_mut(&id) {
                     st.status = StepStatus::Running;
                     st.error = None;
@@ -3529,6 +3573,49 @@ steps:
                 .iter()
                 .any(|e| matches!(e, RunEvent::RunResumed { .. })),
             "missing RunResumed: {events:?}"
+        );
+    }
+
+    /// A `run:` step killed by its timeout reports "timed out", not the misleading
+    /// "exited with code -1" that the synthetic exit code would otherwise produce.
+    #[tokio::test]
+    async fn a_timed_out_run_step_reports_timeout_not_crash() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: t\nworkspace: { type: worktree }\nsteps:\n  - {id: slow, run: \"sleep 5\", timeout: \"1s\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let step = s.steps.iter().find(|st| st.id.as_str() == "slow").unwrap();
+        let err = step.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout reason, got: {err:?}"
+        );
+        assert!(
+            !err.contains("exited with code"),
+            "must not report a synthetic exit code for a timeout: {err:?}"
+        );
+    }
+
+    /// A gate killed by its timeout reports "gate … timed out", not a bare "gate … failed".
+    #[tokio::test]
+    async fn a_timed_out_gate_reports_timeout() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: tg\nworkspace: { type: worktree }\nsteps:\n  - id: s\n    run: \"true\"\n    timeout: \"1s\"\n    gates:\n      slow: \"sleep 5\"\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let step = s.steps.iter().find(|st| st.id.as_str() == "s").unwrap();
+        let err = step.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("timed out"),
+            "expected a gate timeout reason, got: {err:?}"
         );
     }
 

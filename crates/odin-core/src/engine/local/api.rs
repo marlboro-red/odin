@@ -214,15 +214,9 @@ impl Engine for LocalEngine {
         )
         .await;
         let elapsed_ms = (Utc::now() - started_at).num_milliseconds();
-        tracing::info!(
-            parent: &run_span,
-            run_id = %run_id,
-            status = ?status,
-            steps = summary.steps.len(),
-            cost_micros = summary.usage.cost_micros,
-            elapsed_ms,
-            "run finished"
-        );
+        // Level matches status: failed → ERROR (with reason), cancelled → WARN, else INFO. Emitted
+        // within the run span so it nests under the run's trace.
+        run_span.in_scope(|| Self::log_run_outcome(&summary, elapsed_ms));
 
         Ok(summary)
     }
@@ -587,6 +581,38 @@ impl LocalEngine {
         }
     }
 
+    /// Logs a run's terminal outcome at a level matching its status: a failed run at ERROR (with
+    /// its terminal reason), a cancelled run at WARN, everything else at INFO. Called from every
+    /// terminal path — the foreground `run()`, a resume, and `fail_run` — so a failed run is
+    /// ALWAYS loud at the default level, including one that fails during crash recovery.
+    fn log_run_outcome(summary: &RunSummary, elapsed_ms: i64) {
+        match summary.status {
+            RunStatus::Failed => tracing::error!(
+                run_id = %summary.run_id,
+                steps = summary.steps.len(),
+                cost_micros = summary.usage.cost_micros,
+                elapsed_ms,
+                error = summary.error.as_deref().unwrap_or("(none)"),
+                "run failed"
+            ),
+            RunStatus::Cancelled => tracing::warn!(
+                run_id = %summary.run_id,
+                steps = summary.steps.len(),
+                cost_micros = summary.usage.cost_micros,
+                elapsed_ms,
+                "run cancelled"
+            ),
+            status => tracing::info!(
+                run_id = %summary.run_id,
+                status = ?status,
+                steps = summary.steps.len(),
+                cost_micros = summary.usage.cost_micros,
+                elapsed_ms,
+                "run finished"
+            ),
+        }
+    }
+
     /// Marks a run terminally Failed, checkpoints it, and returns its summary. Used by
     /// `resume_all` so one un-resumable run does not abort recovery of the others.
     async fn fail_run(
@@ -611,25 +637,10 @@ impl LocalEngine {
             },
         )
         .await;
-        Ok(RunSummary {
-            run_id: state.run_id,
-            workflow: state.workflow.clone(),
-            status: RunStatus::Failed,
-            steps: state
-                .steps
-                .iter()
-                .map(|(id, st)| step_result(id, st))
-                .collect(),
-            usage: total_usage(&state.steps),
-            side_effects: collect_side_effects(&state.steps),
-            diff: state
-                .artifacts
-                .get(&crate::ids::ArtifactName::new(DIFF))
-                .cloned(),
-            error: Some(error.to_owned()),
-            started_at: state.created_at,
-            finished_at: Some(Utc::now()),
-        })
+        let summary = Self::summary_from_state(state.clone());
+        let elapsed_ms = (Utc::now() - state.created_at).num_milliseconds();
+        Self::log_run_outcome(&summary, elapsed_ms);
+        Ok(summary)
     }
 
     /// Resumes a single already-loaded run to its next stopping point (terminal, or paused
@@ -775,6 +786,12 @@ impl LocalEngine {
                                         },
                                     )
                                     .await;
+                                    // Log the resumed run's terminal outcome too (failed → ERROR),
+                                    // so a run that completes via crash-recovery/approval isn't
+                                    // silent at the default level. (`fail_run` logs its own paths.)
+                                    let elapsed_ms =
+                                        (Utc::now() - state.created_at).num_milliseconds();
+                                    Self::log_run_outcome(&summary, elapsed_ms);
                                     summary
                                 }
                                 Err(e) => {

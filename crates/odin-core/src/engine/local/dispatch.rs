@@ -24,7 +24,7 @@ use crate::context::render::{eval_when, render_template};
 use crate::error::{Error, Result};
 use crate::ids::{RunId, StepId};
 use crate::ir::{JudgeSpec, RetrySpec, Step, StepKind, Workflow};
-use crate::provider::process::{ProcessOptions, StreamSink, run_process};
+use crate::provider::process::{ProcessOptions, ProcessOutput, StreamSink, run_process};
 use crate::traits::{ActionCtx, CancelToken, InvocationCtx, RunEvent};
 
 impl LocalEngine {
@@ -120,6 +120,12 @@ impl LocalEngine {
                         p.provider.as_str()
                     ));
                 };
+                tracing::debug!(
+                    step = %step.id,
+                    provider = %p.provider.as_str(),
+                    prompt_bytes = prompt.len(),
+                    "invoking provider"
+                );
                 let inputs = step
                     .artifacts
                     .requires
@@ -162,14 +168,23 @@ impl LocalEngine {
                     .shell(&cmd, workdir, timeout, cancel, stream.as_ref())
                     .await
                 {
-                    Ok((code, stdout, stderr)) => {
+                    Ok(out) => {
+                        // A timeout/cancel kill exits the child with code -1; record WHY instead of
+                        // the misleading "exited with code -1" `exec_step` would otherwise synthesize
+                        // (a timed-out `run:` step was previously indistinguishable from a crash).
+                        let reason = killed_reason(&out, timeout);
                         let mut outputs = IndexMap::new();
                         outputs.insert(
                             "stdout".to_owned(),
-                            Value::String(clip_middle(&stdout, STDOUT_MAX)),
+                            Value::String(clip_middle(&out.stdout, STDOUT_MAX)),
                         );
-                        let mut outcome = StepOutcome::passing(code, outputs, None);
-                        outcome.stderr = stderr;
+                        let mut outcome = StepOutcome::passing(out.exit_code, outputs, None);
+                        outcome.stderr = out.stderr;
+                        if let Some(reason) = reason {
+                            outcome.status = StepStatus::Failed;
+                            outcome.failure_detail = Some(failure_detail(&reason, &outcome.stderr));
+                            outcome.error = Some(with_stderr_tail(&reason, &outcome.stderr));
+                        }
                         outcome
                     }
                     Err(e) => StepOutcome::failed(format!("run error: {e}")),
@@ -291,16 +306,24 @@ impl LocalEngine {
                     return outcome;
                 }
             };
-            let (passed, gate_output) = match self
+            let (passed, gate_output, killed) = match self
                 .shell(&cmd, workdir, timeout, cancel, gate_stream.as_ref())
                 .await
             {
-                Ok((code, stdout, stderr)) => (code == 0, join_streams(&stdout, &stderr)),
-                Err(e) => (false, e.to_string()),
+                Ok(out) => (
+                    out.exit_code == 0,
+                    join_streams(&out.stdout, &out.stderr),
+                    killed_reason(&out, timeout),
+                ),
+                Err(e) => (false, e.to_string(), None),
             };
             outcome.gates.insert(name.as_str().to_owned(), passed);
             if !passed {
-                let headline = format!("gate {:?} failed", name.as_str());
+                // Name a timeout/cancel explicitly rather than just "gate failed".
+                let headline = match killed {
+                    Some(reason) => format!("gate {:?} {reason}", name.as_str()),
+                    None => format!("gate {:?} failed", name.as_str()),
+                };
                 outcome.failure_detail = Some(failure_detail(&headline, &gate_output));
                 outcome.status = StepStatus::Failed;
                 outcome.error = Some(with_stderr_tail(&headline, &gate_output));
@@ -535,8 +558,9 @@ impl LocalEngine {
         outcome
     }
 
-    /// Runs a shell command in `workdir`, returning `(exit_code, stdout, stderr)`. With a
-    /// `stream` sink (the `--stream` view) the command's output is teed to the terminal live.
+    /// Runs a shell command in `workdir`, returning the full [`ProcessOutput`] (exit code, captured
+    /// streams, and the `timed_out`/`cancelled` flags the callers use to report *why* a step was
+    /// killed). With a `stream` sink (the `--stream` view) the output is teed to the terminal live.
     async fn shell(
         &self,
         command: &str,
@@ -544,7 +568,7 @@ impl LocalEngine {
         timeout: Option<Duration>,
         cancel: &CancelToken,
         stream: Option<&StreamSink>,
-    ) -> Result<(i32, String, String)> {
+    ) -> Result<ProcessOutput> {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             timeout,
@@ -553,8 +577,7 @@ impl LocalEngine {
             stream: stream.cloned(),
         };
         let args = vec!["-c".to_owned(), command.to_owned()];
-        let out = run_process(crate::provider::posix_shell()?, &args, &opts, cancel).await?;
-        Ok((out.exit_code, out.stdout, out.stderr))
+        Ok(run_process(crate::provider::posix_shell()?, &args, &opts, cancel).await?)
     }
     /// Runs one step, provisioning an isolated scratch worktree first if `step.scratch`. A
     /// scratch step's file edits stay in its throwaway worktree; its diff is surfaced as
@@ -626,5 +649,28 @@ impl LocalEngine {
             }
             Err(e) => (id, StepOutcome::failed(format!("scratch workspace: {e}"))),
         }
+    }
+}
+
+/// Why a subprocess was killed, for the step failure headline — so a timed-out or cancelled
+/// `run:`/gate step reads "timed out after 30s" / "cancelled" instead of the bare, misleading
+/// "exited with code -1" the synthetic exit code would otherwise produce.
+///
+/// Returns `None` when the child exited cleanly (`exit_code == 0`) even though a kill was issued —
+/// a race where the process finished right as the timeout/cancel fired counts as success, NOT a
+/// timeout. Both the `run:` and gate handlers consult this, so they agree on that boundary.
+fn killed_reason(out: &ProcessOutput, timeout: Option<Duration>) -> Option<String> {
+    if out.exit_code == 0 {
+        return None; // finished cleanly before/as the kill landed — not a timeout/cancel
+    }
+    if out.timed_out {
+        Some(match timeout {
+            Some(d) => format!("timed out after {d:?}"),
+            None => "timed out".to_owned(),
+        })
+    } else if out.cancelled {
+        Some("cancelled".to_owned())
+    } else {
+        None
     }
 }

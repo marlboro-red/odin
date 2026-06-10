@@ -362,11 +362,13 @@ async fn dispatch(
     };
     tracing::info!("dispatching run");
     match engine.run(workflow, event.input).await {
+        // The engine already logs the run's terminal outcome at the right level (a failed run at
+        // ERROR with its reason), so just note the dispatch result at INFO here — no duplicate WARN.
         Ok(summary) => tracing::info!(
             run_id = %summary.run_id,
             status = ?summary.status,
-            "run finished"
+            "dispatched run finished"
         ),
-        Err(e) => tracing::error!(error = %e, "run failed"),
+        Err(e) => tracing::error!(error = %e, "dispatch returned an error"),
     }
 }
