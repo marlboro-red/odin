@@ -158,6 +158,13 @@ impl LocalEngine {
                             outcome.raw_stdout = o.stdout;
                         }
                         outcome.stderr = o.stderr;
+                        // Record the provider's CLI version (resolved once, cached) for run
+                        // reproducibility — only here, on success, since the provider just ran so
+                        // its CLI exists.
+                        if let Some(version) = self.cached_provider_version(&provider).await {
+                            outcome.provider_version =
+                                Some((p.provider.as_str().to_owned(), version));
+                        }
                         outcome
                     }
                     Err(e) => StepOutcome::failed(format!("provider error: {e}")),
