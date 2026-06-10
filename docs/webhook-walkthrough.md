@@ -158,7 +158,7 @@ your browser with the secret), or with the signed `/approve` endpoint — grab t
 ```sh
 RUN=<run-id-from-the-log>
 BODY=$(printf '{"run_id":"%s","decision":"approved","approver":"you"}' "$RUN")
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$ODIN_WEBHOOK_SECRET" | awk '{print $2}')
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$ODIN_WEBHOOK_SECRET" | awk '{print $NF}')
 
 curl -sS http://127.0.0.1:9292/approve \
   -H "X-Hub-Signature-256: sha256=$SIG" \
