@@ -193,8 +193,15 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     let mut webhook_triggers = Vec::new();
     for workflow in &workflows {
         for decl in &workflow.triggers {
-            if let TriggerDecl::GithubWebhook(github) = decl {
-                webhook_triggers.push(webhook_server.subscribe(github, workflow.name.clone()));
+            match decl {
+                TriggerDecl::GithubWebhook(github) => {
+                    webhook_triggers.push(webhook_server.subscribe(github, workflow.name.clone()));
+                }
+                TriggerDecl::Webhook(generic) => {
+                    webhook_triggers
+                        .push(webhook_server.subscribe_webhook(generic, workflow.name.clone()));
+                }
+                _ => {}
             }
         }
     }

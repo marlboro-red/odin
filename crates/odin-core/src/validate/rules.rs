@@ -7,7 +7,9 @@ use super::KnownNames;
 use super::diagnostic::{DiagCode, Diagnostic};
 use super::graph;
 use crate::ids::StepId;
-use crate::ir::{Step, StepKind, TriggerDecl, Workflow, WorkspaceConfig};
+use crate::ir::{
+    GithubWebhookDecl, Step, StepKind, TriggerDecl, WebhookDecl, Workflow, WorkspaceConfig,
+};
 
 /// The engine-reserved artifact auto-captured after every step.
 const DIFF: &str = "DIFF";
@@ -414,9 +416,11 @@ pub(crate) fn triggers(wf: &Workflow, d: &mut Vec<Diagnostic>) {
                 ));
             }
             // ODIN027 — a webhook param mapping whose key is not a declared param is inert;
-            // the extracted value would go nowhere. Catch the typo at validate time.
-            TriggerDecl::GithubWebhook(g) => {
-                for name in g.params.keys() {
+            // the extracted value would go nowhere. Catch the typo at validate time. Applies to
+            // both the GitHub and the generic webhook (their `params` mean the same thing).
+            TriggerDecl::GithubWebhook(GithubWebhookDecl { params, .. })
+            | TriggerDecl::Webhook(WebhookDecl { params, .. }) => {
+                for name in params.keys() {
                     if !wf.params.contains_key(name) {
                         d.push(Diagnostic::new(
                             DiagCode::WebhookParamUndeclared,

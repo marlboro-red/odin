@@ -20,6 +20,10 @@ pub enum TriggerDecl {
     Manual {},
     /// A GitHub webhook event. Declaration parsed now; dispatch in the daemon milestone.
     GithubWebhook(GithubWebhookDecl),
+    /// A **generic** HTTP webhook — any service that can `POST` JSON. Delivered to `/webhook` with
+    /// an `X-Odin-Event` header (and an `X-Odin-Signature-256: sha256=<hmac>` when a secret is set).
+    /// Unlike [`GithubWebhook`](Self::GithubWebhook), it has no `repo`/`action` coupling.
+    Webhook(WebhookDecl),
     /// A cron schedule. Declaration parsed now; dispatch in the daemon milestone.
     Cron(CronDecl),
 }
@@ -52,6 +56,26 @@ pub struct GithubWebhookDecl {
     pub params: IndexMap<ParamName, String>,
 }
 
+/// Declaration of a **generic** webhook trigger — for any service that can `POST` a JSON body,
+/// not just GitHub. The daemon delivers it to `/webhook`; map the fields you need into `params`
+/// via dot-paths (same as [`GithubWebhookDecl`]). The full body is also reachable as `trigger.*`
+/// in templates (and, for a `durable` workflow, persisted into run state — see the PII note on
+/// [`GithubWebhookDecl`]).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct WebhookDecl {
+    /// The event name, matched case-insensitively against the request's `X-Odin-Event` header.
+    /// Omit to fire on **any** event posted to `/webhook`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// Maps a declared workflow param to a dot-path into the JSON body, e.g.
+    /// `pr_url: pull_request.html_url`. Absent paths are skipped (the run then fails param
+    /// validation, surfacing the misconfiguration).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub params: IndexMap<ParamName, String>,
+}
+
 /// Declaration of a cron trigger.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -76,11 +100,23 @@ mod tests {
     issue_url: issue.html_url
 - type: cron
   schedule: "0 3 * * 1"
+- type: webhook
+  event: deploy
+  params:
+    ref: deployment.ref
 "#;
         let triggers: Vec<TriggerDecl> = serde_yaml_ng::from_str(y).unwrap();
-        assert_eq!(triggers.len(), 3);
+        assert_eq!(triggers.len(), 4);
         assert!(matches!(triggers[0], TriggerDecl::Manual { .. }));
         assert!(matches!(triggers[2], TriggerDecl::Cron(_)));
+        let TriggerDecl::Webhook(wh) = &triggers[3] else {
+            panic!("expected webhook");
+        };
+        assert_eq!(wh.event.as_deref(), Some("deploy"));
+        assert_eq!(
+            wh.params.get(&crate::ids::ParamName::from("ref")),
+            Some(&"deployment.ref".to_owned())
+        );
         let TriggerDecl::GithubWebhook(wh) = &triggers[1] else {
             panic!("expected github_webhook");
         };

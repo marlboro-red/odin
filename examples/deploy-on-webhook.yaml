@@ -1,0 +1,21 @@
+# A GENERIC webhook trigger: any service that can POST JSON (a CI system, a deploy tool, an
+# internal app) hits the daemon's `/webhook` with `X-Odin-Event: deploy` and a JSON body. Unlike
+# `github_webhook`, there's no GitHub event/repo model — just an optional event-name match and a
+# param mapping from the body by dot-path. Sign with `X-Odin-Signature-256: sha256=<hmac>` when the
+# daemon has a secret (HMAC-SHA256 of the raw body), exactly like the GitHub path.
+name: deploy-on-webhook
+workspace: { type: worktree }
+durable: true
+
+triggers:
+  - type: webhook
+    event: deploy
+    params:
+      ref: deployment.ref
+
+params:
+  ref: { required: true }
+
+steps:
+  - id: announce
+    run: "echo deploying {{ params.ref }}"

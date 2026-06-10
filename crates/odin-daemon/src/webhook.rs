@@ -1,5 +1,6 @@
-//! GitHub webhook triggers: a shared HTTP server that turns signed webhook POSTs into
-//! [`TriggerEvent`]s feeding the daemon's pull-based [`Trigger`] loop.
+//! Webhook triggers — GitHub (`github_webhook`) and a generic `webhook` (`X-Odin-Event`): a shared
+//! HTTP server that turns signed webhook POSTs into [`TriggerEvent`]s feeding the daemon's
+//! pull-based [`Trigger`] loop.
 //!
 //! [`WebhookServer`] is push-side: it owns the HTTP listener and one
 //! [`mpsc::Sender`](tokio::sync::mpsc) per [subscription](GithubWebhookDecl). Each
@@ -13,13 +14,15 @@
 //!
 //! ## Hardening
 //!
-//! - **Signatures**: HMAC-SHA256 over the raw body, fail-closed when a secret is configured.
-//! - **Idempotency**: GitHub re-delivers on a non-2xx/timeout; recent `X-GitHub-Delivery`
-//!   ids are remembered ([`DeliveryDedup`]) so a retry doesn't start a duplicate run.
+//! - **Signatures**: HMAC-SHA256 over the raw body, fail-closed when a secret is configured
+//!   (`X-Hub-Signature-256` for GitHub, `X-Odin-Signature-256` for the generic webhook).
+//! - **Idempotency**: a sender re-delivers on a non-2xx/timeout; recent delivery ids
+//!   (`X-GitHub-Delivery` / `X-Odin-Delivery`, namespaced by kind) are remembered
+//!   ([`DeliveryDedup`]) so a retry doesn't start a duplicate run.
 //! - **Resource bounds**: a 25 MiB body cap, a bounded per-subscription queue, and the
 //!   daemon's `max_concurrent_runs` together bound the work a flood of *valid* deliveries can
 //!   spawn — so HTTP-edge rate limiting is left to a fronting reverse proxy rather than
-//!   reimplemented here. A full queue makes the delivery fail `503` (un-deduped so GitHub
+//!   reimplemented here. A full queue makes the delivery fail `503` (un-deduped so the sender
 //!   retries): delivery is **at-least-once**, never silently dropped.
 //! - **TLS**: not built in — run behind a TLS-terminating reverse proxy (the server warns
 //!   when bound to a non-loopback address over plain HTTP).
@@ -39,7 +42,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
-use odin_core::ir::GithubWebhookDecl;
+use odin_core::ir::{GithubWebhookDecl, WebhookDecl};
 use odin_core::traits::{Trigger, TriggerEvent};
 use odin_core::{
     Decision, Engine, Error, RunId, RunInput, Store, TriggerError, Workflow, WorkflowId,
@@ -159,18 +162,37 @@ impl Subscription {
     }
 }
 
-/// The pull-side handle for a webhook subscription: a [`Trigger`] that yields events the
-/// [`WebhookServer`] routes to it.
+/// One declared **generic** `webhook` trigger bound to a workflow (no GitHub event/repo model —
+/// just an optional event-name match against `X-Odin-Event`).
+struct WebhookSubscription {
+    workflow: WorkflowId,
+    /// The event name to match (case-insensitively) against `X-Odin-Event`; `None` = any event.
+    event: Option<String>,
+    /// Declared param → dot-path into the JSON body.
+    params: IndexMap<String, String>,
+    tx: mpsc::Sender<TriggerEvent>,
+}
+
+impl WebhookSubscription {
+    fn matches(&self, event: &str) -> bool {
+        self.event
+            .as_ref()
+            .is_none_or(|want| want.eq_ignore_ascii_case(event))
+    }
+}
+
+/// The pull-side handle for a webhook subscription (GitHub or generic): a [`Trigger`] that yields
+/// events the [`WebhookServer`] routes to it.
 pub struct GithubWebhookTrigger {
     rx: mpsc::Receiver<TriggerEvent>,
+    /// `github_webhook` or `webhook`, reported by [`Trigger::kind`].
+    kind: &'static str,
 }
 
 #[async_trait]
 impl Trigger for GithubWebhookTrigger {
-    // The trait fixes the return type to `&str`; the literal cannot be `&'static str`.
-    #[allow(clippy::unnecessary_literal_bound)]
     fn kind(&self) -> &str {
-        "github_webhook"
+        self.kind
     }
 
     async fn next_event(&mut self) -> Result<Option<TriggerEvent>, TriggerError> {
@@ -185,6 +207,7 @@ pub struct WebhookServer {
     addr: SocketAddr,
     secret: Option<String>,
     subscriptions: Vec<Subscription>,
+    webhook_subscriptions: Vec<WebhookSubscription>,
     approvals: Option<ApprovalCtx>,
     store: Option<Arc<dyn Store>>,
     metrics: Option<Arc<crate::metrics::Metrics>>,
@@ -210,6 +233,7 @@ impl WebhookServer {
             addr,
             secret,
             subscriptions: Vec::new(),
+            webhook_subscriptions: Vec::new(),
             approvals: None,
             store: None,
             metrics: None,
@@ -248,7 +272,9 @@ impl WebhookServer {
     /// `/health` are read-only and don't require a secret.
     #[must_use]
     pub fn serves_mutations(&self) -> bool {
-        !self.subscriptions.is_empty() || self.approvals.is_some()
+        !self.subscriptions.is_empty()
+            || !self.webhook_subscriptions.is_empty()
+            || self.approvals.is_some()
     }
 
     /// Registers one declared webhook trigger and returns the [`GithubWebhookTrigger`] to
@@ -270,20 +296,46 @@ impl WebhookServer {
                 .collect(),
             tx,
         });
-        GithubWebhookTrigger { rx }
+        GithubWebhookTrigger {
+            rx,
+            kind: "github_webhook",
+        }
     }
 
-    /// Number of registered subscriptions (one per `github_webhook` decl).
+    /// Registers one declared **generic** `webhook` trigger and returns its pull-side handle.
+    /// Call once per `webhook` decl.
+    pub fn subscribe_webhook(
+        &mut self,
+        decl: &WebhookDecl,
+        workflow: WorkflowId,
+    ) -> GithubWebhookTrigger {
+        let (tx, rx) = mpsc::channel(QUEUE_DEPTH);
+        self.webhook_subscriptions.push(WebhookSubscription {
+            workflow,
+            event: decl.event.clone(),
+            params: decl
+                .params
+                .iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v.clone()))
+                .collect(),
+            tx,
+        });
+        GithubWebhookTrigger {
+            rx,
+            kind: "webhook",
+        }
+    }
+
+    /// Number of registered webhook subscriptions (GitHub + generic) — one per webhook trigger.
     #[must_use]
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.len()
+        self.subscriptions.len() + self.webhook_subscriptions.len()
     }
 
-    /// Whether any subscriptions were registered. The daemon skips starting the server when
-    /// no workflow declares a webhook trigger.
+    /// Whether any webhook subscriptions (GitHub or generic) were registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.subscriptions.is_empty()
+        self.subscriptions.is_empty() && self.webhook_subscriptions.is_empty()
     }
 
     /// Binds the TCP listener (so the actual port is known before serving — useful for the
@@ -304,6 +356,7 @@ impl WebhookServer {
             state: Arc::new(AppState {
                 secret: self.secret,
                 subscriptions: self.subscriptions,
+                webhook_subscriptions: self.webhook_subscriptions,
                 approvals: self.approvals,
                 store: self.store,
                 metrics: self.metrics,
@@ -337,7 +390,9 @@ impl BoundWebhookServer {
     /// are answered with a 4xx and logged).
     pub async fn serve(self, shutdown: CancellationToken) -> anyhow::Result<()> {
         if self.state.secret.is_none()
-            && (!self.state.subscriptions.is_empty() || self.state.approvals.is_some())
+            && (!self.state.subscriptions.is_empty()
+                || !self.state.webhook_subscriptions.is_empty()
+                || self.state.approvals.is_some())
         {
             tracing::warn!(
                 "no secret set (ODIN_WEBHOOK_SECRET / --webhook-secret); accepting UNSIGNED \
@@ -366,6 +421,7 @@ impl BoundWebhookServer {
 struct AppState {
     secret: Option<String>,
     subscriptions: Vec<Subscription>,
+    webhook_subscriptions: Vec<WebhookSubscription>,
     /// Present when `POST /approve` is enabled (some workflow has an approval gate).
     approvals: Option<ApprovalCtx>,
     /// The run-state store for `GET /metrics` + the dashboard API (set when the daemon serves).
@@ -506,7 +562,12 @@ async fn handle_approve(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(rejection) = verify_signature(state.secret.as_deref(), &headers, &body) {
+    if let Some(rejection) = verify_signature(
+        state.secret.as_deref(),
+        &headers,
+        &body,
+        "x-hub-signature-256",
+    ) {
         return rejection;
     }
     let Some(ctx) = state.approvals.as_ref() else {
@@ -612,7 +673,16 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Some(rejection) = verify_signature(state.secret.as_deref(), &headers, &body) {
+    // Route by which event header is present: GitHub (`X-GitHub-Event`, verified with
+    // `X-Hub-Signature-256`) or the generic Odin webhook (`X-Odin-Event` / `X-Odin-Signature-256`).
+    let is_github = header_str(&headers, "x-github-event").is_some();
+    let sig_header = if is_github {
+        "x-hub-signature-256"
+    } else {
+        "x-odin-signature-256"
+    };
+    if let Some(rejection) = verify_signature(state.secret.as_deref(), &headers, &body, sig_header)
+    {
         return rejection;
     }
 
@@ -624,71 +694,131 @@ async fn handle_webhook(
         }
     };
 
-    let Some(event_type) = header_str(&headers, "x-github-event") else {
-        return (StatusCode::BAD_REQUEST, "missing X-GitHub-Event").into_response();
-    };
-    let action = payload.get("action").and_then(serde_json::Value::as_str);
-    let repo_full_name = payload
-        .get("repository")
-        .and_then(|r| r.get("full_name"))
-        .and_then(serde_json::Value::as_str);
-    let delivery = header_str(&headers, "x-github-delivery").unwrap_or("?");
-    let label = event_label(event_type, action);
+    if let Some(event_type) = header_str(&headers, "x-github-event") {
+        let action = payload.get("action").and_then(serde_json::Value::as_str);
+        let repo_full_name = payload
+            .get("repository")
+            .and_then(|r| r.get("full_name"))
+            .and_then(serde_json::Value::as_str);
+        let delivery = header_str(&headers, "x-github-delivery").unwrap_or("?");
+        let label = event_label(event_type, action);
+        let matched: Vec<Enqueue> = state
+            .subscriptions
+            .iter()
+            .filter(|s| s.matches(event_type, action, repo_full_name))
+            .map(|s| Enqueue {
+                source: format!("github_webhook:{label}"),
+                workflow: s.workflow.clone(),
+                input: build_input("github_webhook", &payload, &s.params),
+                tx: s.tx.clone(),
+            })
+            .collect();
+        dispatch_webhook(
+            &state,
+            &namespaced_delivery("github", delivery),
+            &label,
+            matched,
+        )
+    } else if let Some(event) = header_str(&headers, "x-odin-event") {
+        let delivery = header_str(&headers, "x-odin-delivery").unwrap_or("?");
+        let matched: Vec<Enqueue> = state
+            .webhook_subscriptions
+            .iter()
+            .filter(|s| s.matches(event))
+            .map(|s| Enqueue {
+                source: format!("webhook:{event}"),
+                workflow: s.workflow.clone(),
+                input: build_input("webhook", &payload, &s.params),
+                tx: s.tx.clone(),
+            })
+            .collect();
+        dispatch_webhook(
+            &state,
+            &namespaced_delivery("webhook", delivery),
+            event,
+            matched,
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            "missing X-GitHub-Event or X-Odin-Event header",
+        )
+            .into_response()
+    }
+}
 
-    // Idempotency: GitHub re-delivers on timeout/error. Drop a delivery we've already FULLY
+/// Namespaces a delivery id by trigger kind, so a GitHub delivery `abc` and a generic delivery
+/// `abc` (two independent senders can pick the same id) don't false-collide in the shared dedup
+/// set. The `"?"` sentinel (absent delivery id) passes through to skip dedup.
+fn namespaced_delivery(kind: &str, delivery: &str) -> String {
+    if delivery == "?" {
+        "?".to_owned()
+    } else {
+        format!("{kind}:{delivery}")
+    }
+}
+
+/// One matched subscription to enqueue a run for.
+struct Enqueue {
+    source: String,
+    workflow: WorkflowId,
+    input: RunInput,
+    tx: mpsc::Sender<TriggerEvent>,
+}
+
+/// Shared delivery tail for both webhook kinds: dedup, enqueue each matched run, answer 2xx/503.
+fn dispatch_webhook(
+    state: &AppState,
+    delivery: &str,
+    label: &str,
+    matched: Vec<Enqueue>,
+) -> Response {
+    // Idempotency: a sender re-delivers on timeout/non-2xx. Drop a delivery we've already FULLY
     // handled so a retry doesn't start a duplicate run. We record a delivery only AFTER every
     // matched subscription is enqueued (below) — a delivery recorded up-front, then partially
     // failed, would let a *concurrent* in-flight retry of the same id see it as a duplicate and
-    // get a 2xx, so GitHub would never retry and the un-enqueued subscriptions would be lost.
+    // get a 2xx, so the sender would never retry and the un-enqueued subscriptions would be lost.
     // Recording after success keeps the contract at-least-once: the worst case is two in-flight
     // deliveries of one id both enqueuing (a duplicate run), never a dropped one.
-    if delivery != "?" && dedup(&state).contains(delivery) {
+    if delivery != "?" && dedup(state).contains(delivery) {
         tracing::info!(%delivery, "webhook: duplicate delivery ignored");
         return (StatusCode::OK, "duplicate delivery ignored").into_response();
     }
 
-    let mut matched = 0_usize;
+    let total = matched.len();
     let mut dropped = 0_usize;
-    for sub in &state.subscriptions {
-        if sub.matches(event_type, action, repo_full_name) {
-            matched += 1;
-            let input = build_input(&payload, &sub.params);
-            let event = TriggerEvent::new(
-                format!("github_webhook:{label}"),
-                sub.workflow.clone(),
-                input,
+    for e in matched {
+        let event = TriggerEvent::new(e.source, e.workflow.clone(), e.input);
+        if let Err(err) = e.tx.try_send(event) {
+            dropped += 1;
+            tracing::warn!(
+                %label,
+                workflow = %e.workflow.as_str(),
+                error = %err,
+                "webhook: dropping event (subscription queue full)"
             );
-            if let Err(e) = sub.tx.try_send(event) {
-                dropped += 1;
-                tracing::warn!(
-                    %label,
-                    workflow = %sub.workflow.as_str(),
-                    error = %e,
-                    "webhook: dropping event (subscription queue full)"
-                );
-            }
         }
     }
     if dropped > 0 {
-        // Couldn't enqueue every matched run (queue overflow). Leave the delivery UN-recorded
-        // and return a non-2xx so GitHub retries it. (A retry may re-enqueue subscriptions that
+        // Couldn't enqueue every matched run (queue overflow). Leave the delivery UN-recorded and
+        // return a non-2xx so the sender retries it. (A retry may re-enqueue subscriptions that
         // already accepted — at-least-once, preferred over silently losing the event.)
         tracing::warn!(
-            %label, %delivery, dropped, matched,
-            "webhook: enqueue(s) failed; returning 503 so GitHub retries"
+            %label, %delivery, dropped, matched = total,
+            "webhook: enqueue(s) failed; returning 503 so the sender retries"
         );
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("enqueue failed for {dropped}/{matched}; please retry"),
+            format!("enqueue failed for {dropped}/{total}; please retry"),
         )
             .into_response();
     }
-    // Fully enqueued (or nothing matched): record now so GitHub's later retry is deduped.
+    // Fully enqueued (or nothing matched): record now so a later retry is deduped.
     if delivery != "?" {
-        dedup(&state).record(delivery);
+        dedup(state).record(delivery);
     }
-    tracing::info!(%label, %delivery, matched, "webhook: delivery accepted");
-    (StatusCode::ACCEPTED, format!("accepted; matched {matched}")).into_response()
+    tracing::info!(%label, %delivery, matched = total, "webhook: delivery accepted");
+    (StatusCode::ACCEPTED, format!("accepted; matched {total}")).into_response()
 }
 
 /// Locks the dedup set, recovering the guard if a previous holder panicked (poison) rather
@@ -701,13 +831,19 @@ fn dedup(state: &AppState) -> std::sync::MutexGuard<'_, DeliveryDedup> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Verifies `X-Hub-Signature-256` against the raw body. Returns `None` to accept (a
-/// configured secret matched, or none is configured — dev mode) or `Some(response)` with the
+/// Verifies the HMAC signature in `sig_header` (`x-hub-signature-256` for GitHub,
+/// `x-odin-signature-256` for the generic webhook) against the raw body. Returns `None` to accept
+/// (a configured secret matched, or none is configured — dev mode) or `Some(response)` with the
 /// rejection. (Returning an `Option` rather than a `Result<(), Response>` keeps the large
 /// axum `Response` out of an `Err` variant — `clippy::result_large_err`.)
-fn verify_signature(secret: Option<&str>, headers: &HeaderMap, body: &[u8]) -> Option<Response> {
+fn verify_signature(
+    secret: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+    sig_header: &str,
+) -> Option<Response> {
     let secret = secret?; // dev mode: accept unsigned (warned about at startup).
-    let Some(header) = header_str(headers, "x-hub-signature-256") else {
+    let Some(header) = header_str(headers, sig_header) else {
         tracing::warn!("webhook: rejecting unsigned request (a secret is configured)");
         return Some((StatusCode::BAD_REQUEST, "missing signature").into_response());
     };
@@ -729,9 +865,14 @@ fn verify_signature(secret: Option<&str>, headers: &HeaderMap, body: &[u8]) -> O
 }
 
 /// Builds the run input: the full event as `trigger_payload` (reachable as `trigger.*`),
-/// plus any declared params extracted from the payload by dot-path.
-fn build_input(payload: &serde_json::Value, params: &IndexMap<String, String>) -> RunInput {
-    let mut input = RunInput::manual().with_trigger("github_webhook", payload.clone());
+/// plus any declared params extracted from the payload by dot-path. `source` is the trigger name
+/// recorded on the run (`github_webhook` or `webhook`).
+fn build_input(
+    source: &str,
+    payload: &serde_json::Value,
+    params: &IndexMap<String, String>,
+) -> RunInput {
+    let mut input = RunInput::manual().with_trigger(source, payload.clone());
     for (name, path) in params {
         if let Some(value) = extract_path(payload, path) {
             input.params.insert(name.clone(), value);
@@ -766,7 +907,10 @@ fn event_label(event_type: &str, action: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventSpec, HmacSha256, Subscription, build_input, extract_path, verify_signature};
+    use super::{
+        EventSpec, HmacSha256, Subscription, build_input, extract_path, namespaced_delivery,
+        verify_signature,
+    };
     use axum::http::{HeaderMap, HeaderValue};
     use hmac::Mac as _;
     use indexmap::IndexMap;
@@ -870,7 +1014,7 @@ mod tests {
         params.insert("issue_url".to_owned(), "issue.html_url".to_owned());
         params.insert("missing".to_owned(), "nope".to_owned());
 
-        let input = build_input(&payload, &params);
+        let input = build_input("github_webhook", &payload, &params);
         assert_eq!(input.trigger, "github_webhook");
         assert_eq!(input.trigger_payload, payload);
         assert_eq!(input.params["issue_url"], serde_json::json!("https://x/7"));
@@ -895,7 +1039,7 @@ mod tests {
             "x-hub-signature-256",
             HeaderValue::from_str(&sign(secret, body)).unwrap(),
         );
-        assert!(verify_signature(Some(secret), &headers, body).is_none());
+        assert!(verify_signature(Some(secret), &headers, body, "x-hub-signature-256").is_none());
 
         // Wrong signature is rejected (Some == a rejection response).
         let mut bad = HeaderMap::new();
@@ -903,18 +1047,74 @@ mod tests {
             "x-hub-signature-256",
             HeaderValue::from_str(&sign("wrong", body)).unwrap(),
         );
-        assert!(verify_signature(Some(secret), &bad, body).is_some());
+        assert!(verify_signature(Some(secret), &bad, body, "x-hub-signature-256").is_some());
 
         // Missing header is rejected when a secret is configured.
-        assert!(verify_signature(Some(secret), &HeaderMap::new(), body).is_some());
+        assert!(
+            verify_signature(Some(secret), &HeaderMap::new(), body, "x-hub-signature-256")
+                .is_some()
+        );
 
         // Tampered body fails against a signature for the original body.
-        assert!(verify_signature(Some(secret), &headers, b"tampered").is_some());
+        assert!(
+            verify_signature(Some(secret), &headers, b"tampered", "x-hub-signature-256").is_some()
+        );
+    }
+
+    #[test]
+    fn generic_webhook_signature_uses_its_own_header() {
+        let body = br#"{"deployment":{"ref":"v1"}}"#;
+        let secret = "s3cr3t";
+
+        // Correctly signed in X-Odin-Signature-256 → accepted.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-odin-signature-256",
+            HeaderValue::from_str(&sign(secret, body)).unwrap(),
+        );
+        assert!(verify_signature(Some(secret), &headers, body, "x-odin-signature-256").is_none());
+
+        // Unsigned with a secret set → rejected (fail-closed).
+        assert!(
+            verify_signature(
+                Some(secret),
+                &HeaderMap::new(),
+                body,
+                "x-odin-signature-256"
+            )
+            .is_some()
+        );
+
+        // Signed in the GITHUB header but verified for the generic header → rejected (the generic
+        // path won't accept a github-named signature).
+        let mut github_named = HeaderMap::new();
+        github_named.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign(secret, body)).unwrap(),
+        );
+        assert!(
+            verify_signature(Some(secret), &github_named, body, "x-odin-signature-256").is_some()
+        );
+    }
+
+    #[test]
+    fn delivery_ids_are_namespaced_by_kind() {
+        // The same raw id from two different senders must not collide in the shared dedup set.
+        assert_ne!(
+            namespaced_delivery("github", "abc"),
+            namespaced_delivery("webhook", "abc")
+        );
+        assert_eq!(namespaced_delivery("github", "abc"), "github:abc");
+        // The absent-id sentinel passes through unchanged (so it keeps skipping dedup).
+        assert_eq!(namespaced_delivery("github", "?"), "?");
+        assert_eq!(namespaced_delivery("webhook", "?"), "?");
     }
 
     #[test]
     fn dev_mode_accepts_unsigned() {
         // No secret configured → unsigned requests are accepted.
-        assert!(verify_signature(None, &HeaderMap::new(), b"anything").is_none());
+        assert!(
+            verify_signature(None, &HeaderMap::new(), b"anything", "x-hub-signature-256").is_none()
+        );
     }
 }
