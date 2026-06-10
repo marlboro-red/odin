@@ -314,34 +314,34 @@ impl Engine for LocalEngine {
     }
 
     async fn summary(&self, run_id: RunId) -> Result<Option<RunSummary>> {
-        let Some(store) = &self.store else {
-            return Ok(None);
+        // Durable runs are persisted in the store; non-durable runs live only in the in-memory
+        // mirror. Try the store first, then the mirror.
+        let state = match &self.store {
+            Some(store) => store.load_run(run_id).await?,
+            None => None,
         };
-        let Some(state) = store.load_run(run_id).await? else {
-            return Ok(None);
+        let state = match state {
+            Some(s) => Some(s),
+            None => self.mirror.lock().unwrap().get(&run_id).cloned(),
         };
-        let steps = state
-            .steps
-            .iter()
-            .map(|(id, st)| step_result(id, st))
-            .collect();
-        let diff = state
-            .artifacts
-            .get(&crate::ids::ArtifactName::new(DIFF))
-            .cloned();
-        let usage = total_usage(&state.steps);
-        Ok(Some(RunSummary {
-            run_id: state.run_id,
-            workflow: state.workflow,
-            status: state.status,
-            steps,
-            usage,
-            side_effects: collect_side_effects(&state.steps),
-            diff,
-            error: state.error,
-            started_at: state.created_at,
-            finished_at: Some(state.updated_at),
-        }))
+        Ok(state.map(Self::summary_from_state))
+    }
+
+    async fn recent(&self, limit: usize) -> Result<Vec<crate::view::RunView>> {
+        let mut runs: Vec<RunState> = match &self.store {
+            Some(store) => store.recent(limit).await?,
+            None => Vec::new(),
+        };
+        // Merge in non-durable runs the engine is tracking in memory (the store never holds them,
+        // so there's no overlap to dedup). Then newest-first and cap to `limit`.
+        runs.extend(self.mirror.lock().unwrap().values().cloned());
+        runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.run_id.0.cmp(&a.run_id.0))
+        });
+        runs.truncate(limit);
+        Ok(runs.iter().map(crate::view::RunView::project).collect())
     }
 
     async fn submit_approval(
@@ -539,6 +539,35 @@ impl Engine for LocalEngine {
 }
 
 impl LocalEngine {
+    /// Builds a [`RunSummary`] from a loaded/mirrored [`RunState`]. `finished_at` is `Some` only
+    /// for a terminal run — an in-flight or paused run (now visible via the mirror) reports `None`
+    /// rather than a fabricated end time.
+    fn summary_from_state(state: RunState) -> RunSummary {
+        let steps = state
+            .steps
+            .iter()
+            .map(|(id, st)| step_result(id, st))
+            .collect();
+        let diff = state
+            .artifacts
+            .get(&crate::ids::ArtifactName::new(DIFF))
+            .cloned();
+        let usage = total_usage(&state.steps);
+        let finished_at = state.status.is_terminal().then_some(state.updated_at);
+        RunSummary {
+            run_id: state.run_id,
+            workflow: state.workflow,
+            status: state.status,
+            steps,
+            usage,
+            side_effects: collect_side_effects(&state.steps),
+            diff,
+            error: state.error,
+            started_at: state.created_at,
+            finished_at,
+        }
+    }
+
     /// Marks a run terminally Failed, checkpoints it, and returns its summary. Used by
     /// `resume_all` so one un-resumable run does not abort recovery of the others.
     async fn fail_run(

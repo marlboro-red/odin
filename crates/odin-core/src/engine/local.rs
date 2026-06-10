@@ -102,7 +102,16 @@ pub(crate) struct LocalEngine {
     /// not), in addition to the durable audit log — the embedder's live view. Set via
     /// [`super::EngineBuilder::on_event`]; see [`super::EventHook`].
     on_event: Option<super::EventHook>,
+    /// In-memory view of **non-durable** runs (which the store never persists), so `summary()` /
+    /// `recent()` and the dashboard can still see them live. Bounded ([`MIRROR_CAP`]); a finished
+    /// non-durable run lingers until evicted or the process exits. Durable runs are NOT mirrored
+    /// (they're already in the store), so the two sources never overlap.
+    mirror: std::sync::Mutex<IndexMap<RunId, RunState>>,
 }
+
+/// Max non-durable runs held in the in-memory mirror. Newest are kept; when full, the oldest
+/// *terminal* run is evicted first (an in-flight run is never dropped), else the oldest overall.
+const MIRROR_CAP: usize = 256;
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
 /// executes once even under concurrent decisions. See [`LocalEngine::claim_run`].
@@ -260,7 +269,26 @@ impl LocalEngine {
             active_cancels: std::sync::Mutex::new(HashMap::new()),
             stream,
             on_event,
+            mirror: std::sync::Mutex::new(IndexMap::new()),
         }
+    }
+
+    /// Records a non-durable run's latest state in the in-memory mirror (durable runs go to the
+    /// store instead). Bounded to [`MIRROR_CAP`]: an update keeps the run's slot; a new run over
+    /// the cap evicts the oldest terminal run (never an in-flight one), else the oldest overall.
+    fn mirror_put(&self, state: &RunState) {
+        let mut mirror = self.mirror.lock().unwrap();
+        if !mirror.contains_key(&state.run_id) && mirror.len() >= MIRROR_CAP {
+            let victim = mirror
+                .iter()
+                .find(|(_, s)| s.status.is_terminal())
+                .map(|(id, _)| *id)
+                .or_else(|| mirror.keys().next().copied());
+            if let Some(victim) = victim {
+                mirror.shift_remove(&victim);
+            }
+        }
+        mirror.insert(state.run_id, state.clone());
     }
 
     /// The live-output sink for `step`, derived from the engine's [`StreamMux`] (the `--stream`
@@ -329,6 +357,11 @@ impl LocalEngine {
             if let Some(store) = &self.store {
                 store.checkpoint(state).await?;
             }
+        } else {
+            // Non-durable runs aren't persisted; mirror them in memory so `summary()`/`recent()`
+            // and the dashboard can still see them live (the store never will). Called at every
+            // step boundary, so the mirror tracks progress like a checkpoint would.
+            self.mirror_put(state);
         }
         Ok(())
     }
@@ -3379,6 +3412,80 @@ steps:
                 .any(|e| matches!(e, RunEvent::RunResumed { .. })),
             "missing RunResumed: {events:?}"
         );
+    }
+
+    /// The in-memory mirror makes a **non-durable** run visible to `recent()`/`summary()` even
+    /// though the store never persisted it.
+    #[tokio::test]
+    async fn recent_and_summary_see_a_non_durable_run() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: nd\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        // The store never saw it (non-durable)…
+        assert!(
+            store.load_run(s.run_id).await.unwrap().is_none(),
+            "the store must not hold a non-durable run"
+        );
+        assert!(store.recent(10).await.unwrap().is_empty());
+        // …but the engine's mirror does.
+        let summary = eng
+            .summary(s.run_id)
+            .await
+            .unwrap()
+            .expect("the mirror should hold the run");
+        assert_eq!(summary.status, RunStatus::Succeeded);
+        assert!(
+            summary.finished_at.is_some(),
+            "a terminal run has finished_at"
+        );
+        let recent = eng.recent(10).await.unwrap();
+        assert!(
+            recent.iter().any(|v| v.run_id == s.run_id.to_string()),
+            "engine.recent() must list the non-durable run: {recent:?}"
+        );
+    }
+
+    /// `summary()` reports `finished_at: None` for a still-running (mirrored) run — no fabricated
+    /// end time, the bug the mirror's in-flight visibility would otherwise expose.
+    #[tokio::test]
+    async fn summary_finished_at_is_none_while_running() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: nf\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 2\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+
+        let mut checked = false;
+        for _ in 0..120 {
+            let recent = eng.recent(10).await.unwrap();
+            if let Some(v) = recent.iter().find(|v| v.status == "running") {
+                use std::str::FromStr as _;
+                let run_id = RunId::from_str(&v.run_id).unwrap();
+                let summary = eng.summary(run_id).await.unwrap().unwrap();
+                assert_eq!(summary.status, RunStatus::Running);
+                assert!(
+                    summary.finished_at.is_none(),
+                    "an in-flight run must not report finished_at"
+                );
+                checked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            checked,
+            "the running non-durable run should have appeared in the mirror"
+        );
+        handle.await.unwrap().unwrap();
     }
 
     /// A clean (non-cancelled) run emits NO `RunCancelled`, and `RunStarted`/`RunFinished` bracket

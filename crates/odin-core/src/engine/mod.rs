@@ -73,11 +73,23 @@ pub trait Engine: Send + Sync {
     /// Returns an [`crate::error::Error`] if recovery fails.
     async fn resume_all(&self, workflows: &[Workflow]) -> Result<Vec<RunSummary>>;
 
-    /// Fetches the summary of a known run id from the [`Store`].
+    /// Fetches the summary of a known run id. Consults the durable [`Store`] first, then the
+    /// engine's in-memory view of **non-durable** runs (which the store never sees). `Ok(None)` if
+    /// the run is unknown to both.
     ///
     /// # Errors
     /// Returns an [`crate::error::Error`] if the store read fails.
     async fn summary(&self, run_id: RunId) -> Result<Option<RunSummary>>;
+
+    /// Lists the most-recently-updated runs (newest first), up to `limit` — the
+    /// [`RunView`](crate::view::RunView) projection a status UI consumes. Merges persisted
+    /// (durable) runs from the [`Store`] with **non-durable** runs the engine is tracking in memory
+    /// (bounded, until process exit), so a live view shows both. Without a store, returns just the
+    /// in-memory non-durable runs.
+    ///
+    /// # Errors
+    /// Returns an [`crate::error::Error`] if the store read fails.
+    async fn recent(&self, limit: usize) -> Result<Vec<crate::view::RunView>>;
 
     /// Records a human `decision` on the run's pending [`approval`](crate::ir::ApprovalStep)
     /// gate, then resumes the run — returning its resulting summary (terminal, or paused again
