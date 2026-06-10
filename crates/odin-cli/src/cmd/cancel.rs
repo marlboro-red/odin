@@ -18,12 +18,29 @@ pub(crate) struct CancelArgs {
     pub run_id: String,
     pub repo: Option<PathBuf>,
     pub db: Option<PathBuf>,
+    /// Emit `{"run_id":…,"requested":bool}` on stdout instead of the human line.
+    pub json: bool,
 }
 
 /// Records a cross-process cancel request for the run.
 pub(crate) fn cancel(args: CancelArgs) -> anyhow::Result<ExitCode> {
-    let run_id = RunId::from_str(&args.run_id)
-        .map_err(|_| anyhow::anyhow!("invalid run id {:?}", args.run_id))?;
+    let run_id = match RunId::from_str(&args.run_id) {
+        Ok(id) => id,
+        // A bad UUID still gets a parseable envelope on stdout under --json (not just an anyhow
+        // error to stderr), so the command's `--json` contract holds on every path.
+        Err(_) if args.json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "run_id": args.run_id,
+                    "requested": false,
+                    "error": format!("invalid run id {:?}", args.run_id),
+                }))?
+            );
+            return Ok(ExitCode::from(2));
+        }
+        Err(_) => anyhow::bail!("invalid run id {:?}", args.run_id),
+    };
     let repo = args.repo.unwrap_or_else(|| PathBuf::from("."));
     let db = args
         .db
@@ -31,7 +48,22 @@ pub(crate) fn cancel(args: CancelArgs) -> anyhow::Result<ExitCode> {
     let store = SqliteStore::open(&db).context("opening the run state database")?;
     let runtime = Runtime::new().context("starting the async runtime")?;
 
-    if runtime.block_on(store.request_cancel(run_id))? {
+    let requested = runtime.block_on(store.request_cancel(run_id))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "run_id": run_id.to_string(),
+                "requested": requested,
+            }))?
+        );
+        return Ok(if requested {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        });
+    }
+    if requested {
         println!(
             "⏹ cancel requested for run {run_id}; if it is running it will stop within a few \
              seconds (terminally cancelled)"

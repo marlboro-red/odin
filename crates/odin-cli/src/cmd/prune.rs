@@ -52,6 +52,12 @@ pub(crate) fn run(args: PruneArgs) -> anyhow::Result<ExitCode> {
     // Otherwise, unless --yes, preview first and confirm (CI-safe: a non-TTY auto-declines).
     if !args.yes {
         let preview = runtime.block_on(engine.prune(&policy, true))?;
+        // Under --json there's no human to prompt: emit the dry-run report (what WOULD be pruned;
+        // `dry_run: true` means nothing was deleted) on stdout and stop. Pass --yes to delete.
+        if args.json {
+            emit(&preview, true);
+            return Ok(ExitCode::SUCCESS);
+        }
         if preview.runs_pruned == 0 {
             println!("Nothing to prune.");
             return Ok(ExitCode::SUCCESS);

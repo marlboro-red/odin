@@ -33,13 +33,45 @@ pub(crate) struct RunArgs {
 /// Runs the workflow named by `args.file` (a path or a recipe name). Exit: `0` succeeded,
 /// `1` failed / invalid, `2` parse/IO.
 pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
+    let json = args.json;
+    match run_inner(args) {
+        Ok(code) => Ok(code),
+        // Any error not already turned into an envelope (a missing file / catalog miss, an IO or
+        // store error, an engine-build failure) still yields a parseable `{ok:false, phase, error}`
+        // on stdout under --json — so `run --json` never produces empty stdout on ANY failure.
+        Err(e) if json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::cmd::validate::json_error_envelope(
+                    "error",
+                    &e.to_string()
+                ))?
+            );
+            Ok(ExitCode::from(2))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn run_inner(args: RunArgs) -> anyhow::Result<ExitCode> {
     let file = crate::catalog::resolve_arg(&args.file, args.recipes_dir.as_deref())?;
     let src =
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
     let workflow = match Workflow::from_yaml_str(&src) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("✗ {}: parse error\n  {e}", file.display());
+            if args.json {
+                // Same envelope as `odin validate --json` so a `run --json` consumer never gets
+                // empty stdout on a malformed workflow.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::cmd::validate::json_parse_envelope(
+                        &e.to_string()
+                    ))?
+                );
+            } else {
+                eprintln!("✗ {}: parse error\n  {e}", file.display());
+            }
             return Ok(ExitCode::from(2));
         }
     };
@@ -157,18 +189,39 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
             })
         }
         Err(Error::Validation(report)) => {
-            for diagnostic in &report.diagnostics {
-                eprintln!("{diagnostic}\n");
+            if args.json {
+                // Emit the same `{ok:false, phase:"validate", diagnostics, error}` shape as
+                // `odin validate --json`, so `run --json` is parseable on a validation failure too.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::cmd::validate::json_validation_envelope(
+                        &report
+                    ))?
+                );
+            } else {
+                for diagnostic in &report.diagnostics {
+                    eprintln!("{diagnostic}\n");
+                }
+                eprintln!(
+                    "✗ {}: {} error(s)",
+                    args.file.display(),
+                    report.error_count()
+                );
             }
-            eprintln!(
-                "✗ {}: {} error(s)",
-                args.file.display(),
-                report.error_count()
-            );
             Ok(ExitCode::from(1))
         }
         Err(e) => {
-            eprintln!("✗ run failed: {e}");
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::cmd::validate::json_error_envelope(
+                        "error",
+                        &e.to_string()
+                    ))?
+                );
+            } else {
+                eprintln!("✗ run failed: {e}");
+            }
             Ok(ExitCode::from(2))
         }
     }

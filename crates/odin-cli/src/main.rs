@@ -139,8 +139,8 @@ enum Command {
         /// Maximum number of runs to show.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Live-refresh every 2s until ctrl-c.
-        #[arg(long)]
+        /// Live-refresh every 2s until ctrl-c. (Mutually exclusive with `--json`.)
+        #[arg(long, conflicts_with = "json")]
         watch: bool,
         /// Emit the runs as JSON (the same shape as the daemon's `/api/runs`).
         #[arg(long)]
@@ -220,6 +220,9 @@ struct ApprovalCmd {
     /// Path to the run-state SQLite database. Overrides `--repo`.
     #[arg(long)]
     db: Option<PathBuf>,
+    /// Emit the resulting run summary as JSON on stdout (for scripts/bots).
+    #[arg(long)]
+    json: bool,
 }
 
 impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
@@ -233,6 +236,7 @@ impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
             rerun: c.rerun,
             repo: c.repo,
             db: c.db,
+            json: c.json,
         }
     }
 }
@@ -247,6 +251,9 @@ struct CancelCmd {
     /// Path to the run-state SQLite database. Overrides `--repo`.
     #[arg(long)]
     db: Option<PathBuf>,
+    /// Emit `{"run_id":…,"requested":bool}` on stdout (for scripts/bots).
+    #[arg(long)]
+    json: bool,
 }
 
 impl From<CancelCmd> for cmd::cancel::CancelArgs {
@@ -255,6 +262,7 @@ impl From<CancelCmd> for cmd::cancel::CancelArgs {
             run_id: c.run_id,
             repo: c.repo,
             db: c.db,
+            json: c.json,
         }
     }
 }

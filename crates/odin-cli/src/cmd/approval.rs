@@ -21,6 +21,9 @@ pub(crate) struct ApprovalArgs {
     pub rerun: bool,
     pub repo: Option<PathBuf>,
     pub db: Option<PathBuf>,
+    /// Emit the resulting `RunSummary` (or `RerunOutcome`) as JSON on stdout instead of the
+    /// human summary, so an approval bot can parse the outcome.
+    pub json: bool,
 }
 
 /// Approves the run's pending gate and resumes it.
@@ -83,6 +86,7 @@ fn resolve(args: &ApprovalArgs) -> anyhow::Result<Resolved> {
 }
 
 fn submit(decision: Decision, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
+    let json = args.json;
     let r = resolve(&args)?;
     let result = r.runtime.block_on(r.engine.submit_approval(
         r.run_id,
@@ -93,21 +97,36 @@ fn submit(decision: Decision, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
     ));
     match result {
         Ok(Some(summary)) => {
-            crate::cmd::run::print_summary(&summary);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                crate::cmd::run::print_summary(&summary);
+            }
             Ok(exit_for(summary.status))
         }
-        Ok(None) => {
-            eprintln!("✗ no run {} found in the store", r.run_id);
-            Ok(ExitCode::from(2))
-        }
-        Err(e) => {
-            eprintln!("✗ {e}");
-            Ok(ExitCode::from(2))
-        }
+        Ok(None) => fail(json, &format!("no run {} found in the store", r.run_id)),
+        Err(e) => fail(json, &e.to_string()),
     }
 }
 
+/// The error/not-found arm: a `{ok:false, phase:"error", error}` envelope on stdout under
+/// `--json` (so a bot never gets empty stdout), else a human line on stderr. Exit `2`.
+fn fail(json: bool, error: &str) -> anyhow::Result<ExitCode> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&crate::cmd::validate::json_error_envelope(
+                "error", error
+            ))?
+        );
+    } else {
+        eprintln!("✗ {error}");
+    }
+    Ok(ExitCode::from(2))
+}
+
 fn reject_rerun(note: String, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
+    let json = args.json;
     let r = resolve(&args)?;
     let result = r.runtime.block_on(r.engine.reject_and_rerun(
         r.run_id,
@@ -117,20 +136,19 @@ fn reject_rerun(note: String, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
     ));
     match result {
         Ok(Some(outcome)) => {
-            crate::cmd::run::print_summary(&outcome.rejected);
-            println!("↻ rerunning as {} with your feedback", outcome.rerun.run_id);
-            crate::cmd::run::print_summary(&outcome.rerun);
+            if json {
+                // `{ "rejected": RunSummary, "rerun": RunSummary }`.
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                crate::cmd::run::print_summary(&outcome.rejected);
+                println!("↻ rerunning as {} with your feedback", outcome.rerun.run_id);
+                crate::cmd::run::print_summary(&outcome.rerun);
+            }
             // The rerun's outcome is the actionable one (it may pause again at the gate).
             Ok(exit_for(outcome.rerun.status))
         }
-        Ok(None) => {
-            eprintln!("✗ no run {} found in the store", r.run_id);
-            Ok(ExitCode::from(2))
-        }
-        Err(e) => {
-            eprintln!("✗ {e}");
-            Ok(ExitCode::from(2))
-        }
+        Ok(None) => fail(json, &format!("no run {} found in the store", r.run_id)),
+        Err(e) => fail(json, &e.to_string()),
     }
 }
 
