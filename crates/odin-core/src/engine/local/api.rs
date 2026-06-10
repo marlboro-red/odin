@@ -114,6 +114,12 @@ impl Engine for LocalEngine {
                 state.status = RunStatus::AwaitingApproval;
                 state.updated_at = Utc::now();
                 self.checkpoint(workflow.durable, &state).await?;
+                self.emit_suspended(
+                    run_id,
+                    workflow.durable,
+                    crate::traits::SuspendReason::Approval,
+                )
+                .await;
                 tracing::info!(parent: &run_span, run_id = %run_id, gate = ?gate, "run paused for approval");
                 return Ok(Self::suspended_summary(
                     run_id,
@@ -137,6 +143,12 @@ impl Engine for LocalEngine {
                 state.error = None;
                 state.updated_at = Utc::now();
                 self.checkpoint(workflow.durable, &state).await?;
+                self.emit_suspended(
+                    run_id,
+                    workflow.durable,
+                    crate::traits::SuspendReason::Shutdown,
+                )
+                .await;
                 tracing::info!(parent: &run_span, run_id = %run_id, "run suspended for shutdown; will resume on next start");
                 return Ok(Self::interrupted_summary(
                     run_id,
@@ -177,7 +189,10 @@ impl Engine for LocalEngine {
         // step even launched (the loop guard skips it, so nothing failed). The token is only
         // reachable while the run is registered/in-flight (the guard removes it on finish), so an
         // `is_cancelled()` here always means the run was interrupted, never a clean completion.
-        if cancel.is_cancelled() {
+        // Read ONCE so the recorded status, the `RunCancelled` event, and `RunFinished` can't
+        // disagree if a cancel lands between two reads.
+        let cancelled = cancel.is_cancelled();
+        if cancelled {
             status = RunStatus::Cancelled;
             summary.status = RunStatus::Cancelled;
             summary.error = Some("run cancelled".to_owned());
@@ -186,7 +201,7 @@ impl Engine for LocalEngine {
         state.error = summary.error.clone();
         state.updated_at = Utc::now();
         self.checkpoint(workflow.durable, &state).await?;
-        if cancel.is_cancelled() {
+        if cancelled {
             self.emit_cancelled(run_id, workflow.durable, &cancel).await;
         }
         self.emit(
@@ -394,20 +409,21 @@ impl Engine for LocalEngine {
         };
         tracing::info!(run_id = %run_id, gate = %gate, decision = ?decision, %approver, "approval recorded");
         // Capture the decision for the audit/progress event before the fields are moved into the
-        // recorded `ApprovalDecision`.
+        // recorded `ApprovalDecision`. One timestamp for both so they can't disagree.
+        let decided_at = Utc::now();
         let decided = RunEvent::ApprovalDecided {
             step: gate.clone(),
             decision,
             approver: approver.clone(),
             note: note.clone(),
-            at: Utc::now(),
+            at: decided_at,
         };
         state.approvals.insert(
             gate,
             ApprovalDecision {
                 decision,
                 approver,
-                at: Utc::now(),
+                at: decided_at,
                 note,
             },
         );
@@ -416,7 +432,9 @@ impl Engine for LocalEngine {
         state.status = RunStatus::Running;
         state.updated_at = Utc::now();
         store.checkpoint(&state).await?;
-        self.emit(run_id, workflow.durable, decided).await;
+        // Emit with `durable = true`: approvals always run with a store (checked above) and the
+        // checkpoint just persisted, so the audit event must not be dropped on a flag mismatch.
+        self.emit(run_id, true, decided).await;
         match self.resume_state(workflow, state).await? {
             Some(summary) => Ok(Some(summary)),
             // A paused run always kept its workspace, so this is unreachable in practice; treat
@@ -617,6 +635,12 @@ impl LocalEngine {
                             state.status = RunStatus::AwaitingApproval;
                             state.updated_at = Utc::now();
                             self.checkpoint(workflow.durable, &state).await?;
+                            self.emit_suspended(
+                                state.run_id,
+                                workflow.durable,
+                                crate::traits::SuspendReason::Approval,
+                            )
+                            .await;
                             tracing::info!(run_id = %state.run_id, gate = ?gate, "resumed run paused for approval");
                             Self::suspended_summary(
                                 state.run_id,
@@ -636,6 +660,12 @@ impl LocalEngine {
                                     state.error = None;
                                     state.updated_at = Utc::now();
                                     self.checkpoint(workflow.durable, &state).await?;
+                                    self.emit_suspended(
+                                        state.run_id,
+                                        workflow.durable,
+                                        crate::traits::SuspendReason::Shutdown,
+                                    )
+                                    .await;
                                     tracing::info!(run_id = %state.run_id, "resumed run suspended for shutdown; will resume again");
                                     return Ok(Some(Self::interrupted_summary(
                                         state.run_id,
@@ -665,7 +695,9 @@ impl LocalEngine {
                                         None,
                                         started_at,
                                     );
-                                    if cancel.is_cancelled() {
+                                    // Read once (see run()'s terminal path) so status/event agree.
+                                    let cancelled = cancel.is_cancelled();
+                                    if cancelled {
                                         status = RunStatus::Cancelled;
                                         summary.status = RunStatus::Cancelled;
                                         summary.error = Some("run cancelled".to_owned());
@@ -674,7 +706,7 @@ impl LocalEngine {
                                     state.error = summary.error.clone();
                                     state.updated_at = Utc::now();
                                     self.checkpoint(workflow.durable, &state).await?;
-                                    if cancel.is_cancelled() {
+                                    if cancelled {
                                         self.emit_cancelled(
                                             state.run_id,
                                             workflow.durable,

@@ -25,8 +25,16 @@ use crate::traits::{PrunePolicy, PruneReport, RunEvent, Store};
 /// progress (a websocket, a channel, a UI) without polling.
 ///
 /// The closure runs **inline** on the engine's task, so it must be cheap and non-blocking — hand
-/// off to your own thread/channel for real work. A panic inside it is caught and logged, never
-/// aborting the run; events are delivered in order, at-most-once (a panicking call drops its event).
+/// off to your own thread/channel for real work (a blocking or `block_on` callback stalls the run).
+/// Events for a single run arrive in order, but the hook is shared (one `Arc`) and may be invoked
+/// **concurrently** for different runs (e.g. `resume_all` recovers several at once), so it takes
+/// `&self`-style shared access.
+///
+/// A panic inside it is caught and logged, never aborting the run — **except** under
+/// `panic = "abort"`, where `catch_unwind` cannot catch and the process still dies. A panicking
+/// call drops its one event. Beware that a panic while holding a `std::sync::Mutex` *poisons* it,
+/// so a naive `lock().unwrap()` callback silently loses every later event; prefer a channel
+/// (`mpsc::Sender`) or a poison-tolerant lock. Registering a second hook replaces the first.
 pub type EventHook = Arc<dyn Fn(RunId, &RunEvent) + Send + Sync>;
 
 /// The thing embedders drive to run workflows.

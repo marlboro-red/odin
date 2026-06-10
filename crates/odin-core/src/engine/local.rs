@@ -342,13 +342,17 @@ impl LocalEngine {
     /// deletes events alongside the row), growing the `events` table without bound. The hook has
     /// no such persistence, so it can safely carry non-durable runs (see [`Self::on_event`]).
     async fn emit(&self, run_id: RunId, durable: bool, event: RunEvent) {
-        // Push-based hook first, inline. A panicking callback must never abort the run, so catch
-        // it; a poisoned hook just drops its event and logs once.
+        // Push-based hook first, inline. No engine lock is held across this call (the `running` /
+        // `active_cancels` guards are scoped tightly), so a hook that synchronously calls back into
+        // the engine can't deadlock — but it MUST be non-blocking (see `EventHook`). A panic is
+        // caught so it can't abort the run; note `catch_unwind` catches only under `panic =
+        // "unwind"` (the default) — under `panic = "abort"` a panicking hook still aborts. The warn
+        // fires per panicking call (not once) and names the event kind.
         if let Some(hook) = &self.on_event {
             let fired =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(run_id, &event)));
             if fired.is_err() {
-                tracing::warn!(run_id = %run_id, "on_event callback panicked; event dropped");
+                tracing::warn!(run_id = %run_id, event = ?std::mem::discriminant(&event), "on_event callback panicked; event dropped");
             }
         }
         if durable {
@@ -356,6 +360,24 @@ impl LocalEngine {
                 let _ = store.append_event(run_id, &event).await;
             }
         }
+    }
+
+    /// Emits a [`RunEvent::RunSuspended`] (the run paused, not finished) with its reason.
+    async fn emit_suspended(
+        &self,
+        run_id: RunId,
+        durable: bool,
+        reason: crate::traits::SuspendReason,
+    ) {
+        self.emit(
+            run_id,
+            durable,
+            RunEvent::RunSuspended {
+                reason,
+                at: Utc::now(),
+            },
+        )
+        .await;
     }
 
     /// Emits a [`RunEvent::RunCancelled`] carrying *why* (user cancel vs graceful shutdown),
@@ -3356,6 +3378,200 @@ steps:
                 .iter()
                 .any(|e| matches!(e, RunEvent::RunResumed { .. })),
             "missing RunResumed: {events:?}"
+        );
+    }
+
+    /// A clean (non-cancelled) run emits NO `RunCancelled`, and `RunStarted`/`RunFinished` bracket
+    /// the event stream — the absence/ordering guarantees the cancel tests don't cover.
+    #[tokio::test]
+    async fn a_clean_run_brackets_events_and_emits_no_cancelled() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: clean\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let events = store.events(s.run_id).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::RunCancelled { .. })),
+            "a clean run must not emit RunCancelled: {events:?}"
+        );
+        assert!(
+            matches!(events.first(), Some(RunEvent::RunStarted { .. })),
+            "first event must be RunStarted: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(RunEvent::RunFinished {
+                    status: RunStatus::Succeeded,
+                    ..
+                })
+            ),
+            "last event must be RunFinished(Succeeded): {events:?}"
+        );
+    }
+
+    /// A USER cancel of a durable run ends with exactly `[.. RunCancelled{User}, RunFinished]` in
+    /// that order — the ordering/exactly-once guarantee for the cancel path.
+    #[tokio::test]
+    async fn cancel_emits_run_cancelled_immediately_before_run_finished() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: co\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+        let mut run_id = None;
+        for _ in 0..120 {
+            if let Some(s) = store
+                .load_incomplete()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.status == RunStatus::Running)
+            {
+                run_id = Some(s.run_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let run_id = run_id.expect("running");
+        for _ in 0..120 {
+            if eng.cancel_run(run_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let events = store.events(run_id).await.unwrap();
+        let n_cancelled = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::RunCancelled { .. }))
+            .count();
+        assert_eq!(n_cancelled, 1, "exactly one RunCancelled: {events:?}");
+        // RunCancelled is the second-to-last event; RunFinished is last.
+        let len = events.len();
+        assert!(
+            matches!(
+                events[len - 2],
+                RunEvent::RunCancelled {
+                    reason: crate::traits::CancelReason::User,
+                    ..
+                }
+            ) && matches!(
+                events[len - 1],
+                RunEvent::RunFinished {
+                    status: RunStatus::Cancelled,
+                    ..
+                }
+            ),
+            "tail must be [RunCancelled(User), RunFinished(Cancelled)]: {events:?}"
+        );
+    }
+
+    /// A durable run hit by a graceful shutdown emits `RunSuspended{Shutdown}` (it's resumable),
+    /// NOT `RunCancelled` — the distinction the review flagged as missing.
+    #[tokio::test]
+    async fn durable_shutdown_emits_suspended_not_cancelled() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: sd\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+        let mut fired = 0;
+        for _ in 0..120 {
+            fired = eng.cancel_all_active();
+            if fired >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(fired >= 1);
+        let suspended = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            suspended.status,
+            RunStatus::Running,
+            "suspended, not terminal"
+        );
+        let events = store.events(suspended.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::RunSuspended {
+                    reason: crate::traits::SuspendReason::Shutdown,
+                    ..
+                }
+            )),
+            "missing RunSuspended(Shutdown): {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::RunCancelled { .. })),
+            "a suspended durable run must not emit RunCancelled: {events:?}"
+        );
+    }
+
+    /// Pausing at an approval gate emits `RunSuspended{Approval}`; a rejection records
+    /// `ApprovalDecided{Rejected}`.
+    #[tokio::test]
+    async fn approval_gate_emits_suspended_and_rejection_decided() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+        let events = store.events(s1.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::RunSuspended {
+                    reason: crate::traits::SuspendReason::Approval,
+                    ..
+                }
+            )),
+            "missing RunSuspended(Approval): {events:?}"
+        );
+
+        eng.submit_approval(
+            s1.run_id,
+            Decision::Rejected,
+            "bob".to_owned(),
+            Some("nope".to_owned()),
+            std::slice::from_ref(&wf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = store.events(s1.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::ApprovalDecided { decision: Decision::Rejected, approver, .. }
+                    if approver == "bob"
+            )),
+            "missing ApprovalDecided(Rejected, bob): {events:?}"
         );
     }
 

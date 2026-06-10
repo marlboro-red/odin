@@ -22,7 +22,7 @@ pub use action::{Action, ActionCtx, ActionOutcome};
 pub use provider::{CancelToken, InvocationCtx, InvocationOutcome, Provider};
 pub use store::{
     CancelReason, LoopProgress, PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState,
-    RunStatusCount, StepState, Store, StoreMetrics,
+    RunStatusCount, StepState, Store, StoreMetrics, SuspendReason,
 };
 pub use trigger::{Trigger, TriggerEvent};
 pub use workspace::{AcquireCtx, Workspace, WorkspaceHandle};

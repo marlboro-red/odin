@@ -415,6 +415,17 @@ pub enum RunEvent {
         /// When.
         at: DateTime<Utc>,
     },
+    /// The run **paused** (it is not finished): at an approval gate awaiting a human decision, or
+    /// suspended by a graceful shutdown for resume on the next start. No `RunFinished` follows
+    /// until the run later terminates; a `RunResumed` marks it picking back up. This is what a
+    /// live view needs to tell "still working" from "waiting".
+    #[non_exhaustive]
+    RunSuspended {
+        /// Why it paused.
+        reason: SuspendReason,
+        /// When.
+        at: DateTime<Utc>,
+    },
     /// A crashed or approval-paused run resumed execution (crash recovery or an approval
     /// decision). Pairs with the original `RunStarted` so a resumed run is distinguishable.
     #[non_exhaustive]
@@ -432,7 +443,10 @@ pub enum RunEvent {
     },
 }
 
-/// Why a run was cancelled — the `reason` of a [`RunEvent::RunCancelled`].
+/// Why a run was cancelled — the `reason` of a [`RunEvent::RunCancelled`]. Note a **durable** run
+/// hit by a graceful shutdown is *suspended* (a [`RunEvent::RunSuspended`] with
+/// [`SuspendReason::Shutdown`]), not cancelled; `RunCancelled` fires only when the run actually
+/// ends `Cancelled`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -441,6 +455,20 @@ pub enum CancelReason {
     /// `odin cancel`) — the run ends terminally `Cancelled`.
     User,
     /// A graceful shutdown ([`Engine::cancel_all_active`](crate::engine::Engine::cancel_all_active))
-    /// — a durable run is suspended for resume; a non-durable one is abandoned.
+    /// of a **non-durable** run (a durable one suspends instead — see [`SuspendReason::Shutdown`]).
+    Shutdown,
+}
+
+/// Why a run [paused](RunEvent::RunSuspended) rather than finishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SuspendReason {
+    /// Paused at an `approval:` gate awaiting a human decision (resumes via
+    /// [`Engine::submit_approval`](crate::engine::Engine::submit_approval)).
+    Approval,
+    /// Suspended by a graceful shutdown
+    /// ([`Engine::cancel_all_active`](crate::engine::Engine::cancel_all_active)); a durable run
+    /// resumes via [`resume_all`](crate::engine::Engine::resume_all) on the next start.
     Shutdown,
 }

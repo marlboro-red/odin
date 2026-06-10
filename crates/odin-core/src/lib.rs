@@ -114,7 +114,7 @@ pub use validate::{
 #[cfg(feature = "runtime")]
 pub use action::{GitCommit, GitPush, OpenPr, ShellExec};
 #[cfg(all(feature = "runtime", feature = "templating"))]
-pub use engine::{Engine, EngineBuilder};
+pub use engine::{Engine, EngineBuilder, EventHook};
 #[cfg(feature = "runtime")]
 pub use provider::{ClaudeProvider, CodexProvider, CopilotProvider, StreamMux, StreamSink};
 #[cfg(feature = "runtime")]
@@ -130,7 +130,7 @@ pub use traits::{Action, Provider, Store, Trigger, Workspace};
 pub use traits::{
     AcquireCtx, ActionCtx, ActionOutcome, CancelReason, CancelToken, InvocationCtx,
     InvocationOutcome, LoopProgress, PrunePolicy, PruneReport, PrunedCount, RunEvent, RunState,
-    RunStatusCount, StepState, StoreMetrics, TriggerEvent, WorkspaceHandle,
+    RunStatusCount, StepState, StoreMetrics, SuspendReason, TriggerEvent, WorkspaceHandle,
 };
 #[cfg(feature = "runtime")]
 pub use view::{GateView, RunDetailView, RunView, StepView};
