@@ -6,7 +6,7 @@ All notable changes to Odin are recorded here. The format follows
 [versioning policy](README.md#versioning) (the minor is the breaking slot). The library crates and
 the CLIs share one version.
 
-## [0.1.0]
+## [0.1.0] – 2026-06-11
 
 A developer-experience milestone: the engine was already strong at "run, then read the result", but
 walled the moment you needed to **act mid-run, watch a run live, or observe a non-durable run**.
