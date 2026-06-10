@@ -102,7 +102,24 @@ pub(crate) struct LocalEngine {
     /// not), in addition to the durable audit log — the embedder's live view. Set via
     /// [`super::EngineBuilder::on_event`]; see [`super::EventHook`].
     on_event: Option<super::EventHook>,
+    /// In-memory view of runs that are NOT persisted to the store (a `durable: false` run, or any
+    /// run when no store is configured), so `summary()` / `recent()` can still see them live. Each
+    /// entry is a **light** snapshot ([`Self::light_snapshot`]): per-step status/exit/usage but NOT
+    /// step output, the diff, or the trigger payload — bounded memory, not full run state. Process-
+    /// local and lost on restart; a finished entry lingers until evicted or exit. Persisted runs
+    /// are never mirrored, so the two sources normally don't overlap (see `recent`'s dedup for the
+    /// one case they can — a `durable` flag flipped mid-run).
+    mirror: std::sync::Mutex<IndexMap<RunId, RunState>>,
 }
+
+/// Max runs held in the in-memory mirror. When full, a NEW run evicts the oldest *terminal* run;
+/// only if all 256 are in-flight (≥256 concurrent unpersisted runs — pathological) does it evict
+/// the oldest live run, which then reappears at its next step boundary.
+const MIRROR_CAP: usize = 256;
+
+/// Max serialized size of a single param value retained in a mirror [`light_snapshot`]; larger
+/// values (e.g. a webhook param mapped from a big payload field) are replaced with a placeholder.
+const MIRROR_PARAM_CAP: usize = 4096;
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
 /// executes once even under concurrent decisions. See [`LocalEngine::claim_run`].
@@ -260,6 +277,106 @@ impl LocalEngine {
             active_cancels: std::sync::Mutex::new(HashMap::new()),
             stream,
             on_event,
+            mirror: std::sync::Mutex::new(IndexMap::new()),
+        }
+    }
+
+    /// Records a not-persisted run's latest state in the in-memory mirror (persisted runs go to the
+    /// store instead). Stores a [`Self::light_snapshot`] (no step output / diff / payload), bounded
+    /// to [`MIRROR_CAP`]: an update keeps the run's slot; a new run over the cap evicts the oldest
+    /// terminal run, else (all in-flight) the oldest overall.
+    fn mirror_put(&self, state: &RunState) {
+        let light = Self::light_snapshot(state);
+        let mut mirror = self.mirror.lock().unwrap();
+        if !mirror.contains_key(&state.run_id) && mirror.len() >= MIRROR_CAP {
+            let victim = mirror
+                .iter()
+                .find(|(_, s)| s.status.is_terminal())
+                .map(|(id, _)| *id)
+                .or_else(|| mirror.keys().next().copied());
+            if let Some(victim) = victim {
+                mirror.shift_remove(&victim);
+            }
+        }
+        mirror.insert(state.run_id, light);
+    }
+
+    /// A memory-bounded copy of `state` for the mirror: keeps identity, status, per-step
+    /// status/exit/usage/gates, side effects, timings, and an approval gate's `message`, but DROPS
+    /// the heavy, potentially unbounded fields — each step's captured output, the `DIFF` artifact,
+    /// the trigger payload, and any oversize param value. So `summary()`/`recent()` of a non-durable
+    /// run report status and shape, not full output (use the [`on_event`](super::EventHook) hook or
+    /// `--stream` for live output).
+    fn light_snapshot(state: &RunState) -> RunState {
+        let steps = state
+            .steps
+            .iter()
+            .map(|(id, st)| {
+                // Keep only an approval gate's `message` output (so a paused run's gate message
+                // still surfaces in the RunView); drop everything else (step stdout, up to 1 MiB).
+                let outputs = if st.status == StepStatus::AwaitingApproval {
+                    st.outputs
+                        .iter()
+                        .filter(|(k, _)| k.as_str() == "message")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                } else {
+                    IndexMap::new()
+                };
+                (
+                    id.clone(),
+                    StepState {
+                        status: st.status,
+                        attempts: st.attempts,
+                        exit_code: st.exit_code,
+                        outputs,
+                        usage: st.usage,
+                        gates: st.gates.clone(),
+                        judge_score: st.judge_score,
+                        side_effects: st.side_effects.clone(),
+                        error: st.error.clone(),
+                    },
+                )
+            })
+            .collect();
+        // Keep typed params, but cap any single value's size — a webhook param can be mapped from a
+        // (large) payload field, which would otherwise re-open the unbounded-memory hole.
+        let params = state
+            .input
+            .params
+            .iter()
+            .map(|(k, v)| {
+                let capped = if serde_json::to_string(v).map_or(0, |s| s.len()) > MIRROR_PARAM_CAP {
+                    Value::String("[omitted: large param]".to_owned())
+                } else {
+                    v.clone()
+                };
+                (k.clone(), capped)
+            })
+            .collect();
+        let input = crate::api::RunInput {
+            trigger: state.input.trigger.clone(),
+            trigger_payload: Value::Null, // dropped (unbounded; attacker-controlled for webhooks)
+            params,
+            idempotency_key: state.input.idempotency_key.clone(),
+        };
+        RunState {
+            run_id: state.run_id,
+            workflow: state.workflow.clone(),
+            schema_major: state.schema_major,
+            status: state.status,
+            error: state.error.clone(),
+            steps,
+            artifacts: IndexMap::new(), // dropped (the uncapped DIFF)
+            provider_versions: state.provider_versions.clone(),
+            approvals: state.approvals.clone(),
+            input,
+            workspace: state.workspace.clone(),
+            base_commit: state.base_commit.clone(),
+            snapshot: state.snapshot.clone(),
+            loop_state: state.loop_state.clone(),
+            created_at: state.created_at,
+            updated_at: state.updated_at,
         }
     }
 
@@ -325,11 +442,20 @@ impl LocalEngine {
     }
 
     async fn checkpoint(&self, durable: bool, state: &RunState) -> Result<()> {
+        // A run is *persisted* iff it's durable AND a store is configured. Everything else — a
+        // `durable: false` run, OR a durable run with no store — would otherwise be invisible, so
+        // mirror it in memory. Keying on "persisted" (not just `durable`) closes the gap where a
+        // durable run without a store vanished from `summary()`/`recent()`.
         if durable {
             if let Some(store) = &self.store {
                 store.checkpoint(state).await?;
+                // If this run was ever mirrored (its `durable` flag flipped false→true mid-run),
+                // drop the now-redundant mirror entry so the two sources can't overlap.
+                self.mirror.lock().unwrap().shift_remove(&state.run_id);
+                return Ok(());
             }
         }
+        self.mirror_put(state);
         Ok(())
     }
 
@@ -479,7 +605,8 @@ impl LocalEngine {
     /// approver) and flips the RUN to `AwaitingApproval`, then checkpoints — persisting the
     /// pause so a crash leaves the run correctly parked (not auto-resumed) until a decision.
     /// (A workflow with an approval step is required to be `durable` — ODIN032 — since a pause
-    /// is unresumable without persistence; so this checkpoint always writes.)
+    /// is unresumable without persistence; so this checkpoint persists, to the store when one is
+    /// configured, else to the in-memory mirror.)
     async fn mark_awaiting(
         &self,
         workflow: &Workflow,
@@ -1014,6 +1141,8 @@ impl StepOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr as _;
+
     use crate::api::RunInput;
     use crate::engine::{Engine, EngineBuilder};
     use crate::error::Error;
@@ -1026,6 +1155,28 @@ mod tests {
 
     fn parse(yaml: &str) -> Workflow {
         Workflow::from_yaml_str(yaml).unwrap()
+    }
+
+    /// A minimal `RunState` for exercising the mirror directly.
+    fn mk_mirror_state(status: RunStatus) -> RunState {
+        RunState {
+            run_id: RunId::new(),
+            workflow: crate::ids::WorkflowId::new("w"),
+            schema_major: 1,
+            status,
+            error: None,
+            steps: IndexMap::new(),
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: None,
+            base_commit: None,
+            snapshot: None,
+            loop_state: IndexMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
     }
 
     /// An engine over `repo` with an `echo` provider registered alongside the built-ins.
@@ -3378,6 +3529,224 @@ steps:
                 .iter()
                 .any(|e| matches!(e, RunEvent::RunResumed { .. })),
             "missing RunResumed: {events:?}"
+        );
+    }
+
+    /// The in-memory mirror makes a **non-durable** run visible to `recent()`/`summary()` even
+    /// though the store never persisted it.
+    #[tokio::test]
+    async fn recent_and_summary_see_a_non_durable_run() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: nd\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        // The store never saw it (non-durable)…
+        assert!(
+            store.load_run(s.run_id).await.unwrap().is_none(),
+            "the store must not hold a non-durable run"
+        );
+        assert!(store.recent(10).await.unwrap().is_empty());
+        // …but the engine's mirror does.
+        let summary = eng
+            .summary(s.run_id)
+            .await
+            .unwrap()
+            .expect("the mirror should hold the run");
+        assert_eq!(summary.status, RunStatus::Succeeded);
+        assert!(
+            summary.finished_at.is_some(),
+            "a terminal run has finished_at"
+        );
+        let recent = eng.recent(10).await.unwrap();
+        assert!(
+            recent.iter().any(|v| v.run_id == s.run_id.to_string()),
+            "engine.recent() must list the non-durable run: {recent:?}"
+        );
+    }
+
+    /// `summary()` reports `finished_at: None` for a still-running (mirrored) run — no fabricated
+    /// end time, the bug the mirror's in-flight visibility would otherwise expose.
+    #[tokio::test]
+    async fn summary_finished_at_is_none_while_running() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: nf\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 2\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+
+        // Grab the run id as soon as it appears (any status), then poll summary directly: while it
+        // reports Running (the ~2s sleep gives a wide window), finished_at must be None.
+        let mut run_id = None;
+        for _ in 0..120 {
+            if let Some(v) = eng.recent(10).await.unwrap().first() {
+                run_id = Some(RunId::from_str(&v.run_id).unwrap());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let run_id = run_id.expect("the non-durable run should appear in the mirror");
+        let mut checked = false;
+        for _ in 0..120 {
+            let summary = eng.summary(run_id).await.unwrap().unwrap();
+            if summary.status == RunStatus::Running {
+                assert!(
+                    summary.finished_at.is_none(),
+                    "an in-flight run must not report finished_at"
+                );
+                checked = true;
+            } else {
+                break; // terminal — done observing the running window
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        assert!(checked, "should have observed the run while Running");
+        handle.await.unwrap().unwrap();
+    }
+
+    /// A **durable** run is never mirrored (it's persisted) — guards the `if durable && store`
+    /// predicate so a regression can't duplicate durable runs into `recent()`.
+    #[tokio::test]
+    async fn a_durable_run_with_a_store_is_not_mirrored() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut reg = Registry::with_builtins();
+        reg.register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = LocalEngine::new(
+            reg,
+            Some(store.clone()),
+            repo.path().to_path_buf(),
+            None,
+            None,
+        );
+        let wf = parse(
+            "name: dm\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        assert!(
+            store.load_run(s.run_id).await.unwrap().is_some(),
+            "in the store"
+        );
+        assert!(
+            eng.mirror.lock().unwrap().is_empty(),
+            "a durable, persisted run must NOT be mirrored"
+        );
+    }
+
+    /// A **durable** run with NO store configured is still visible via the mirror — the
+    /// persisted-vs-durable predicate fix (otherwise it would be invisible to `summary()`/`recent()`).
+    #[tokio::test]
+    async fn a_durable_run_without_a_store_is_mirrored() {
+        let repo = init_repo().await;
+        let mut reg = Registry::with_builtins();
+        reg.register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = LocalEngine::new(reg, None, repo.path().to_path_buf(), None, None);
+        let wf = parse(
+            "name: dns\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let summary = eng.summary(s.run_id).await.unwrap();
+        assert!(
+            summary.is_some(),
+            "a durable, store-less run must be visible via the mirror"
+        );
+        assert!(
+            eng.recent(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|v| v.run_id == s.run_id.to_string())
+        );
+    }
+
+    /// The mirror is bounded: inserting past `MIRROR_CAP` keeps the count capped and evicts
+    /// terminal entries first, never a still-in-flight one (until all slots are in-flight).
+    #[tokio::test]
+    async fn mirror_is_bounded_and_evicts_terminal_first() {
+        let repo = init_repo().await;
+        let eng = LocalEngine::new(
+            Registry::with_builtins(),
+            None,
+            repo.path().to_path_buf(),
+            None,
+            None,
+        );
+        // One in-flight run, then flood with terminal runs past the cap.
+        let live = mk_mirror_state(RunStatus::Running);
+        eng.mirror_put(&live);
+        for _ in 0..MIRROR_CAP + 50 {
+            eng.mirror_put(&mk_mirror_state(RunStatus::Succeeded));
+        }
+        let mirror = eng.mirror.lock().unwrap();
+        assert!(
+            mirror.len() <= MIRROR_CAP,
+            "mirror exceeded its cap: {}",
+            mirror.len()
+        );
+        assert!(
+            mirror.contains_key(&live.run_id),
+            "the in-flight run must survive eviction of terminal runs"
+        );
+    }
+
+    /// `light_snapshot` drops the heavy fields (step output, diff, payload), caps a large param,
+    /// but keeps an approval gate's `message` so a paused run still shows it.
+    #[test]
+    fn light_snapshot_drops_heavy_keeps_gate_message_and_caps_params() {
+        use crate::ids::StepId;
+        let mut state = mk_mirror_state(RunStatus::AwaitingApproval);
+        let mut outputs = IndexMap::new();
+        outputs.insert("message".to_owned(), json!("ok to ship?"));
+        outputs.insert("stdout".to_owned(), json!("X".repeat(2_000_000)));
+        state.steps.insert(
+            StepId::new("gate"),
+            StepState {
+                status: StepStatus::AwaitingApproval,
+                attempts: 0,
+                exit_code: None,
+                outputs,
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: Vec::new(),
+                error: None,
+            },
+        );
+        state.artifacts.insert(DIFF.into(), "Y".repeat(2_000_000));
+        state.input.trigger_payload = json!({ "huge": "Z".repeat(1_000_000) });
+        state
+            .input
+            .params
+            .insert("big".to_owned(), json!("Z".repeat(10_000)));
+        state.input.params.insert("small".to_owned(), json!("ok"));
+
+        let light = LocalEngine::light_snapshot(&state);
+        assert!(light.artifacts.is_empty(), "DIFF dropped");
+        assert_eq!(
+            light.input.trigger_payload,
+            serde_json::Value::Null,
+            "payload dropped"
+        );
+        let gate = &light.steps[&StepId::new("gate")];
+        assert!(gate.outputs.contains_key("message"), "gate message kept");
+        assert!(!gate.outputs.contains_key("stdout"), "step stdout dropped");
+        assert_eq!(light.input.params["small"], json!("ok"), "small param kept");
+        assert!(
+            light.input.params["big"]
+                .as_str()
+                .unwrap()
+                .contains("omitted"),
+            "large param capped: {:?}",
+            light.input.params["big"]
         );
     }
 

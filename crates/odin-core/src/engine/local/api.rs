@@ -314,34 +314,53 @@ impl Engine for LocalEngine {
     }
 
     async fn summary(&self, run_id: RunId) -> Result<Option<RunSummary>> {
-        let Some(store) = &self.store else {
-            return Ok(None);
+        // Persisted runs are in the store; unpersisted (non-durable, or durable-without-store) in
+        // the mirror. Try both; if a run is in both (a `durable` flag flipped mid-run), prefer the
+        // one updated more recently so a stale persisted row can't shadow the live mirror entry.
+        let from_store = match &self.store {
+            Some(store) => store.load_run(run_id).await?,
+            None => None,
         };
-        let Some(state) = store.load_run(run_id).await? else {
-            return Ok(None);
+        let from_mirror = self.mirror.lock().unwrap().get(&run_id).cloned();
+        let state = match (from_store, from_mirror) {
+            (Some(a), Some(b)) => Some(if a.updated_at >= b.updated_at { a } else { b }),
+            (s, m) => s.or(m),
         };
-        let steps = state
-            .steps
-            .iter()
-            .map(|(id, st)| step_result(id, st))
-            .collect();
-        let diff = state
-            .artifacts
-            .get(&crate::ids::ArtifactName::new(DIFF))
-            .cloned();
-        let usage = total_usage(&state.steps);
-        Ok(Some(RunSummary {
-            run_id: state.run_id,
-            workflow: state.workflow,
-            status: state.status,
-            steps,
-            usage,
-            side_effects: collect_side_effects(&state.steps),
-            diff,
-            error: state.error,
-            started_at: state.created_at,
-            finished_at: Some(state.updated_at),
-        }))
+        Ok(state.map(Self::summary_from_state))
+    }
+
+    async fn recent(&self, limit: usize) -> Result<Vec<crate::view::RunView>> {
+        // Project both sources to the light `RunView` rather than cloning full states — in
+        // particular the mirror is projected *under its lock* (RunView is small), so a dashboard
+        // poll never clones up to 256 full run states while blocking every step boundary.
+        let mut views: Vec<crate::view::RunView> = match &self.store {
+            Some(store) => store
+                .recent(limit)
+                .await?
+                .iter()
+                .map(crate::view::RunView::project)
+                .collect(),
+            None => Vec::new(),
+        };
+        views.extend({
+            let mirror = self.mirror.lock().unwrap();
+            mirror
+                .values()
+                .map(crate::view::RunView::project)
+                .collect::<Vec<_>>()
+        });
+        // Newest first (RFC3339 `updated_at` sorts chronologically), then dedup by run_id keeping
+        // the newest — the persisted/mirror sources normally don't overlap, but a durable flag
+        // flipped mid-run can land a run in both.
+        views.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.run_id.cmp(&a.run_id))
+        });
+        let mut seen = std::collections::HashSet::new();
+        views.retain(|v| seen.insert(v.run_id.clone()));
+        views.truncate(limit);
+        Ok(views)
     }
 
     async fn submit_approval(
@@ -539,6 +558,35 @@ impl Engine for LocalEngine {
 }
 
 impl LocalEngine {
+    /// Builds a [`RunSummary`] from a loaded/mirrored [`RunState`]. `finished_at` is `Some` only
+    /// for a terminal run — an in-flight or paused run (now visible via the mirror) reports `None`
+    /// rather than a fabricated end time.
+    fn summary_from_state(state: RunState) -> RunSummary {
+        let steps = state
+            .steps
+            .iter()
+            .map(|(id, st)| step_result(id, st))
+            .collect();
+        let diff = state
+            .artifacts
+            .get(&crate::ids::ArtifactName::new(DIFF))
+            .cloned();
+        let usage = total_usage(&state.steps);
+        let finished_at = state.status.is_terminal().then_some(state.updated_at);
+        RunSummary {
+            run_id: state.run_id,
+            workflow: state.workflow,
+            status: state.status,
+            steps,
+            usage,
+            side_effects: collect_side_effects(&state.steps),
+            diff,
+            error: state.error,
+            started_at: state.created_at,
+            finished_at,
+        }
+    }
+
     /// Marks a run terminally Failed, checkpoints it, and returns its summary. Used by
     /// `resume_all` so one un-resumable run does not abort recovery of the others.
     async fn fail_run(
