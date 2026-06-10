@@ -44,10 +44,9 @@ impl Engine for LocalEngine {
         // permanently unresumable (and vanish on restart) — and that only surfaced later, at
         // `submit_approval`. Fail fast at run start instead.
         if self.store.is_none()
-            && workflow
-                .steps
+            && crate::validate::rules::all_steps(workflow)
                 .iter()
-                .any(|s| matches!(s.kind, crate::ir::StepKind::Approval(_)))
+                .any(|(_, s)| matches!(s.kind, crate::ir::StepKind::Approval(_)))
         {
             return Err(Error::Input(format!(
                 "workflow {:?} has an approval gate, which requires a durable store to resume from, \

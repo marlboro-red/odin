@@ -177,8 +177,14 @@ impl Store for MemStore {
 
     async fn recent(&self, limit: usize) -> Result<Vec<RunState>, StoreError> {
         let mut runs: Vec<RunState> = self.runs.lock().unwrap().values().cloned().collect();
-        // Newest first, like the SQLite store's `ORDER BY updated_at DESC`.
-        runs.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+        // Newest first, with a run_id tiebreak to match the SQLite store's
+        // `ORDER BY updated_at DESC, run_id DESC` (so same-timestamp order is deterministic and
+        // identical across both stores).
+        runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.run_id.0.cmp(&a.run_id.0))
+        });
         runs.truncate(limit);
         Ok(runs)
     }
