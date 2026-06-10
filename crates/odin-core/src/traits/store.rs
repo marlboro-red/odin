@@ -55,6 +55,31 @@ pub trait Store: Send + Sync {
     /// Returns a [`StoreError`] if the backend read fails.
     async fn load_run(&self, run_id: RunId) -> Result<Option<RunState>, StoreError>;
 
+    /// Requests cancellation of a run from **another process** (e.g. the CLI `odin cancel` against
+    /// a run executing in the daemon): records a durable cancel signal that the executing engine's
+    /// per-run watcher polls via [`is_cancel_requested`](Store::is_cancel_requested). Returns `true`
+    /// iff a non-terminal run with `run_id` existed and was marked (so the caller can report "no
+    /// such cancellable run"). The default returns `false` — a store without a cancel-signal table
+    /// can't carry a cross-process cancel.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backend write fails.
+    async fn request_cancel(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let _ = run_id;
+        Ok(false)
+    }
+
+    /// Whether a cross-process [`request_cancel`](Store::request_cancel) is pending for `run_id`.
+    /// The engine polls this for each in-flight durable run and fires its cancel token when set.
+    /// Defaults to `false`.
+    ///
+    /// # Errors
+    /// Returns a [`StoreError`] if the backend read fails.
+    async fn is_cancel_requested(&self, run_id: RunId) -> Result<bool, StoreError> {
+        let _ = run_id;
+        Ok(false)
+    }
+
     /// Atomically claims an `awaiting_approval` run for resumption, flipping its status column to
     /// `running` and returning `true` iff **this** caller won the flip (the row existed and was
     /// `awaiting_approval`). Lets two processes that share one store — e.g. the CLI `odin approve`

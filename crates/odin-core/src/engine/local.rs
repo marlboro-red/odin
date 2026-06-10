@@ -130,6 +130,21 @@ impl Drop for CancelGuard<'_> {
     }
 }
 
+/// How often a run's watcher polls the store for a cross-process `odin cancel` request.
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A background poller that fires a run's cancel token when a cross-process `odin cancel` request
+/// lands in the store (the in-process `active_cancels` map can't be reached from another process,
+/// e.g. the CLI cancelling a run executing in the daemon). Aborted on drop — held only for the
+/// run's execute duration.
+struct CancelWatcher(tokio::task::JoinHandle<()>);
+
+impl Drop for CancelWatcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What executing a single step produced (richer than the persisted `StepState`).
 pub(crate) struct StepOutcome {
     status: StepStatus,
@@ -256,6 +271,37 @@ impl LocalEngine {
             engine: self,
             run_id,
         }
+    }
+
+    /// Spawns a background poller that fires `cancel` (a USER cancel → terminal `Cancelled`) when a
+    /// cross-process `odin cancel` request for `run_id` lands in the store. Returns `None` for a
+    /// non-durable run or when no store is configured (nothing to poll). The guard stops the poller
+    /// on drop, so it lives exactly as long as the run executes.
+    fn spawn_cancel_watcher(
+        &self,
+        run_id: RunId,
+        durable: bool,
+        cancel: CancelToken,
+    ) -> Option<CancelWatcher> {
+        if !durable {
+            return None;
+        }
+        let store = self.store.clone()?;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    // The run ended (guard dropped → task aborted) or was cancelled another way.
+                    () = cancel.cancelled() => break,
+                    () = tokio::time::sleep(CANCEL_POLL_INTERVAL) => {
+                        if matches!(store.is_cancel_requested(run_id).await, Ok(true)) {
+                            cancel.cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Some(CancelWatcher(handle))
     }
 
     /// Claims `run_id` for execution, returning a guard that releases it on drop. Returns
@@ -1108,6 +1154,49 @@ steps:
                 .all(|s| s.run_id != suspended.run_id),
             "the resumed run is terminal and no longer incomplete"
         );
+    }
+
+    /// A cross-process `odin cancel` (a request written to the store, as the CLI would, against a
+    /// run executing here) stops the running durable run terminally — the watcher polls the store
+    /// and fires the token.
+    #[tokio::test]
+    async fn a_store_cancel_request_stops_a_running_durable_run() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: xc\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+
+        let mut run_id = None;
+        for _ in 0..120 {
+            if let Some(s) = store
+                .load_incomplete()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.status == RunStatus::Running)
+            {
+                run_id = Some(s.run_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let run_id = run_id.expect("the run should have registered as Running");
+        assert!(
+            store.request_cancel(run_id).await.unwrap(),
+            "a running run is cancellable via the store"
+        );
+
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(15), handle)
+            .await
+            .expect("the watcher must cancel the run within a poll interval")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.status, RunStatus::Cancelled, "error: {:?}", summary.error);
     }
 
     /// `resume_all` recovers MULTIPLE incomplete runs (concurrently) and completes them all — the

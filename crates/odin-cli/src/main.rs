@@ -122,6 +122,8 @@ enum Command {
     Approve(ApprovalCmd),
     /// Reject a run paused at an `approval` gate (failing the gate with `--note` feedback).
     Reject(ApprovalCmd),
+    /// Request cancellation of an in-flight run (e.g. one executing in a running `odind`).
+    Cancel(CancelCmd),
     /// Delete old/excess terminal runs from the store (never touches in-flight or awaiting runs).
     Prune(PruneCmd),
     /// Manage the workflow recipe catalog (run/validate workflows by name).
@@ -229,6 +231,28 @@ impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
             by: c.by,
             note: c.note,
             rerun: c.rerun,
+            repo: c.repo,
+            db: c.db,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct CancelCmd {
+    /// The run id (UUID) of the in-flight run to cancel.
+    run_id: String,
+    /// The git repository whose `.odin/state.db` to use. Defaults to the current dir.
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Path to the run-state SQLite database. Overrides `--repo`.
+    #[arg(long)]
+    db: Option<PathBuf>,
+}
+
+impl From<CancelCmd> for cmd::cancel::CancelArgs {
+    fn from(c: CancelCmd) -> Self {
+        Self {
+            run_id: c.run_id,
             repo: c.repo,
             db: c.db,
         }
@@ -455,6 +479,7 @@ fn main() -> ExitCode {
         } => finish(cmd::inspect::logs(&run_id, repo, db, json)),
         Command::Approve(c) => finish(cmd::approval::approve(c.into())),
         Command::Reject(c) => finish(cmd::approval::reject(c.into())),
+        Command::Cancel(c) => finish(cmd::cancel::cancel(c.into())),
         Command::Prune(c) => finish(cmd::prune::run(c.into())),
         Command::Recipe(c) => finish(dispatch_recipe(c.command)),
         Command::Status {

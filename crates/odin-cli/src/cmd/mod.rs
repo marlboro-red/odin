@@ -1,6 +1,7 @@
 //! Subcommand implementations for the `odin` CLI.
 
 pub(crate) mod approval;
+pub(crate) mod cancel;
 pub(crate) mod inspect;
 pub(crate) mod prune;
 pub(crate) mod recipe;
