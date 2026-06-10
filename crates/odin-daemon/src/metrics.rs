@@ -16,9 +16,9 @@ use chrono::{DateTime, Utc};
 use odin_core::{RunEvent, RunId, StepId, StoreMetrics};
 
 /// Upper bounds (seconds) for the run/step duration histogram buckets — sub-second shell steps
-/// through multi-minute agent steps and long runs.
+/// through multi-minute agent steps and hour-plus runs (so a long agent run isn't `+Inf`-only).
 const DURATION_BUCKETS_SECS: &[f64] = &[
-    0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+    0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0,
 ];
 
 /// A cumulative Prometheus histogram with fixed buckets. Lock-free (atomics) — the engine hook may
@@ -60,19 +60,23 @@ impl Histogram {
     fn render(&self, out: &mut String, name: &str, help: &str) {
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} histogram");
-        for (i, le) in DURATION_BUCKETS_SECS.iter().enumerate() {
-            let _ = writeln!(
-                out,
-                "{name}_bucket{{le=\"{le}\"}} {}",
-                self.buckets[i].load(Relaxed)
-            );
-        }
+        // `observe_ms` bumps count/sum/buckets as separate Relaxed atomics, so a concurrent scrape
+        // could read a bucket already incremented but a count not yet (or vice versa). Repair the
+        // snapshot at render so the OUTPUT is always valid: enforce a non-decreasing running max
+        // across buckets, and make `+Inf` / `_count` the max of the observed count and the largest
+        // bucket — guaranteeing `bucket{le} <= +Inf` (Prometheus's invariant) on every CPU.
         let count = self.count.load(Relaxed);
-        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
+        let mut running = 0u64;
+        for (i, le) in DURATION_BUCKETS_SECS.iter().enumerate() {
+            running = running.max(self.buckets[i].load(Relaxed));
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {running}");
+        }
+        let total = count.max(running);
+        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {total}");
         #[allow(clippy::cast_precision_loss)]
         let sum_secs = self.sum_ms.load(Relaxed) as f64 / 1000.0;
         let _ = writeln!(out, "{name}_sum {sum_secs}");
-        let _ = writeln!(out, "{name}_count {count}");
+        let _ = writeln!(out, "{name}_count {total}");
     }
 }
 
@@ -80,9 +84,11 @@ impl Histogram {
 /// Register [`record`](Self::record) as the engine's `on_event` callback; expose
 /// [`render`](Self::render) from `/metrics`.
 pub struct Metrics {
-    /// Per-run start time (`RunStarted` → removed on `RunFinished`); bounded by in-flight runs.
+    /// Start of a run's current active segment (`RunStarted`/`RunResumed` → removed on
+    /// `RunSuspended`/`RunFinished`); bounded by in-flight runs (+ the leak cap).
     run_starts: Mutex<HashMap<RunId, DateTime<Utc>>>,
-    /// Per-(run, step) start time; the latest attempt's start wins, removed on the step's finish.
+    /// Per-(run, step) start of the FIRST attempt (kept across retries), removed on the step's
+    /// finish.
     step_starts: Mutex<HashMap<(RunId, StepId), DateTime<Utc>>>,
     run_hist: Histogram,
     step_hist: Histogram,
@@ -93,6 +99,12 @@ impl Default for Metrics {
         Self::new()
     }
 }
+
+/// Caps on the start-time maps so a run that errors out after `RunStarted` without a `RunFinished`
+/// (e.g. a recurring store-write failure) can't leak unboundedly: when full, the oldest entry is
+/// evicted. Generous — far above any real in-flight count, so it only bites a pathological leak.
+const MAX_TRACKED_RUNS: usize = 4096;
+const MAX_TRACKED_STEPS: usize = 16_384;
 
 impl Metrics {
     /// An empty metrics registry. Register [`record`](Self::record) as the engine's `on_event` hook
@@ -108,36 +120,43 @@ impl Metrics {
     }
 
     /// Folds one run event into the histograms. Cheap and non-blocking (brief lock + atomics), as
-    /// the `on_event` contract requires.
+    /// the `on_event` contract requires. Poison-tolerant: the maps hold only timestamps, so a prior
+    /// panic mustn't permanently kill metrics — recover the guard rather than re-panic every event.
     pub fn record(&self, run_id: RunId, event: &RunEvent) {
         match event {
-            RunEvent::RunStarted { at, .. } => {
-                self.run_starts.lock().unwrap().insert(run_id, *at);
+            // (Re)start timing the run's ACTIVE execution. `RunResumed` restarts the timer so a
+            // crash-recovered run — which re-emits `RunResumed`, never `RunStarted` — is still
+            // recorded, and a paused/suspended gap (approval human-wait, shutdown) is EXCLUDED
+            // rather than poisoning the histogram with `+Inf` samples.
+            RunEvent::RunStarted { at, .. } | RunEvent::RunResumed { at, .. } => {
+                let mut runs = lock(&self.run_starts);
+                evict_oldest_if_full(&mut runs, MAX_TRACKED_RUNS);
+                runs.insert(run_id, *at);
+            }
+            // Pausing (approval gate or graceful shutdown): stop the timer so the gap isn't billed.
+            RunEvent::RunSuspended { .. } => {
+                lock(&self.run_starts).remove(&run_id);
             }
             RunEvent::RunFinished { at, .. } => {
-                if let Some(start) = self.run_starts.lock().unwrap().remove(&run_id) {
+                if let Some(start) = lock(&self.run_starts).remove(&run_id) {
                     self.run_hist.observe_ms((*at - start).num_milliseconds());
                 }
-                // Drop any step starts left dangling for this run (a finish event we never saw),
-                // so the map can't grow without bound across many runs.
-                self.step_starts
-                    .lock()
-                    .unwrap()
-                    .retain(|(rid, _), _| *rid != run_id);
+                // Drop any step starts left dangling for this run, bounding the map.
+                lock(&self.step_starts).retain(|(rid, _), _| *rid != run_id);
             }
+            // First attempt's start → settle = the step's full wall-clock INCLUDING retries +
+            // backoff (`StepStarted` fires per attempt, so keep the EARLIEST). `StepFinished` fires
+            // once, at settle.
             RunEvent::StepStarted { step, at, .. } => {
-                self.step_starts
-                    .lock()
-                    .unwrap()
-                    .insert((run_id, step.clone()), *at);
+                let key = (run_id, step.clone());
+                let mut steps = lock(&self.step_starts);
+                if !steps.contains_key(&key) {
+                    evict_oldest_if_full(&mut steps, MAX_TRACKED_STEPS);
+                    steps.insert(key, *at);
+                }
             }
             RunEvent::StepFinished { step, at, .. } => {
-                if let Some(start) = self
-                    .step_starts
-                    .lock()
-                    .unwrap()
-                    .remove(&(run_id, step.clone()))
-                {
+                if let Some(start) = lock(&self.step_starts).remove(&(run_id, step.clone())) {
                     self.step_hist.observe_ms((*at - start).num_milliseconds());
                 }
             }
@@ -152,14 +171,36 @@ impl Metrics {
         self.run_hist.render(
             &mut out,
             "odin_run_duration_seconds",
-            "Wall-clock duration of completed runs.",
+            "Active execution duration of completed runs (a paused/recovered run's wait is excluded).",
         );
         self.step_hist.render(
             &mut out,
             "odin_step_duration_seconds",
-            "Wall-clock duration of completed step attempts.",
+            "Wall-clock duration of completed steps (first attempt to settle, including retries).",
         );
         out
+    }
+}
+
+/// Locks a start-time map, recovering from a poisoned mutex (the maps hold only timestamps, so a
+/// prior panic mustn't permanently disable metrics).
+fn lock<K>(
+    m: &Mutex<HashMap<K, DateTime<Utc>>>,
+) -> std::sync::MutexGuard<'_, HashMap<K, DateTime<Utc>>> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Evicts the oldest entry when the map is at `cap`, to bound a leak (a run/step start that never
+/// got a matching finish). The O(n) scan runs only at the cap, which a healthy daemon never hits.
+fn evict_oldest_if_full<K: Clone + Eq + std::hash::Hash>(
+    map: &mut HashMap<K, DateTime<Utc>>,
+    cap: usize,
+) {
+    if map.len() < cap {
+        return;
+    }
+    if let Some(oldest) = map.iter().min_by_key(|(_, t)| **t).map(|(k, _)| k.clone()) {
+        map.remove(&oldest);
     }
 }
 

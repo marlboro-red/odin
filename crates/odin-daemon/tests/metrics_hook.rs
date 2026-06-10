@@ -60,4 +60,41 @@ async fn metrics_hook_records_run_and_step_durations() {
         out.contains("odin_step_duration_seconds_count 1"),
         "step histogram not recorded:\n{out}"
     );
+    // A real observation lands in a finite bucket and the +Inf total equals the count.
+    assert!(
+        out.contains("odin_run_duration_seconds_bucket{le=\"+Inf\"} 1"),
+        "{out}"
+    );
+}
+
+/// A step that retries emits multiple `StepStarted` but ONE `StepFinished`, so it must be observed
+/// exactly ONCE (not per attempt) — the earliest start to settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_step_is_observed_once() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+
+    let metrics = Arc::new(Metrics::new());
+    let engine = EngineBuilder::new()
+        .repo(repo.path())
+        .on_event({
+            let m = metrics.clone();
+            move |id, ev| m.record(id, ev)
+        })
+        .build()
+        .unwrap();
+
+    // `false` always fails; `max: 2` runs two attempts, then the step settles Failed (one finish).
+    let wf = Workflow::from_yaml_str(
+        "name: r\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: flaky, run: \"false\", retry: { max: 2 }}\n",
+    )
+    .unwrap();
+    let s = engine.run(&wf, RunInput::manual()).await.unwrap();
+    assert_eq!(s.status, odin_core::RunStatus::Failed);
+
+    let out = metrics.render();
+    assert!(
+        out.contains("odin_step_duration_seconds_count 1"),
+        "a retried (2-attempt) step must be observed once, not per attempt:\n{out}"
+    );
 }
