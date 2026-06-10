@@ -1080,7 +1080,20 @@ impl LocalEngine {
             side_effects.extend(outcome.side_effects.iter().cloned());
             // The persisted projection; side effects are kept so a later resume can reconstruct
             // the run's full set without re-running the step (see the resume seed below).
-            let step_state = outcome.to_state();
+            let mut step_state = outcome.to_state();
+            // Complete the timings for a step the executor didn't stamp itself — a `loop:` step
+            // (run by the scheduler, not `run_one`) and an instantly-decided approval gate. Their
+            // outcomes carry no timing, so without this the longest step in a run shows none. Keep
+            // the `started_at` that `mark_running` already recorded and stamp the settle time;
+            // a Skipped step never ran, so it stays untimed.
+            if step_state.status != StepStatus::Skipped {
+                if step_state.started_at.is_none() {
+                    step_state.started_at = state.steps.get(&id).and_then(|prev| prev.started_at);
+                }
+                if step_state.finished_at.is_none() {
+                    step_state.finished_at = Some(Utc::now());
+                }
+            }
             state.steps.insert(id.clone(), step_state.clone());
             if matches!(
                 outcome.status,
@@ -3730,6 +3743,25 @@ steps:
             .expect("run in recent()");
         assert!(v.duration_ms.is_some(), "a terminal run has a duration_ms");
         assert!(v.steps[0].duration_ms.is_some(), "step has a duration_ms");
+    }
+
+    /// A `loop:` step — run by the scheduler, not `run_one` — is timed too (the longest step in a
+    /// run is exactly the one you want timed). Regression for the fold-clobber bug.
+    #[tokio::test]
+    async fn a_loop_step_is_timed() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: lt\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - id: fix\n    loop:\n      until: \"steps.check.status == 'passed'\"\n      max: 2\n      steps:\n        - {id: check, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let loop_step = s.steps.iter().find(|st| st.id.as_str() == "fix").unwrap();
+        assert!(
+            loop_step.started_at.is_some() && loop_step.finished_at.is_some(),
+            "a loop step must be timed: {loop_step:?}"
+        );
     }
 
     /// A `run:` step killed by its timeout reports "timed out", not the misleading

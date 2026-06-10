@@ -285,7 +285,9 @@ pub(crate) fn print_summary(summary: &RunSummary) {
             .exit_code
             .map_or(String::new(), |c| format!(" (exit {c})"));
         let dur = match (step.started_at, step.finished_at) {
-            (Some(s), Some(f)) => format!(" [{}]", fmt_duration_ms((f - s).num_milliseconds())),
+            (Some(s), Some(f)) => {
+                format!(" [{}]", fmt_duration_ms((f - s).num_milliseconds().max(0)))
+            }
             _ => String::new(),
         };
         println!("  {} {}{exit}{dur}", glyph(step.status), step.id);
@@ -315,7 +317,7 @@ pub(crate) fn print_summary(summary: &RunSummary) {
     if let Some(finished) = summary.finished_at {
         println!(
             "took: {}",
-            fmt_duration_ms((finished - summary.started_at).num_milliseconds())
+            fmt_duration_ms((finished - summary.started_at).num_milliseconds().max(0))
         );
     }
     if let Some(error) = &summary.error {

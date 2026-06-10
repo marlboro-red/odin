@@ -97,7 +97,7 @@ impl RunView {
                 exit_code: st.exit_code,
                 error: st.error.clone(),
                 duration_ms: match (st.started_at, st.finished_at) {
-                    (Some(s), Some(f)) => Some((f - s).num_milliseconds()),
+                    (Some(s), Some(f)) => Some((f - s).num_milliseconds().max(0)),
                     _ => None,
                 },
             })
@@ -117,14 +117,18 @@ impl RunView {
                     .map(str::to_owned),
             });
         // A terminal run's duration is settled (updated_at ≈ when it finished); an in-flight or
-        // paused run has no final duration yet.
-        let status = tag(&state.status);
-        let duration_ms = matches!(status.as_str(), "succeeded" | "failed" | "cancelled")
-            .then(|| (state.updated_at - state.created_at).num_milliseconds());
+        // paused run has no final duration yet. Keyed on the enum (not the serde string) so a new
+        // status variant can't silently make this `None` forever. `.max(0)` guards a backwards
+        // wall-clock step (NTP) from yielding a negative duration.
+        let duration_ms = state.status.is_terminal().then(|| {
+            (state.updated_at - state.created_at)
+                .num_milliseconds()
+                .max(0)
+        });
         Self {
             run_id: state.run_id.to_string(),
             workflow: state.workflow.as_str().to_owned(),
-            status,
+            status: tag(&state.status),
             created_at: state.created_at.to_rfc3339(),
             updated_at: state.updated_at.to_rfc3339(),
             duration_ms,
