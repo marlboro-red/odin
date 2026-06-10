@@ -98,6 +98,10 @@ pub(crate) struct LocalEngine {
     /// (prefixed by step id), in addition to capturing it — the `odin run --stream` view. `None`
     /// (the default, and always for the daemon) keeps output capture-only.
     stream: Option<StreamMux>,
+    /// Optional push-based progress callback fired for every `RunEvent` of every run (durable or
+    /// not), in addition to the durable audit log — the embedder's live view. Set via
+    /// [`super::EngineBuilder::on_event`]; see [`super::EventHook`].
+    on_event: Option<super::EventHook>,
 }
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
@@ -244,6 +248,7 @@ impl LocalEngine {
         store: Option<Arc<dyn Store>>,
         repo_root: PathBuf,
         stream: Option<StreamMux>,
+        on_event: Option<super::EventHook>,
     ) -> Self {
         Self {
             registry,
@@ -254,6 +259,7 @@ impl LocalEngine {
             running: std::sync::Mutex::new(HashSet::new()),
             active_cancels: std::sync::Mutex::new(HashMap::new()),
             stream,
+            on_event,
         }
     }
 
@@ -327,17 +333,71 @@ impl LocalEngine {
         Ok(())
     }
 
-    /// Appends an audit event — but only for a **durable** run. A non-durable run is never
-    /// checkpointed (no `runs` row), so its events would be orphaned: invisible to `odin status`
-    /// and unreclaimable by `prune` (which deletes a run's events alongside its row), growing the
-    /// `events` table without bound. Gating here mirrors [`checkpoint`](Self::checkpoint).
+    /// The single choke point for every [`RunEvent`]. Fires the push-based progress hook for
+    /// **every** run (durable or not) — the embedder's live view — then appends to the durable
+    /// audit log for **durable** runs only.
+    ///
+    /// The audit log stays durable-only on purpose: a non-durable run has no `runs` row, so its
+    /// events would be orphaned — invisible to `odin status` and unreclaimable by `prune` (which
+    /// deletes events alongside the row), growing the `events` table without bound. The hook has
+    /// no such persistence, so it can safely carry non-durable runs (see [`Self::on_event`]).
     async fn emit(&self, run_id: RunId, durable: bool, event: RunEvent) {
-        if !durable {
-            return;
+        // Push-based hook first, inline. No engine lock is held across this call (the `running` /
+        // `active_cancels` guards are scoped tightly), so a hook that synchronously calls back into
+        // the engine can't deadlock — but it MUST be non-blocking (see `EventHook`). A panic is
+        // caught so it can't abort the run; note `catch_unwind` catches only under `panic =
+        // "unwind"` (the default) — under `panic = "abort"` a panicking hook still aborts. The warn
+        // fires per panicking call (not once) and names the event kind.
+        if let Some(hook) = &self.on_event {
+            let fired =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(run_id, &event)));
+            if fired.is_err() {
+                tracing::warn!(run_id = %run_id, event = ?std::mem::discriminant(&event), "on_event callback panicked; event dropped");
+            }
         }
-        if let Some(store) = &self.store {
-            let _ = store.append_event(run_id, &event).await;
+        if durable {
+            if let Some(store) = &self.store {
+                let _ = store.append_event(run_id, &event).await;
+            }
         }
+    }
+
+    /// Emits a [`RunEvent::RunSuspended`] (the run paused, not finished) with its reason.
+    async fn emit_suspended(
+        &self,
+        run_id: RunId,
+        durable: bool,
+        reason: crate::traits::SuspendReason,
+    ) {
+        self.emit(
+            run_id,
+            durable,
+            RunEvent::RunSuspended {
+                reason,
+                at: Utc::now(),
+            },
+        )
+        .await;
+    }
+
+    /// Emits a [`RunEvent::RunCancelled`] carrying *why* (user cancel vs graceful shutdown),
+    /// derived from the fired token. Called at the terminal point of a run that ended `Cancelled`,
+    /// just before its `RunFinished`.
+    async fn emit_cancelled(&self, run_id: RunId, durable: bool, cancel: &CancelToken) {
+        let reason = if cancel.is_shutdown() {
+            crate::traits::CancelReason::Shutdown
+        } else {
+            crate::traits::CancelReason::User
+        };
+        self.emit(
+            run_id,
+            durable,
+            RunEvent::RunCancelled {
+                reason,
+                at: Utc::now(),
+            },
+        )
+        .await;
     }
 
     /// Appends the gate/judge/finished audit events for a completed step (durable runs only).
@@ -1196,6 +1256,18 @@ steps:
             RunStatus::Cancelled,
             "error: {:?}",
             summary.error
+        );
+        // The audit/progress log records WHY it was cancelled (a user/store cancel, not a shutdown).
+        let events = store.events(run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::RunCancelled {
+                    reason: crate::traits::CancelReason::User,
+                    ..
+                }
+            )),
+            "missing RunCancelled(User): {events:?}"
         );
     }
 
@@ -3199,6 +3271,310 @@ steps:
         );
     }
 
+    /// The `on_event` hook fires the full lifecycle for a **non-durable** run — the run has no
+    /// store and leaves no event log, yet a push-based embedder still sees every transition.
+    #[tokio::test]
+    async fn on_event_hook_fires_for_a_non_durable_run() {
+        let repo = init_repo().await;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let mut builder = EngineBuilder::new()
+            .repo(repo.path()) // NB: no .store()
+            .on_event(move |_id, ev| captured.lock().unwrap().push(ev.clone()));
+        builder
+            .registry_mut()
+            .register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = builder.build().unwrap();
+        let wf = parse(
+            "name: h\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(summary.status, RunStatus::Succeeded);
+
+        let evs = events.lock().unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(e, RunEvent::RunStarted { .. })),
+            "hook missed RunStarted: {evs:?}"
+        );
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, RunEvent::StepStarted { step, .. } if step.as_str() == "s")),
+            "hook missed StepStarted: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                RunEvent::StepFinished {
+                    status: StepStatus::Passed,
+                    ..
+                }
+            )),
+            "hook missed a passed StepFinished: {evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                RunEvent::RunFinished {
+                    status: RunStatus::Succeeded,
+                    ..
+                }
+            )),
+            "hook missed RunFinished: {evs:?}"
+        );
+    }
+
+    /// A panicking `on_event` callback must never abort the run — the panic is caught and logged.
+    #[tokio::test]
+    async fn a_panicking_on_event_hook_does_not_kill_the_run() {
+        let repo = init_repo().await;
+        let mut builder = EngineBuilder::new()
+            .repo(repo.path())
+            .on_event(|_id, _ev| panic!("boom from a bad callback"));
+        builder
+            .registry_mut()
+            .register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = builder.build().unwrap();
+        let wf = parse(
+            "name: hp\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let summary = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(
+            summary.status,
+            RunStatus::Succeeded,
+            "a panicking hook must not abort the run"
+        );
+    }
+
+    /// An approval decision and the subsequent resume emit the new `ApprovalDecided` (who/what/note)
+    /// and `RunResumed` audit events.
+    #[tokio::test]
+    async fn approval_emits_decided_and_resumed_events() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        eng.submit_approval(
+            s1.run_id,
+            Decision::Approved,
+            "alice".to_owned(),
+            Some("lgtm".to_owned()),
+            std::slice::from_ref(&wf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = store.events(s1.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::ApprovalDecided { decision: Decision::Approved, approver, note: Some(n), .. }
+                    if approver == "alice" && n == "lgtm"
+            )),
+            "missing ApprovalDecided: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, RunEvent::RunResumed { .. })),
+            "missing RunResumed: {events:?}"
+        );
+    }
+
+    /// A clean (non-cancelled) run emits NO `RunCancelled`, and `RunStarted`/`RunFinished` bracket
+    /// the event stream — the absence/ordering guarantees the cancel tests don't cover.
+    #[tokio::test]
+    async fn a_clean_run_brackets_events_and_emits_no_cancelled() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: clean\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let events = store.events(s.run_id).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::RunCancelled { .. })),
+            "a clean run must not emit RunCancelled: {events:?}"
+        );
+        assert!(
+            matches!(events.first(), Some(RunEvent::RunStarted { .. })),
+            "first event must be RunStarted: {events:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(RunEvent::RunFinished {
+                    status: RunStatus::Succeeded,
+                    ..
+                })
+            ),
+            "last event must be RunFinished(Succeeded): {events:?}"
+        );
+    }
+
+    /// A USER cancel of a durable run ends with exactly `[.. RunCancelled{User}, RunFinished]` in
+    /// that order — the ordering/exactly-once guarantee for the cancel path.
+    #[tokio::test]
+    async fn cancel_emits_run_cancelled_immediately_before_run_finished() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: co\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+        let mut run_id = None;
+        for _ in 0..120 {
+            if let Some(s) = store
+                .load_incomplete()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.status == RunStatus::Running)
+            {
+                run_id = Some(s.run_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let run_id = run_id.expect("running");
+        for _ in 0..120 {
+            if eng.cancel_run(run_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let events = store.events(run_id).await.unwrap();
+        let n_cancelled = events
+            .iter()
+            .filter(|e| matches!(e, RunEvent::RunCancelled { .. }))
+            .count();
+        assert_eq!(n_cancelled, 1, "exactly one RunCancelled: {events:?}");
+        // RunCancelled is the second-to-last event; RunFinished is last.
+        let len = events.len();
+        assert!(
+            matches!(
+                events[len - 2],
+                RunEvent::RunCancelled {
+                    reason: crate::traits::CancelReason::User,
+                    ..
+                }
+            ) && matches!(
+                events[len - 1],
+                RunEvent::RunFinished {
+                    status: RunStatus::Cancelled,
+                    ..
+                }
+            ),
+            "tail must be [RunCancelled(User), RunFinished(Cancelled)]: {events:?}"
+        );
+    }
+
+    /// A durable run hit by a graceful shutdown emits `RunSuspended{Shutdown}` (it's resumable),
+    /// NOT `RunCancelled` — the distinction the review flagged as missing.
+    #[tokio::test]
+    async fn durable_shutdown_emits_suspended_not_cancelled() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: sd\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+        let mut fired = 0;
+        for _ in 0..120 {
+            fired = eng.cancel_all_active();
+            if fired >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(fired >= 1);
+        let suspended = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            suspended.status,
+            RunStatus::Running,
+            "suspended, not terminal"
+        );
+        let events = store.events(suspended.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::RunSuspended {
+                    reason: crate::traits::SuspendReason::Shutdown,
+                    ..
+                }
+            )),
+            "missing RunSuspended(Shutdown): {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, RunEvent::RunCancelled { .. })),
+            "a suspended durable run must not emit RunCancelled: {events:?}"
+        );
+    }
+
+    /// Pausing at an approval gate emits `RunSuspended{Approval}`; a rejection records
+    /// `ApprovalDecided{Rejected}`.
+    #[tokio::test]
+    async fn approval_gate_emits_suspended_and_rejection_decided() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(APPROVAL_WF);
+        let s1 = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s1.status, RunStatus::AwaitingApproval);
+        let events = store.events(s1.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::RunSuspended {
+                    reason: crate::traits::SuspendReason::Approval,
+                    ..
+                }
+            )),
+            "missing RunSuspended(Approval): {events:?}"
+        );
+
+        eng.submit_approval(
+            s1.run_id,
+            Decision::Rejected,
+            "bob".to_owned(),
+            Some("nope".to_owned()),
+            std::slice::from_ref(&wf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let events = store.events(s1.run_id).await.unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                RunEvent::ApprovalDecided { decision: Decision::Rejected, approver, .. }
+                    if approver == "bob"
+            )),
+            "missing ApprovalDecided(Rejected, bob): {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn loop_emits_paired_start_finish_for_node_and_inner_steps() {
         // The loop node and each inner step must each emit a paired StepStarted + StepFinished —
@@ -4126,6 +4502,7 @@ steps:
             Registry::with_builtins(),
             None,
             repo.path().to_path_buf(),
+            None,
             None,
         );
         let cancel = CancelToken::new();

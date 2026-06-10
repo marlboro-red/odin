@@ -6,7 +6,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::WorkspaceHandle;
-use crate::api::{ApprovalDecision, RunInput, RunStatus, SideEffect, StepStatus};
+use crate::api::{ApprovalDecision, Decision, RunInput, RunStatus, SideEffect, StepStatus};
 use crate::error::StoreError;
 use crate::ids::{ArtifactName, RunId, StepId, WorkflowId};
 use crate::usage::Usage;
@@ -389,6 +389,50 @@ pub enum RunEvent {
         /// When.
         at: DateTime<Utc>,
     },
+    /// A human approval gate was decided (recorded just before the run resumes). Answers the
+    /// audit question "who approved/rejected, and what did they say?" — which `GateResult`
+    /// (shell gates) and `RunFinished` cannot.
+    #[non_exhaustive]
+    ApprovalDecided {
+        /// The gate step that was decided.
+        step: StepId,
+        /// Approved or rejected.
+        decision: Decision,
+        /// Who decided (the recorded approver).
+        approver: String,
+        /// Their note, if any (the rejection feedback / approval comment).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+        /// When.
+        at: DateTime<Utc>,
+    },
+    /// The run was cancelled — distinct from a plain failure, and carrying *why*. A `RunFinished`
+    /// with `status: cancelled` still follows; this event records the cause.
+    #[non_exhaustive]
+    RunCancelled {
+        /// User cancel vs graceful shutdown.
+        reason: CancelReason,
+        /// When.
+        at: DateTime<Utc>,
+    },
+    /// The run **paused** (it is not finished): at an approval gate awaiting a human decision, or
+    /// suspended by a graceful shutdown for resume on the next start. No `RunFinished` follows
+    /// until the run later terminates; a `RunResumed` marks it picking back up. This is what a
+    /// live view needs to tell "still working" from "waiting".
+    #[non_exhaustive]
+    RunSuspended {
+        /// Why it paused.
+        reason: SuspendReason,
+        /// When.
+        at: DateTime<Utc>,
+    },
+    /// A crashed or approval-paused run resumed execution (crash recovery or an approval
+    /// decision). Pairs with the original `RunStarted` so a resumed run is distinguishable.
+    #[non_exhaustive]
+    RunResumed {
+        /// When.
+        at: DateTime<Utc>,
+    },
     /// The run finished.
     #[non_exhaustive]
     RunFinished {
@@ -397,4 +441,34 @@ pub enum RunEvent {
         /// When.
         at: DateTime<Utc>,
     },
+}
+
+/// Why a run was cancelled — the `reason` of a [`RunEvent::RunCancelled`]. Note a **durable** run
+/// hit by a graceful shutdown is *suspended* (a [`RunEvent::RunSuspended`] with
+/// [`SuspendReason::Shutdown`]), not cancelled; `RunCancelled` fires only when the run actually
+/// ends `Cancelled`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CancelReason {
+    /// A user-initiated cancel ([`Engine::cancel_run`](crate::engine::Engine::cancel_run) or
+    /// `odin cancel`) — the run ends terminally `Cancelled`.
+    User,
+    /// A graceful shutdown ([`Engine::cancel_all_active`](crate::engine::Engine::cancel_all_active))
+    /// of a **non-durable** run (a durable one suspends instead — see [`SuspendReason::Shutdown`]).
+    Shutdown,
+}
+
+/// Why a run [paused](RunEvent::RunSuspended) rather than finishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SuspendReason {
+    /// Paused at an `approval:` gate awaiting a human decision (resumes via
+    /// [`Engine::submit_approval`](crate::engine::Engine::submit_approval)).
+    Approval,
+    /// Suspended by a graceful shutdown
+    /// ([`Engine::cancel_all_active`](crate::engine::Engine::cancel_all_active)); a durable run
+    /// resumes via [`resume_all`](crate::engine::Engine::resume_all) on the next start.
+    Shutdown,
 }
