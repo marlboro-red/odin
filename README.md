@@ -141,18 +141,36 @@ See the [integration guide](docs/integration-guide.md) for the full embedding st
 - [`odin` CLI](docs/cli.md) and [`odind` daemon](docs/daemon.md) references.
 - [Webhook walkthrough](docs/webhook-walkthrough.md) — wire a GitHub webhook end-to-end.
 - [Scaffolding & templating](docs/recipe-templating.md) · [Integration guide](docs/integration-guide.md) · [Observability](docs/observability.md) · [Architecture](docs/architecture.md).
+- [Glossary](docs/glossary.md) · [Environment variables](docs/environment.md) · [HTTP API (OpenAPI)](docs/openapi.yaml).
+- [`CHANGELOG.md`](CHANGELOG.md) and the [versioning policy](#versioning) below.
 - `cargo doc --open -p odin-core --all-features` — the API reference.
+
+## Versioning
+
+Odin is pre-1.0 (`0.x`), so the SemVer minor is the breaking slot: a **minor** bump (`0.1 → 0.2`)
+may include breaking changes; a **patch** (`0.1.0 → 0.1.1`) is fixes and backward-compatible
+additions. Both the library crates and the CLIs share one version. Notable changes are recorded in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+The daemon's HTTP responses additionally carry an `X-Odin-Api-Version` header (independent of the
+crate version), bumped only when a response **shape** changes — see the
+[HTTP API contract](docs/daemon.md#http-api-contract).
+
+Rust **MSRV is 1.85**, enforced in CI; raising it is a minor-version change.
 
 ## Status
 
 A capable v0.x engine, openly pre-1.0 and not yet validated by external users. Implemented, tested
-(~400 tests, clippy-pedantic, `unsafe`-forbidden), and documented: the workflow IR + full validator
+(~500 tests, clippy-pedantic, `unsafe`-forbidden), and documented: the workflow IR + full validator
 (45 diagnostics), the templating/context model, the five traits, the durable SQLite store, worktree
 + slot-pool workspaces, all three provider adapters, the built-in actions, LLM-as-judge + retry, the
 concurrent executor (`max_parallel` + `scratch:` fan-out), crash-resume with per-step git snapshots,
 `case:`/`loop:` control flow, default step timeouts + run cancellation, live step-output
 streaming (`--stream`), the recipe catalog, the `odin` CLI, and the `odind` daemon (cron + signed
-webhooks + concurrent dispatch). Known gaps:
+GitHub **and** generic webhooks + concurrent dispatch). The [0.1.0](CHANGELOG.md) DX milestone added
+progress-event hooks, observability of non-durable runs, fully scriptable `--json` CLIs,
+disk-spooled step logs, per-step timings, Prometheus duration + webhook metrics, and a hardened,
+versioned, OpenAPI-documented HTTP API. Known gaps:
 codex/copilot dollar-cost reporting (token usage is parsed), operator-facing cost/usage surfaces,
 and provider routing/fallback.
 
