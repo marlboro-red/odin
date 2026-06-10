@@ -28,7 +28,7 @@ use clap::Parser;
 use odin_core::ir::{HumanDuration, StepKind, TriggerDecl};
 use odin_core::telemetry::{self, Options};
 use odin_core::{EngineBuilder, PrunePolicy, SqliteStore, Store, Workflow};
-use odin_daemon::{Daemon, WebhookServer};
+use odin_daemon::{Daemon, Metrics, WebhookServer};
 
 /// Run Odin workflows from event triggers (cron schedules + GitHub webhooks).
 #[derive(Parser)]
@@ -166,7 +166,15 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     }
     let store: Arc<dyn Store> =
         Arc::new(SqliteStore::open(&db).context("opening the run state database")?);
-    let mut builder = EngineBuilder::new().repo(&cli.repo).store(store.clone());
+    // Live duration-histogram metrics, fed by the engine's event hook and exposed at `/metrics`.
+    let metrics = Arc::new(Metrics::new());
+    let mut builder = EngineBuilder::new()
+        .repo(&cli.repo)
+        .store(store.clone())
+        .on_event({
+            let metrics = metrics.clone();
+            move |run_id, event| metrics.record(run_id, event)
+        });
     // Spool full step output under the state directory's `logs/` (e.g. `<repo>/.odin/logs`) — the
     // unattended daemon especially benefits from a complete on-disk record of a failed run.
     if let Some(parent) = db.parent() {
@@ -204,7 +212,7 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     }
     // The read-only `/metrics` + `/health` endpoints are always served (Prometheus scrapes them),
     // so the HTTP server runs even for a webhook-less, approval-less daemon.
-    webhook_server.enable_metrics(store.clone());
+    webhook_server.enable_metrics(store.clone(), metrics.clone());
     if cli.dashboard {
         webhook_server.enable_dashboard();
     }

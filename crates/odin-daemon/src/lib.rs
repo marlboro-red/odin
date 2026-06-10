@@ -40,5 +40,6 @@ mod trigger;
 mod webhook;
 
 pub use daemon::Daemon;
+pub use metrics::Metrics;
 pub use trigger::CronTrigger;
 pub use webhook::{BoundWebhookServer, GithubWebhookTrigger, WebhookServer};

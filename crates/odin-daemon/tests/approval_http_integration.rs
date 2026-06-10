@@ -127,7 +127,7 @@ impl Harness {
         let mut server =
             WebhookServer::new("127.0.0.1:0".parse().unwrap(), secret.map(str::to_owned));
         server.enable_approvals(engine, Arc::from(vec![workflow]));
-        server.enable_metrics(store.clone());
+        server.enable_metrics(store.clone(), Arc::new(odin_daemon::Metrics::new()));
         server.enable_dashboard();
         let bound = server.bind().await.unwrap();
         let addr = bound.local_addr();

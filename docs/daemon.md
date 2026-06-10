@@ -221,6 +221,13 @@ odin_runs_in_flight 3
 odin_runs_awaiting_approval 2
 # TYPE odin_runs_pending gauge
 odin_runs_pending 0
+# TYPE odin_run_duration_seconds histogram
+odin_run_duration_seconds_bucket{le="30"} 41
+odin_run_duration_seconds_bucket{le="+Inf"} 58
+odin_run_duration_seconds_sum 6312.4
+odin_run_duration_seconds_count 58
+# TYPE odin_step_duration_seconds histogram
+odin_step_duration_seconds_count 203
 ```
 
 - **`odin_runs_total{workflow,status}`** (counter) — runs that reached a terminal status
@@ -229,6 +236,10 @@ odin_runs_pending 0
   deletion, so the counter never drops even as old rows are removed.
 - **`odin_runs_in_flight`**, **`odin_runs_awaiting_approval`**, **`odin_runs_pending`** (gauges)
   — the live counts of the corresponding non-terminal statuses, summed across workflows.
+- **`odin_run_duration_seconds`**, **`odin_step_duration_seconds`** (histograms) — wall-clock
+  duration of completed runs / step attempts, accumulated **in process** as runs finish (fed by the
+  engine's event hook — no store re-scan), so `histogram_quantile()` gives run/step p50/p95 latency.
+  These are reset on daemon restart (in-memory), unlike the store-backed counter above.
 
 `/metrics` (like `/health`) is **unauthenticated** — it's read-only operational data and
 Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the same reverse

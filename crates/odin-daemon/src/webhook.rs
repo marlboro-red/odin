@@ -187,6 +187,7 @@ pub struct WebhookServer {
     subscriptions: Vec<Subscription>,
     approvals: Option<ApprovalCtx>,
     store: Option<Arc<dyn Store>>,
+    metrics: Option<Arc<crate::metrics::Metrics>>,
     dashboard: bool,
 }
 
@@ -211,14 +212,17 @@ impl WebhookServer {
             subscriptions: Vec::new(),
             approvals: None,
             store: None,
+            metrics: None,
             dashboard: false,
         }
     }
 
-    /// Provides the run-state store for the unauthenticated `GET /metrics` endpoint (Prometheus
-    /// text exposition). Without it, `/metrics` reports `503`.
-    pub fn enable_metrics(&mut self, store: Arc<dyn Store>) {
+    /// Provides the run-state store (for the snapshot run-count families) and the live
+    /// [`Metrics`](crate::metrics::Metrics) histograms for the unauthenticated `GET /metrics`
+    /// endpoint (Prometheus text exposition). Without the store, `/metrics` reports `503`.
+    pub fn enable_metrics(&mut self, store: Arc<dyn Store>, metrics: Arc<crate::metrics::Metrics>) {
         self.store = Some(store);
+        self.metrics = Some(metrics);
     }
 
     /// Enables the web dashboard (`GET /` + the read-only `GET /api/runs[/{id}]` it polls).
@@ -302,6 +306,7 @@ impl WebhookServer {
                 subscriptions: self.subscriptions,
                 approvals: self.approvals,
                 store: self.store,
+                metrics: self.metrics,
                 dashboard: self.dashboard,
                 dedup: Mutex::new(DeliveryDedup::new()),
             }),
@@ -365,6 +370,8 @@ struct AppState {
     approvals: Option<ApprovalCtx>,
     /// The run-state store for `GET /metrics` + the dashboard API (set when the daemon serves).
     store: Option<Arc<dyn Store>>,
+    /// Live duration-histogram metrics for `GET /metrics` (fed by the engine event hook).
+    metrics: Option<Arc<crate::metrics::Metrics>>,
     /// Whether the web dashboard (`GET /` + `/api/runs`) is enabled (`--dashboard`).
     dashboard: bool,
     /// Recent delivery ids, to drop GitHub's retries of an already-handled delivery.
@@ -384,12 +391,19 @@ async fn handle_metrics(State(state): State<Arc<AppState>>) -> Response {
         return (StatusCode::SERVICE_UNAVAILABLE, "metrics not enabled").into_response();
     };
     match store.metrics().await {
-        Ok(snapshot) => (
-            StatusCode::OK,
-            [("content-type", "text/plain; version=0.0.4")],
-            crate::metrics::render(&snapshot),
-        )
-            .into_response(),
+        Ok(snapshot) => {
+            // Store-snapshot run counts, then the live duration histograms (when enabled).
+            let mut body = crate::metrics::render(&snapshot);
+            if let Some(metrics) = state.metrics.as_ref() {
+                body.push_str(&metrics.render());
+            }
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain; version=0.0.4")],
+                body,
+            )
+                .into_response()
+        }
         Err(e) => {
             tracing::warn!(error = %e, "metrics: store read failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response()
