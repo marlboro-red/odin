@@ -186,6 +186,9 @@ impl Engine for LocalEngine {
         state.error = summary.error.clone();
         state.updated_at = Utc::now();
         self.checkpoint(workflow.durable, &state).await?;
+        if cancel.is_cancelled() {
+            self.emit_cancelled(run_id, workflow.durable, &cancel).await;
+        }
         self.emit(
             run_id,
             workflow.durable,
@@ -390,6 +393,15 @@ impl Engine for LocalEngine {
             )));
         };
         tracing::info!(run_id = %run_id, gate = %gate, decision = ?decision, %approver, "approval recorded");
+        // Capture the decision for the audit/progress event before the fields are moved into the
+        // recorded `ApprovalDecision`.
+        let decided = RunEvent::ApprovalDecided {
+            step: gate.clone(),
+            decision,
+            approver: approver.clone(),
+            note: note.clone(),
+            at: Utc::now(),
+        };
         state.approvals.insert(
             gate,
             ApprovalDecision {
@@ -404,6 +416,7 @@ impl Engine for LocalEngine {
         state.status = RunStatus::Running;
         state.updated_at = Utc::now();
         store.checkpoint(&state).await?;
+        self.emit(run_id, workflow.durable, decided).await;
         match self.resume_state(workflow, state).await? {
             Some(summary) => Ok(Some(summary)),
             // A paused run always kept its workspace, so this is unreachable in practice; treat
@@ -586,6 +599,12 @@ impl LocalEngine {
                         resumed = true,
                     );
                     tracing::info!(parent: &run_span, "resuming run");
+                    self.emit(
+                        state.run_id,
+                        workflow.durable,
+                        RunEvent::RunResumed { at: Utc::now() },
+                    )
+                    .await;
                     let exec = self
                         .execute(workflow, &mut state, &handle.path.clone(), &params, &cancel)
                         .instrument(run_span)
@@ -655,6 +674,14 @@ impl LocalEngine {
                                     state.error = summary.error.clone();
                                     state.updated_at = Utc::now();
                                     self.checkpoint(workflow.durable, &state).await?;
+                                    if cancel.is_cancelled() {
+                                        self.emit_cancelled(
+                                            state.run_id,
+                                            workflow.durable,
+                                            &cancel,
+                                        )
+                                        .await;
+                                    }
                                     // A run completing via the resume path (crash recovery or an
                                     // approval decision) must still emit its terminal audit event
                                     // — only `run()` did before, so resumed/approved runs left a

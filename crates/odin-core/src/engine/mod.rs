@@ -16,7 +16,18 @@ use crate::ids::RunId;
 use crate::ir::Workflow;
 use crate::provider::StreamMux;
 use crate::registry::Registry;
-use crate::traits::{PrunePolicy, PruneReport, Store};
+use crate::traits::{PrunePolicy, PruneReport, RunEvent, Store};
+
+/// A push-based progress callback: invoked for **every** [`RunEvent`] of **every** run — durable
+/// or not — the moment it happens, alongside the durable audit log. Register one with
+/// [`EngineBuilder::on_event`]. Unlike [`Store::append_event`] (durable runs only), this fires for
+/// non-durable runs too, so it is the way to surface live
+/// progress (a websocket, a channel, a UI) without polling.
+///
+/// The closure runs **inline** on the engine's task, so it must be cheap and non-blocking — hand
+/// off to your own thread/channel for real work. A panic inside it is caught and logged, never
+/// aborting the run; events are delivered in order, at-most-once (a panicking call drops its event).
+pub type EventHook = Arc<dyn Fn(RunId, &RunEvent) + Send + Sync>;
 
 /// The thing embedders drive to run workflows.
 #[async_trait]
@@ -111,6 +122,7 @@ pub struct EngineBuilder {
     store: Option<Arc<dyn Store>>,
     repo_root: Option<PathBuf>,
     stream: Option<StreamMux>,
+    on_event: Option<EventHook>,
 }
 
 impl EngineBuilder {
@@ -122,6 +134,7 @@ impl EngineBuilder {
             store: None,
             repo_root: None,
             stream: None,
+            on_event: None,
         }
     }
 
@@ -150,6 +163,15 @@ impl EngineBuilder {
         self
     }
 
+    /// Registers a push-based progress callback fired for every [`RunEvent`] of every run (see
+    /// [`EventHook`]) — the way to observe runs live without polling the store. Fires for
+    /// non-durable runs too. The callback must be cheap and non-blocking; panics are caught.
+    #[must_use]
+    pub fn on_event(mut self, hook: impl Fn(RunId, &RunEvent) + Send + Sync + 'static) -> Self {
+        self.on_event = Some(Arc::new(hook));
+        self
+    }
+
     /// Accesses the registry to register custom plugins.
     pub fn registry_mut(&mut self) -> &mut Registry {
         &mut self.registry
@@ -173,6 +195,7 @@ impl EngineBuilder {
             self.store,
             repo_root,
             self.stream,
+            self.on_event,
         )))
     }
 }
