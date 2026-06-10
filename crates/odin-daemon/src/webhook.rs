@@ -14,13 +14,15 @@
 //!
 //! ## Hardening
 //!
-//! - **Signatures**: HMAC-SHA256 over the raw body, fail-closed when a secret is configured.
-//! - **Idempotency**: GitHub re-delivers on a non-2xx/timeout; recent `X-GitHub-Delivery`
-//!   ids are remembered ([`DeliveryDedup`]) so a retry doesn't start a duplicate run.
+//! - **Signatures**: HMAC-SHA256 over the raw body, fail-closed when a secret is configured
+//!   (`X-Hub-Signature-256` for GitHub, `X-Odin-Signature-256` for the generic webhook).
+//! - **Idempotency**: a sender re-delivers on a non-2xx/timeout; recent delivery ids
+//!   (`X-GitHub-Delivery` / `X-Odin-Delivery`, namespaced by kind) are remembered
+//!   ([`DeliveryDedup`]) so a retry doesn't start a duplicate run.
 //! - **Resource bounds**: a 25 MiB body cap, a bounded per-subscription queue, and the
 //!   daemon's `max_concurrent_runs` together bound the work a flood of *valid* deliveries can
 //!   spawn — so HTTP-edge rate limiting is left to a fronting reverse proxy rather than
-//!   reimplemented here. A full queue makes the delivery fail `503` (un-deduped so GitHub
+//!   reimplemented here. A full queue makes the delivery fail `503` (un-deduped so the sender
 //!   retries): delivery is **at-least-once**, never silently dropped.
 //! - **TLS**: not built in — run behind a TLS-terminating reverse proxy (the server warns
 //!   when bound to a non-loopback address over plain HTTP).
@@ -324,17 +326,16 @@ impl WebhookServer {
         }
     }
 
-    /// Number of registered subscriptions (one per `github_webhook` decl).
+    /// Number of registered webhook subscriptions (GitHub + generic) — one per webhook trigger.
     #[must_use]
     pub fn subscription_count(&self) -> usize {
-        self.subscriptions.len()
+        self.subscriptions.len() + self.webhook_subscriptions.len()
     }
 
-    /// Whether any subscriptions were registered. The daemon skips starting the server when
-    /// no workflow declares a webhook trigger.
+    /// Whether any webhook subscriptions (GitHub or generic) were registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.subscriptions.is_empty()
+        self.subscriptions.is_empty() && self.webhook_subscriptions.is_empty()
     }
 
     /// Binds the TCP listener (so the actual port is known before serving — useful for the
@@ -389,7 +390,9 @@ impl BoundWebhookServer {
     /// are answered with a 4xx and logged).
     pub async fn serve(self, shutdown: CancellationToken) -> anyhow::Result<()> {
         if self.state.secret.is_none()
-            && (!self.state.subscriptions.is_empty() || self.state.approvals.is_some())
+            && (!self.state.subscriptions.is_empty()
+                || !self.state.webhook_subscriptions.is_empty()
+                || self.state.approvals.is_some())
         {
             tracing::warn!(
                 "no secret set (ODIN_WEBHOOK_SECRET / --webhook-secret); accepting UNSIGNED \
@@ -710,7 +713,12 @@ async fn handle_webhook(
                 tx: s.tx.clone(),
             })
             .collect();
-        dispatch_webhook(&state, delivery, &label, matched)
+        dispatch_webhook(
+            &state,
+            &namespaced_delivery("github", delivery),
+            &label,
+            matched,
+        )
     } else if let Some(event) = header_str(&headers, "x-odin-event") {
         let delivery = header_str(&headers, "x-odin-delivery").unwrap_or("?");
         let matched: Vec<Enqueue> = state
@@ -724,13 +732,29 @@ async fn handle_webhook(
                 tx: s.tx.clone(),
             })
             .collect();
-        dispatch_webhook(&state, delivery, event, matched)
+        dispatch_webhook(
+            &state,
+            &namespaced_delivery("webhook", delivery),
+            event,
+            matched,
+        )
     } else {
         (
             StatusCode::BAD_REQUEST,
             "missing X-GitHub-Event or X-Odin-Event header",
         )
             .into_response()
+    }
+}
+
+/// Namespaces a delivery id by trigger kind, so a GitHub delivery `abc` and a generic delivery
+/// `abc` (two independent senders can pick the same id) don't false-collide in the shared dedup
+/// set. The `"?"` sentinel (absent delivery id) passes through to skip dedup.
+fn namespaced_delivery(kind: &str, delivery: &str) -> String {
+    if delivery == "?" {
+        "?".to_owned()
+    } else {
+        format!("{kind}:{delivery}")
     }
 }
 
@@ -883,7 +907,10 @@ fn event_label(event_type: &str, action: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{EventSpec, HmacSha256, Subscription, build_input, extract_path, verify_signature};
+    use super::{
+        EventSpec, HmacSha256, Subscription, build_input, extract_path, namespaced_delivery,
+        verify_signature,
+    };
     use axum::http::{HeaderMap, HeaderValue};
     use hmac::Mac as _;
     use indexmap::IndexMap;
@@ -1032,6 +1059,55 @@ mod tests {
         assert!(
             verify_signature(Some(secret), &headers, b"tampered", "x-hub-signature-256").is_some()
         );
+    }
+
+    #[test]
+    fn generic_webhook_signature_uses_its_own_header() {
+        let body = br#"{"deployment":{"ref":"v1"}}"#;
+        let secret = "s3cr3t";
+
+        // Correctly signed in X-Odin-Signature-256 → accepted.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-odin-signature-256",
+            HeaderValue::from_str(&sign(secret, body)).unwrap(),
+        );
+        assert!(verify_signature(Some(secret), &headers, body, "x-odin-signature-256").is_none());
+
+        // Unsigned with a secret set → rejected (fail-closed).
+        assert!(
+            verify_signature(
+                Some(secret),
+                &HeaderMap::new(),
+                body,
+                "x-odin-signature-256"
+            )
+            .is_some()
+        );
+
+        // Signed in the GITHUB header but verified for the generic header → rejected (the generic
+        // path won't accept a github-named signature).
+        let mut github_named = HeaderMap::new();
+        github_named.insert(
+            "x-hub-signature-256",
+            HeaderValue::from_str(&sign(secret, body)).unwrap(),
+        );
+        assert!(
+            verify_signature(Some(secret), &github_named, body, "x-odin-signature-256").is_some()
+        );
+    }
+
+    #[test]
+    fn delivery_ids_are_namespaced_by_kind() {
+        // The same raw id from two different senders must not collide in the shared dedup set.
+        assert_ne!(
+            namespaced_delivery("github", "abc"),
+            namespaced_delivery("webhook", "abc")
+        );
+        assert_eq!(namespaced_delivery("github", "abc"), "github:abc");
+        // The absent-id sentinel passes through unchanged (so it keeps skipping dedup).
+        assert_eq!(namespaced_delivery("github", "?"), "?");
+        assert_eq!(namespaced_delivery("webhook", "?"), "?");
     }
 
     #[test]
