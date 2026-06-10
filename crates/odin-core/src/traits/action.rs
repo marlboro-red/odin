@@ -45,6 +45,23 @@ pub struct ActionCtx {
     pub timeout: Option<Duration>,
 }
 
+impl ActionCtx {
+    /// A context with the given step and workdir and empty defaults (no args, no timeout, a fresh
+    /// cancel token). The struct is `#[non_exhaustive]`, so this constructor — not a literal — is
+    /// how external code (e.g. a unit test of a custom [`Action`]) builds one; set the remaining
+    /// `pub` fields you need on the returned value.
+    #[must_use]
+    pub fn new(step_id: StepId, workdir: PathBuf) -> Self {
+        Self {
+            step_id,
+            workdir,
+            args: IndexMap::new(),
+            cancel: CancelToken::new(),
+            timeout: None,
+        }
+    }
+}
+
 /// What an action produced.
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]

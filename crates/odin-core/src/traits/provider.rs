@@ -65,6 +65,32 @@ pub struct InvocationCtx {
     pub stream: Option<crate::provider::process::StreamSink>,
 }
 
+impl InvocationCtx {
+    /// A context with the given step and workdir and otherwise-empty defaults (no prompt, no
+    /// inputs, no timeout, a fresh cancel token, capture-only). The struct is `#[non_exhaustive]`,
+    /// so this constructor — not a literal — is how external code (e.g. a unit test of a custom
+    /// [`Provider`]) builds one; set the remaining `pub` fields you need on the returned value.
+    ///
+    /// ```
+    /// use odin_core::{InvocationCtx, StepId};
+    /// let mut ctx = InvocationCtx::new(StepId::new("plan"), std::env::temp_dir());
+    /// ctx.prompt = Some("hello".to_owned());
+    /// assert_eq!(ctx.step_id.as_str(), "plan");
+    /// ```
+    #[must_use]
+    pub fn new(step_id: StepId, workdir: PathBuf) -> Self {
+        Self {
+            step_id,
+            workdir,
+            prompt: None,
+            inputs: IndexMap::new(),
+            timeout: None,
+            cancel: CancelToken::new(),
+            stream: None,
+        }
+    }
+}
+
 /// What a provider produced.
 #[derive(Clone, Debug)]
 #[non_exhaustive]

@@ -7,20 +7,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::traits::{Action, Provider, Trigger, Workspace};
+use crate::traits::{Action, Provider, Workspace};
 use crate::validate::KnownNames;
 
-/// Resolves provider/workspace/action/trigger names to implementations.
+/// Resolves provider/workspace/action names to implementations. (Triggers are NOT registered here:
+/// a workflow declares them structurally — `type: github_webhook` / `cron` — and the daemon
+/// dispatches them from the workflow's `triggers:` block, not via a string-keyed registry lookup.)
 #[derive(Default, Clone)]
 pub struct Registry {
     providers: BTreeMap<String, Arc<dyn Provider>>,
     workspaces: BTreeMap<String, Arc<dyn Workspace>>,
     actions: BTreeMap<String, Arc<dyn Action>>,
-    triggers: BTreeMap<String, Arc<dyn Trigger>>,
 }
 
 impl Registry {
-    /// A registry with all built-in providers/workspaces/actions/triggers registered.
+    /// A registry with all built-in providers/workspaces/actions registered.
     ///
     /// Registers the claude/codex/copilot providers and the github/git/shell actions.
     /// Workspaces are constructed per-workflow by the engine (not registry singletons).
@@ -58,18 +59,6 @@ impl Registry {
         self
     }
 
-    /// Registers a trigger under its [`Trigger::kind`].
-    ///
-    /// **Reserved for custom embedders.** Neither the engine nor the built-in `odind` daemon
-    /// consults registered triggers — the daemon derives cron/webhook triggers structurally
-    /// from each workflow's `triggers:` block (see [`Trigger`] and the daemon docs). This
-    /// pair (`register_trigger` + [`trigger`](Self::trigger)) exists so a *custom* dispatcher
-    /// can resolve triggers by kind; it is not part of the default run/serve paths.
-    pub fn register_trigger(&mut self, t: Arc<dyn Trigger>) -> &mut Self {
-        self.triggers.insert(t.kind().to_owned(), t);
-        self
-    }
-
     /// Looks up a provider by name.
     #[must_use]
     pub fn provider(&self, name: &str) -> Option<&Arc<dyn Provider>> {
@@ -88,21 +77,12 @@ impl Registry {
         self.workspaces.get(name)
     }
 
-    /// Looks up a trigger by kind. Only ever returns triggers added via
-    /// [`register_trigger`](Self::register_trigger) — see that method: the built-in run/serve
-    /// paths don't populate or consult this, so it is empty unless a custom embedder fills it.
-    #[must_use]
-    pub fn trigger(&self, name: &str) -> Option<&Arc<dyn Trigger>> {
-        self.triggers.get(name)
-    }
-
     /// The set of registered provider/action names, for validating a workflow against
     /// this concrete registry (so third-party plugins are recognized).
     ///
-    /// Trigger and workspace names are intentionally omitted: a workflow references
-    /// providers and actions by name in steps, but its `triggers:` are declared
-    /// structurally (`type: github_webhook`) and dispatched by the daemon, not resolved
-    /// by string key during step validation.
+    /// Workspace names are intentionally omitted: a workflow references providers and actions by
+    /// name in steps, but its `workspace:` / `triggers:` are declared structurally (`type: …`) and
+    /// resolved by the engine/daemon, not by a string key during step validation.
     #[must_use]
     pub fn known_names(&self) -> KnownNames<'_> {
         KnownNames {
