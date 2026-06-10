@@ -159,8 +159,9 @@ impl LocalEngine {
                         }
                         outcome.stderr = o.stderr;
                         // Record the provider's CLI version (resolved once, cached) for run
-                        // reproducibility — only here, on success, since the provider just ran so
-                        // its CLI exists.
+                        // reproducibility. Only on a non-transport-error invoke (this arm) — the CLI
+                        // demonstrably ran, even if it exited non-zero; the `Err` arm (missing/
+                        // crashed CLI) skips it, as `--version` would just fail too.
                         if let Some(version) = self.cached_provider_version(&provider).await {
                             outcome.provider_version =
                                 Some((p.provider.as_str().to_owned(), version));

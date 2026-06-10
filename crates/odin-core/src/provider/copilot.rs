@@ -141,14 +141,23 @@ impl Provider for CopilotProvider {
     }
 
     async fn version(&self) -> Option<String> {
+        // Bounded so a hung/auth-prompting CLI can't wedge the run that resolves it (the result is
+        // cached, so this runs at most once per provider). A non-zero exit isn't a usable version.
+        let opts = ProcessOptions {
+            timeout: Some(std::time::Duration::from_secs(5)),
+            ..ProcessOptions::default()
+        };
         let out = run_process(
             &self.program,
             &["--version".to_owned()],
-            &ProcessOptions::default(),
+            &opts,
             &CancelToken::new(),
         )
         .await
         .ok()?;
+        if out.exit_code != 0 {
+            return None;
+        }
         let v = out.stdout.trim();
         (!v.is_empty()).then(|| v.to_owned())
     }
