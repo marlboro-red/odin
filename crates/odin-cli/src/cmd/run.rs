@@ -124,6 +124,11 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating the state directory {}", parent.display()))?;
         }
+        // Spool full step output alongside the store, under `<repo>/.odin/logs`. (Skipped for
+        // --no-store, which opts out of on-disk run artifacts entirely.)
+        if let Some(logs) = crate::cmd::logs_dir_for(&db) {
+            builder = builder.logs_dir(logs);
+        }
         let store = SqliteStore::open(&db).context("opening the run state database")?;
         builder = builder.store(Arc::new(store));
     }
@@ -181,6 +186,21 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
                 println!("{}", serde_json::to_string_pretty(&summary)?);
             } else {
                 print_summary(&summary);
+                // Point at the spooled full output for a failed run — but only if it actually
+                // exists (a failure with no captured output, e.g. a missing prompt file, spools
+                // nothing). stderr, so stdout stays clean.
+                if summary.status == RunStatus::Failed && !args.no_store {
+                    let db = args
+                        .db
+                        .clone()
+                        .unwrap_or_else(|| repo.join(".odin").join("state.db"));
+                    if let Some(logs) = crate::cmd::logs_dir_for(&db) {
+                        let dir = logs.join(summary.run_id.to_string());
+                        if dir.is_dir() {
+                            eprintln!("  full step logs: {}", dir.display());
+                        }
+                    }
+                }
             }
             // A run paused for approval isn't a failure — it's awaiting input.
             Ok(match summary.status {

@@ -539,6 +539,16 @@ impl Engine for LocalEngine {
                     &cancel,
                 )
                 .await;
+                // Drop the run's spooled step logs too (best-effort), so they don't outlive the
+                // run record that referenced them.
+                if let Some(logs) = &self.logs_dir {
+                    let dir = logs.join(run_id.to_string());
+                    if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(run_id = %run_id, error = %e, "failed to remove spooled step logs on prune");
+                        }
+                    }
+                }
             }
         }
         tracing::info!(

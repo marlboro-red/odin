@@ -59,6 +59,7 @@ pub(crate) fn skipped_outcome() -> StepOutcome {
         error: None,
         failure_detail: None,
         stderr: String::new(),
+        raw_stdout: String::new(),
         attempts: 1,
         judge_score: None,
     }

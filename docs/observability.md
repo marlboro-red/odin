@@ -59,6 +59,30 @@ Key events (all within the spans above): `run started` / `run finished` (`status
 2026-06-03T18:22:31Z  INFO run{run_id=7f3c… …}: run finished status=Succeeded steps=6 cost_micros=123400 elapsed_ms=27210
 ```
 
+## Step output logs
+
+The run-state record keeps only a **clipped** copy of each step's stdout (1 MiB, to bound the
+SQLite blob). For the **full, un-clipped** output, the engine spools each step attempt to disk:
+
+```text
+<logs_dir>/<run_id>/<step_id>.<attempt>.log     # stdout, then a "--- stderr ---" section
+```
+
+`logs_dir` is set by the runners — `odin run` (with a store), `odin approve`/`reject` (so a
+resumed run keeps spooling), and `odind` all point it at `<repo>/.odin/logs`; `odin run --no-store`
+opts out (no on-disk artifacts). After a failed `odin run` the path is printed (`full step logs:
+…`) when a log actually exists. An embedder enables it with
+[`EngineBuilder::logs_dir`](../crates/odin-core/src/engine/mod.rs).
+
+The spool is best-effort (a write failure is a WARN, never fatal), one file per attempt (a retried
+step keeps each try). A step that runs many times — a **loop body** across iterations, whose
+attempt counter resets each iteration — gets a `.1`/`.2`/… suffix on collision so no earlier file
+is clobbered. Both `odin prune` and the daemon's retention sweep delete a pruned run's log
+directory along with its record. The full output is held in memory only while spooling is enabled
+(unset `logs_dir` → no retention cost over the clipped copy). Currently the spool is the step's own
+command/provider output; gate-command output on a gate failure is in the run's `error` field, not
+(yet) the spool file.
+
 ## OpenTelemetry / OTLP export
 
 Build with the `otlp` feature, then point `--otlp-endpoint` at an OTLP collector (Jaeger,
