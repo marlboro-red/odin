@@ -265,6 +265,9 @@ odin_step_duration_seconds_count 203
   time, are excluded (so a gated run doesn't show up as hours). A step's value spans its first
   attempt to settle (retries + backoff included). In-memory — reset on daemon restart, unlike the
   store-backed counter above.
+- **`odin_webhook_deliveries_total{result}`** (counter) — `/webhook` deliveries by outcome:
+  `accepted` (signed/valid and enqueued, a 202), `duplicate` (a deduped retry, a 200), or `rejected`
+  (bad/missing signature, bad body, no event header, or a full queue). In-memory (resets on restart).
 
 `/metrics` (like `/health`) is **unauthenticated** — it's read-only operational data and
 Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the same reverse

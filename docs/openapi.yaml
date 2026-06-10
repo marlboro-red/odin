@@ -26,8 +26,9 @@ paths:
       responses:
         "200":
           description: >
-            Run counts (`odin_runs_total` counter, live-status gauges) and duration histograms
-            (`odin_run_duration_seconds`, `odin_step_duration_seconds`).
+            Run counts (`odin_runs_total` counter, live-status gauges), duration histograms
+            (`odin_run_duration_seconds`, `odin_step_duration_seconds`), and webhook delivery
+            counts (`odin_webhook_deliveries_total{result}`).
           content:
             text/plain:
               schema: { type: string }

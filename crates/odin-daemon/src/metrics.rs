@@ -92,6 +92,21 @@ pub struct Metrics {
     step_starts: Mutex<HashMap<(RunId, StepId), DateTime<Utc>>>,
     run_hist: Histogram,
     step_hist: Histogram,
+    /// Webhook deliveries by outcome — the `odin_webhook_deliveries_total{result}` counter.
+    webhook_accepted: AtomicU64,
+    webhook_duplicate: AtomicU64,
+    webhook_rejected: AtomicU64,
+}
+
+/// The outcome of a webhook delivery, for the `odin_webhook_deliveries_total{result}` counter.
+#[derive(Clone, Copy)]
+pub enum WebhookResult {
+    /// Signed/valid and enqueued (a `202`).
+    Accepted,
+    /// A retry of an already-handled delivery (a `200`).
+    Duplicate,
+    /// Rejected: bad/missing signature, bad body, no event header, or a full queue.
+    Rejected,
 }
 
 impl Default for Metrics {
@@ -116,6 +131,9 @@ impl Metrics {
             step_starts: Mutex::new(HashMap::new()),
             run_hist: Histogram::new(),
             step_hist: Histogram::new(),
+            webhook_accepted: AtomicU64::new(0),
+            webhook_duplicate: AtomicU64::new(0),
+            webhook_rejected: AtomicU64::new(0),
         }
     }
 
@@ -164,7 +182,18 @@ impl Metrics {
         }
     }
 
-    /// The histogram families as Prometheus text (appended after the store-snapshot families).
+    /// Counts one webhook delivery outcome (`/webhook`), for `odin_webhook_deliveries_total`.
+    pub fn record_webhook(&self, result: WebhookResult) {
+        match result {
+            WebhookResult::Accepted => &self.webhook_accepted,
+            WebhookResult::Duplicate => &self.webhook_duplicate,
+            WebhookResult::Rejected => &self.webhook_rejected,
+        }
+        .fetch_add(1, Relaxed);
+    }
+
+    /// The histogram + webhook-counter families as Prometheus text (appended after the
+    /// store-snapshot families).
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -178,6 +207,22 @@ impl Metrics {
             "odin_step_duration_seconds",
             "Wall-clock duration of completed steps (first attempt to settle, including retries).",
         );
+        let _ = writeln!(
+            out,
+            "# HELP odin_webhook_deliveries_total Webhook deliveries by outcome."
+        );
+        let _ = writeln!(out, "# TYPE odin_webhook_deliveries_total counter");
+        for (result, counter) in [
+            ("accepted", &self.webhook_accepted),
+            ("duplicate", &self.webhook_duplicate),
+            ("rejected", &self.webhook_rejected),
+        ] {
+            let _ = writeln!(
+                out,
+                "odin_webhook_deliveries_total{{result=\"{result}\"}} {}",
+                counter.load(Relaxed)
+            );
+        }
         out
     }
 }
@@ -274,8 +319,24 @@ fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Histogram, render};
+    use super::{Histogram, Metrics, WebhookResult, render};
     use odin_core::{RunStatusCount, StoreMetrics};
+
+    #[test]
+    fn webhook_delivery_counter_renders() {
+        let m = Metrics::new();
+        m.record_webhook(WebhookResult::Accepted);
+        m.record_webhook(WebhookResult::Accepted);
+        m.record_webhook(WebhookResult::Rejected);
+        let out = m.render();
+        assert!(
+            out.contains("odin_webhook_deliveries_total{result=\"accepted\"} 2"),
+            "{out}"
+        );
+        assert!(out.contains("odin_webhook_deliveries_total{result=\"rejected\"} 1"));
+        // Always emits the zero series too, for a stable set.
+        assert!(out.contains("odin_webhook_deliveries_total{result=\"duplicate\"} 0"));
+    }
 
     #[test]
     fn histogram_buckets_sum_and_count() {
