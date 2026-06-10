@@ -209,7 +209,7 @@ trigger-driven load.
 
 ```sh
 curl -sS http://127.0.0.1:9292/approve \
-  -H "X-Hub-Signature-256: sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')" \
+  -H "X-Hub-Signature-256: sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')" \
   -d "$BODY"   # BODY='{"run_id":"…","decision":"approved","approver":"alice"}'
 ```
 
@@ -271,6 +271,20 @@ Prometheus doesn't sign scrapes. Keep it on the loopback default or behind the s
 proxy / network boundary as the rest of the server (it should not face the public internet).
 For span-level tracing and OTLP export, see [observability](observability.md); `/metrics` is the
 pull-based counterpart for dashboards/alerting.
+
+---
+
+## HTTP API contract
+
+The full surface (`/webhook`, `/approve`, `/api/runs[/{id}]`, `/metrics`, `/health`) is specified
+in [`docs/openapi.yaml`](openapi.yaml) (OpenAPI 3.0). Two conventions across all of it:
+
+- **Every response carries `X-Odin-Api-Version: 1`.** A breaking change to a response shape bumps it,
+  so a client can detect drift.
+- **Errors are JSON**: `{ "error": "<human message>", "code": "<stable machine code>" }` — branch on
+  `code` (e.g. `invalid_signature`, `run_not_found`, `queue_full`, `dashboard_disabled`), not the
+  prose. `/webhook`'s `202` returns `{ "status": "accepted", "matched": [<workflow names>] }` so the
+  sender sees what fired; a deduped retry returns `200` with `"status": "duplicate"`.
 
 ---
 

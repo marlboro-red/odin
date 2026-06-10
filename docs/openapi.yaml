@@ -1,0 +1,184 @@
+openapi: 3.0.3
+info:
+  title: Odin daemon HTTP API
+  description: >
+    The HTTP surface of `odind` — the webhook ingest, the HTTP approval endpoint, the read-only
+    dashboard API, and Prometheus metrics. Hand-authored to match `crates/odin-daemon/src/webhook.rs`.
+    Every response carries an `X-Odin-Api-Version` header (currently `1`); a breaking change to a
+    response shape bumps it. Error responses (4xx/5xx) are the `Error` schema below.
+  version: "1"
+servers:
+  - url: http://127.0.0.1:9292
+    description: Default loopback bind. Front with a TLS-terminating reverse proxy for remote use.
+paths:
+  /health:
+    get:
+      summary: Liveness probe (unauthenticated).
+      responses:
+        "200":
+          description: Always `ok`.
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+  /metrics:
+    get:
+      summary: Prometheus text-exposition metrics (unauthenticated, read-only).
+      responses:
+        "200":
+          description: >
+            Run counts (`odin_runs_total` counter, live-status gauges) and duration histograms
+            (`odin_run_duration_seconds`, `odin_step_duration_seconds`).
+          content:
+            text/plain:
+              schema: { type: string }
+        "503":
+          description: Metrics not enabled (no store).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  /webhook:
+    post:
+      summary: Webhook event ingest (GitHub or generic).
+      description: >
+        Route is selected by the event header: `X-GitHub-Event` (verified with `X-Hub-Signature-256`)
+        or `X-Odin-Event` (verified with `X-Odin-Signature-256`). The signature is HMAC-SHA256 of the
+        raw body, `sha256=<hex>`, required when the daemon has a secret. An optional delivery-id
+        header (`X-GitHub-Delivery` / `X-Odin-Delivery`) de-duplicates retries. Always `202` once
+        accepted; a full queue returns `503` so the sender retries (at-least-once).
+      parameters:
+        - { name: X-Odin-Event, in: header, schema: { type: string }, description: "Generic event name." }
+        - { name: X-Odin-Signature-256, in: header, schema: { type: string }, description: "sha256=<hmac> of the body." }
+        - { name: X-Odin-Delivery, in: header, schema: { type: string }, description: "Delivery id for retry de-dup." }
+        - { name: X-GitHub-Event, in: header, schema: { type: string } }
+        - { name: X-Hub-Signature-256, in: header, schema: { type: string } }
+        - { name: X-GitHub-Delivery, in: header, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: "The event payload (reachable as trigger.* in the run)." }
+      responses:
+        "202":
+          description: Accepted; lists the workflows the delivery matched.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [accepted] }
+                  matched: { type: array, items: { type: string }, description: "Matched workflow names." }
+        "200":
+          description: A duplicate delivery (same id, already handled) — ignored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [duplicate] }
+                  matched: { type: array, items: { type: string } }
+        "400": { $ref: "#/components/responses/JsonError" }
+        "401": { $ref: "#/components/responses/JsonError" }
+        "503": { $ref: "#/components/responses/JsonError" }
+  /approve:
+    post:
+      summary: Record an approval decision on a paused run and resume it (signed).
+      description: >
+        The daemon-side equivalent of `odin approve` / `odin reject`. Signature-verified with
+        `X-Hub-Signature-256` (same secret as `/webhook`). Returns the resumed `RunSummary` JSON.
+      parameters:
+        - { name: X-Hub-Signature-256, in: header, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, decision]
+              properties:
+                run_id: { type: string, format: uuid }
+                decision: { type: string, enum: [approved, rejected] }
+                approver: { type: string }
+                note: { type: string, description: "Required (non-empty) on a reject." }
+                rerun: { type: boolean, description: "Reject only: also start a fresh run with the note as feedback." }
+      responses:
+        "200":
+          description: The resumed run's `RunSummary` (or `{rejected, rerun}` for a reject --rerun).
+          content: { application/json: { schema: { type: object } } }
+        "400": { $ref: "#/components/responses/JsonError" }
+        "401": { $ref: "#/components/responses/JsonError" }
+        "404": { $ref: "#/components/responses/JsonError" }
+        "409": { $ref: "#/components/responses/JsonError" }
+        "500": { $ref: "#/components/responses/JsonError" }
+        "503": { $ref: "#/components/responses/JsonError" }
+  /api/runs:
+    get:
+      summary: Recent runs (dashboard list; unauthenticated, read-only — requires --dashboard).
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 500 } }
+      responses:
+        "200":
+          description: A list of run views.
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/RunView" } }
+        "404": { $ref: "#/components/responses/JsonError" }
+        "503": { $ref: "#/components/responses/JsonError" }
+        "500": { $ref: "#/components/responses/JsonError" }
+  /api/runs/{id}:
+    get:
+      summary: One run's detail incl. the captured diff (requires --dashboard).
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The run detail (a RunView plus diff + error).
+          content: { application/json: { schema: { $ref: "#/components/schemas/RunDetailView" } } }
+        "400": { $ref: "#/components/responses/JsonError" }
+        "404": { $ref: "#/components/responses/JsonError" }
+        "503": { $ref: "#/components/responses/JsonError" }
+        "500": { $ref: "#/components/responses/JsonError" }
+components:
+  responses:
+    JsonError:
+      description: A structured error.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+  schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: { type: string, description: "Human-readable message." }
+        code:
+          type: string
+          description: "Stable machine code to branch on."
+          example: invalid_signature
+    RunView:
+      type: object
+      properties:
+        run_id: { type: string }
+        workflow: { type: string }
+        status: { type: string, description: "snake_case run status." }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        duration_ms: { type: integer, nullable: true, description: "Wall-clock for a terminal run." }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              status: { type: string }
+              exit_code: { type: integer, nullable: true }
+              error: { type: string, nullable: true }
+              duration_ms: { type: integer, nullable: true }
+        gate:
+          type: object
+          nullable: true
+          properties:
+            step: { type: string }
+            message: { type: string, nullable: true }
+    RunDetailView:
+      allOf:
+        - $ref: "#/components/schemas/RunView"
+        - type: object
+          properties:
+            diff: { type: string, nullable: true }
+            error: { type: string, nullable: true }

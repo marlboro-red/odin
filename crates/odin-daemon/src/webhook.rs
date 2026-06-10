@@ -407,6 +407,9 @@ impl BoundWebhookServer {
             .route("/approve", post(handle_approve))
             .route("/metrics", get(handle_metrics))
             .route("/health", get(handle_health))
+            // Stamp every response with the API version and normalize axum-level error rejections
+            // (413/404/405) into the JSON `{error, code}` envelope.
+            .layer(axum::middleware::map_response(finalize_response))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(self.state);
         axum::serve(self.listener, app)
@@ -434,6 +437,63 @@ struct AppState {
     dedup: Mutex<DeliveryDedup>,
 }
 
+/// The HTTP API contract version, emitted on every response as `X-Odin-Api-Version`. Bump on a
+/// breaking change to a response shape so a client can detect drift.
+const API_VERSION: &str = "1";
+
+/// Response-mapping middleware applied to EVERY response: stamps `X-Odin-Api-Version`, and — so the
+/// "errors are JSON" contract holds even for axum-LEVEL rejections that never reach a handler
+/// (413 body-too-large, 404 unmatched route, 405 wrong method) — rewrites any error response that
+/// isn't already `application/json` into the `{error, code}` envelope.
+async fn finalize_response(response: Response) -> Response {
+    let status = response.status();
+    let is_error = status.is_client_error() || status.is_server_error();
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+
+    let mut response = if is_error && !is_json {
+        // A non-JSON error (an axum rejection) — replace the body with the standard envelope,
+        // preserving the status. Handler errors are already JSON and skip this.
+        let code = match status {
+            StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+            _ => "error",
+        };
+        let message = status.canonical_reason().unwrap_or("error");
+        let mut rewritten = json_err(status, code, message);
+        rewritten.headers_mut().extend(
+            response
+                .headers()
+                .iter()
+                .filter(|(n, _)| *n != axum::http::header::CONTENT_TYPE)
+                .map(|(n, v)| (n.clone(), v.clone())),
+        );
+        rewritten
+    } else {
+        response
+    };
+    response.headers_mut().insert(
+        "x-odin-api-version",
+        axum::http::HeaderValue::from_static(API_VERSION),
+    );
+    response
+}
+
+/// A structured JSON error body — `{ "error": <human message>, "code": <stable machine code> }` —
+/// so a programmatic client (`status --url`, an approval bot, a webhook sender) can branch on
+/// `code` rather than scrape prose. Used by every JSON API + the signed mutation endpoints.
+fn json_err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "error": message.into(), "code": code })),
+    )
+        .into_response()
+}
+
 #[allow(clippy::unused_async)] // axum route handlers must be async.
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
@@ -444,7 +504,11 @@ async fn handle_health() -> impl IntoResponse {
 /// loopback or behind a reverse proxy.
 async fn handle_metrics(State(state): State<Arc<AppState>>) -> Response {
     let Some(store) = state.store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "metrics not enabled").into_response();
+        return json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics_disabled",
+            "metrics not enabled",
+        );
     };
     match store.metrics().await {
         Ok(snapshot) => {
@@ -462,7 +526,11 @@ async fn handle_metrics(State(state): State<Arc<AppState>>) -> Response {
         }
         Err(e) => {
             tracing::warn!(error = %e, "metrics: store read failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "metrics unavailable").into_response()
+            json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "metrics unavailable",
+            )
         }
     }
 }
@@ -477,11 +545,11 @@ struct RunsQuery {
 #[allow(clippy::unused_async)] // axum route handlers must be async.
 async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Response {
     if !state.dashboard {
-        return (
+        return json_err(
             StatusCode::NOT_FOUND,
+            "dashboard_disabled",
             "dashboard not enabled (pass --dashboard)",
-        )
-            .into_response();
+        );
     }
     Html(crate::dashboard::HTML).into_response()
 }
@@ -492,10 +560,18 @@ async fn handle_api_runs(
     Query(q): Query<RunsQuery>,
 ) -> Response {
     if !state.dashboard {
-        return (StatusCode::NOT_FOUND, "dashboard not enabled").into_response();
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "dashboard_disabled",
+            "dashboard not enabled",
+        );
     }
     let Some(store) = state.store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "store unavailable").into_response();
+        return json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_unavailable",
+            "store unavailable",
+        );
     };
     // Cap the page so a giant store can't be dumped in one unauthenticated request.
     let limit = q.limit.unwrap_or(50).min(500);
@@ -506,7 +582,11 @@ async fn handle_api_runs(
         }
         Err(e) => {
             tracing::warn!(error = %e, "dashboard: run list read failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "store read failed").into_response()
+            json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "store read failed",
+            )
         }
     }
 }
@@ -514,20 +594,32 @@ async fn handle_api_runs(
 /// `GET /api/runs/{id}` — one run's detail incl. the captured diff (unauthenticated, read-only).
 async fn handle_api_run(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     if !state.dashboard {
-        return (StatusCode::NOT_FOUND, "dashboard not enabled").into_response();
+        return json_err(
+            StatusCode::NOT_FOUND,
+            "dashboard_disabled",
+            "dashboard not enabled",
+        );
     }
     let Some(store) = state.store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, "store unavailable").into_response();
+        return json_err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_unavailable",
+            "store unavailable",
+        );
     };
     let Ok(run_id) = RunId::from_str(&id) else {
-        return (StatusCode::BAD_REQUEST, "invalid run id").into_response();
+        return json_err(StatusCode::BAD_REQUEST, "invalid_run_id", "invalid run id");
     };
     match store.load_run(run_id).await {
         Ok(Some(state)) => Json(odin_core::RunDetailView::project(&state)).into_response(),
-        Ok(None) => (StatusCode::NOT_FOUND, "no such run").into_response(),
+        Ok(None) => json_err(StatusCode::NOT_FOUND, "run_not_found", "no such run"),
         Err(e) => {
             tracing::warn!(error = %e, "dashboard: run detail read failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "store read failed").into_response()
+            json_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "store_error",
+                "store read failed",
+            )
         }
     }
 }
@@ -572,38 +664,46 @@ async fn handle_approve(
     }
     let Some(ctx) = state.approvals.as_ref() else {
         // No workflow has an approval gate, so the endpoint is wired but inert.
-        return (
+        return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
+            "approvals_disabled",
             "approvals are not enabled on this daemon (no workflow declares an approval gate)",
-        )
-            .into_response();
+        );
     };
     let req = match serde_json::from_slice::<ApproveRequest>(&body) {
         Ok(req) => req,
         Err(e) => {
             tracing::warn!(error = %e, "approve: rejecting invalid JSON body");
-            return (StatusCode::BAD_REQUEST, format!("invalid JSON body: {e}")).into_response();
+            return json_err(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                format!("invalid JSON body: {e}"),
+            );
         }
     };
     let Ok(run_id) = RunId::from_str(&req.run_id) else {
-        return (
+        return json_err(
             StatusCode::BAD_REQUEST,
+            "invalid_run_id",
             format!("invalid run id {:?}", req.run_id),
-        )
-            .into_response();
+        );
     };
     // Mirror the CLI: a reject must carry the feedback to act on.
     if matches!(req.decision, Decision::Rejected)
         && req.note.as_deref().unwrap_or("").trim().is_empty()
     {
-        return (
+        return json_err(
             StatusCode::BAD_REQUEST,
+            "note_required",
             "a reject requires a non-empty `note` (the feedback to act on)",
-        )
-            .into_response();
+        );
     }
     if req.rerun && !matches!(req.decision, Decision::Rejected) {
-        return (StatusCode::BAD_REQUEST, "`rerun` only applies to a reject").into_response();
+        return json_err(
+            StatusCode::BAD_REQUEST,
+            "rerun_on_approve",
+            "`rerun` only applies to a reject",
+        );
     }
     let approver = req
         .approver
@@ -646,23 +746,23 @@ async fn handle_approve(
 
 /// A 404 for an unknown run id.
 fn not_found(run_id: RunId) -> Response {
-    (
+    json_err(
         StatusCode::NOT_FOUND,
+        "run_not_found",
         format!("no run {run_id} in the store"),
     )
-        .into_response()
 }
 
 /// Maps an approval engine error to a response: a bad request (not awaiting / unknown workflow)
 /// is the caller's fault → `409`; a store/resume failure is ours → `500`.
 fn approve_error(run_id: RunId, e: &Error) -> Response {
     tracing::warn!(run = %run_id, error = %e, "approve: decision failed");
-    let code = if matches!(e, Error::Input(_)) {
-        StatusCode::CONFLICT
+    let (status, code) = if matches!(e, Error::Input(_)) {
+        (StatusCode::CONFLICT, "approve_conflict")
     } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+        (StatusCode::INTERNAL_SERVER_ERROR, "approve_failed")
     };
-    (code, format!("{e}")).into_response()
+    json_err(status, code, format!("{e}"))
 }
 
 /// Verifies the signature, parses the event, and routes it to every matching subscription.
@@ -690,7 +790,7 @@ async fn handle_webhook(
         Ok(value) => value,
         Err(e) => {
             tracing::warn!(error = %e, "webhook: rejecting invalid JSON body");
-            return (StatusCode::BAD_REQUEST, "invalid JSON body").into_response();
+            return json_err(StatusCode::BAD_REQUEST, "invalid_json", "invalid JSON body");
         }
     };
 
@@ -739,11 +839,11 @@ async fn handle_webhook(
             matched,
         )
     } else {
-        (
+        json_err(
             StatusCode::BAD_REQUEST,
+            "missing_event_header",
             "missing X-GitHub-Event or X-Odin-Event header",
         )
-            .into_response()
     }
 }
 
@@ -782,9 +882,18 @@ fn dispatch_webhook(
     // deliveries of one id both enqueuing (a duplicate run), never a dropped one.
     if delivery != "?" && dedup(state).contains(delivery) {
         tracing::info!(%delivery, "webhook: duplicate delivery ignored");
-        return (StatusCode::OK, "duplicate delivery ignored").into_response();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "duplicate", "matched": [] })),
+        )
+            .into_response();
     }
 
+    // The workflows this delivery matched — returned in the 202 so the sender sees what fired.
+    let workflows: Vec<String> = matched
+        .iter()
+        .map(|e| e.workflow.as_str().to_owned())
+        .collect();
     let total = matched.len();
     let mut dropped = 0_usize;
     for e in matched {
@@ -807,18 +916,22 @@ fn dispatch_webhook(
             %label, %delivery, dropped, matched = total,
             "webhook: enqueue(s) failed; returning 503 so the sender retries"
         );
-        return (
+        return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
+            "queue_full",
             format!("enqueue failed for {dropped}/{total}; please retry"),
-        )
-            .into_response();
+        );
     }
     // Fully enqueued (or nothing matched): record now so a later retry is deduped.
     if delivery != "?" {
         dedup(state).record(delivery);
     }
     tracing::info!(%label, %delivery, matched = total, "webhook: delivery accepted");
-    (StatusCode::ACCEPTED, format!("accepted; matched {total}")).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "status": "accepted", "matched": workflows })),
+    )
+        .into_response()
 }
 
 /// Locks the dedup set, recovering the guard if a previous holder panicked (poison) rather
@@ -845,13 +958,25 @@ fn verify_signature(
     let secret = secret?; // dev mode: accept unsigned (warned about at startup).
     let Some(header) = header_str(headers, sig_header) else {
         tracing::warn!("webhook: rejecting unsigned request (a secret is configured)");
-        return Some((StatusCode::BAD_REQUEST, "missing signature").into_response());
+        return Some(json_err(
+            StatusCode::BAD_REQUEST,
+            "missing_signature",
+            "missing signature",
+        ));
     };
     let Some(hex_sig) = header.strip_prefix("sha256=") else {
-        return Some((StatusCode::BAD_REQUEST, "malformed signature").into_response());
+        return Some(json_err(
+            StatusCode::BAD_REQUEST,
+            "malformed_signature",
+            "malformed signature",
+        ));
     };
     let Ok(expected) = hex::decode(hex_sig) else {
-        return Some((StatusCode::BAD_REQUEST, "malformed signature").into_response());
+        return Some(json_err(
+            StatusCode::BAD_REQUEST,
+            "malformed_signature",
+            "malformed signature",
+        ));
     };
     // HMAC accepts a key of any length, so `new_from_slice` cannot fail here.
     let mut mac =
@@ -859,7 +984,11 @@ fn verify_signature(
     mac.update(body);
     if mac.verify_slice(&expected).is_err() {
         tracing::warn!("webhook: rejecting request with invalid signature");
-        return Some((StatusCode::UNAUTHORIZED, "invalid signature").into_response());
+        return Some(json_err(
+            StatusCode::UNAUTHORIZED,
+            "invalid_signature",
+            "invalid signature",
+        ));
     }
     None
 }

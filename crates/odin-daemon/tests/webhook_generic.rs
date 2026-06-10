@@ -78,7 +78,30 @@ async fn post_generic(addr: SocketAddr, event: &str, delivery: &str, body: &[u8]
     stream.flush().await.unwrap();
     let mut resp = String::new();
     stream.read_to_string(&mut resp).await.unwrap();
-    resp.lines().next().unwrap_or_default().to_owned()
+    resp // full HTTP response (status line + headers + body)
+}
+
+/// GETs `path` and returns the full HTTP response (status line + headers + body).
+async fn get_path(addr: SocketAddr, path: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    resp
+}
+
+/// POSTs `/webhook` with NO event header (the handler 400s) — returns the full response.
+async fn post_no_event(addr: SocketAddr) -> String {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let req = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+               Content-Length: 2\r\nConnection: close\r\n\r\n{}";
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    resp
 }
 
 async fn wait_terminal(store: &Arc<SqliteStore>, timeout: Duration) -> (usize, Option<RunStatus>) {
@@ -125,10 +148,17 @@ async fn generic_webhook_extracts_a_param_and_dispatches_a_run() {
         "deployment": { "ref": "v9.9.9" }
     }))
     .unwrap();
-    let status = post_generic(addr, "deploy", "del-1", &body).await;
+    let resp = post_generic(addr, "deploy", "del-1", &body).await;
+    assert!(resp.contains("202"), "expected 202 Accepted, got: {resp}");
+    // Every response carries the API-version header.
     assert!(
-        status.contains("202"),
-        "expected 202 Accepted, got: {status}"
+        resp.to_lowercase().contains("x-odin-api-version: 1"),
+        "missing version header: {resp}"
+    );
+    // The 202 body is JSON listing the matched workflow(s).
+    assert!(
+        resp.contains("\"matched\":[\"deployer\"]"),
+        "202 should list matched workflows: {resp}"
     );
 
     let (count, terminal) = wait_terminal(&store, Duration::from_secs(10)).await;
@@ -143,8 +173,29 @@ async fn generic_webhook_extracts_a_param_and_dispatches_a_run() {
     );
 
     // A non-matching event fires nothing.
-    let status = post_generic(addr, "other-event", "del-2", &body).await;
-    assert!(status.contains("202"), "got: {status}");
+    let resp = post_generic(addr, "other-event", "del-2", &body).await;
+    assert!(resp.contains("202"), "got: {resp}");
+
+    // An invalid request (no event header) → a JSON error body with a stable `code`.
+    let err = post_no_event(addr).await;
+    assert!(err.contains("400"), "expected 400, got: {err}");
+    assert!(
+        err.contains("\"code\":\"missing_event_header\""),
+        "error body should be JSON with a code: {err}"
+    );
+
+    // An axum-LEVEL rejection (unmatched route) is ALSO normalized to the JSON envelope + version
+    // header — so the "errors are JSON" contract holds end to end.
+    let nf = get_path(addr, "/nope").await;
+    assert!(nf.contains("404"), "expected 404, got: {nf}");
+    assert!(
+        nf.contains("\"code\":\"not_found\""),
+        "404 should be JSON: {nf}"
+    );
+    assert!(
+        nf.to_lowercase().contains("x-odin-api-version: 1"),
+        "404 should carry the version header: {nf}"
+    );
 
     shutdown.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
