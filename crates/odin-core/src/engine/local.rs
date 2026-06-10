@@ -3003,6 +3003,26 @@ steps:
 
     const APPROVAL_WF: &str = "name: appr\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: plan, run: \"echo planned > plan.txt\"}\n  - id: gate\n    approval: { message: \"ok to proceed?\" }\n    depends_on: [plan]\n  - {id: ship, run: \"echo shipped > ship.txt\", depends_on: [gate]}\n";
 
+    /// An approval workflow on a store-less engine fails FAST at run start (it would otherwise
+    /// suspend but be permanently unresumable), with a clear message — not silently.
+    #[tokio::test]
+    async fn an_approval_workflow_without_a_store_fails_fast() {
+        let repo = init_repo().await;
+        let mut reg = Registry::with_builtins();
+        reg.register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = LocalEngine::new(reg, None, repo.path().to_path_buf(), None, None);
+        let wf = parse(APPROVAL_WF);
+        let err = eng.run(&wf, RunInput::manual()).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Input(_)),
+            "expected Input error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("approval gate"),
+            "message should name the cause: {err}"
+        );
+    }
+
     fn step_status(s: &RunSummary, id: &str) -> Option<StepStatus> {
         s.steps
             .iter()

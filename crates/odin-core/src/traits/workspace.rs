@@ -42,6 +42,16 @@ pub struct AcquireCtx {
     pub config: WorkspaceConfig,
 }
 
+impl AcquireCtx {
+    /// Builds a context for `run_id` with the given workspace `config`. The struct is
+    /// `#[non_exhaustive]`, so this constructor — not a literal — is how external code (e.g. a unit
+    /// test of a custom [`Workspace`]) builds one.
+    #[must_use]
+    pub fn new(run_id: RunId, config: WorkspaceConfig) -> Self {
+        Self { run_id, config }
+    }
+}
+
 /// A claimed workspace lease.
 ///
 /// It is `Clone + Serialize` because [`crate::traits::RunState`] must persist it for

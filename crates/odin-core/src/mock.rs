@@ -14,7 +14,8 @@ use crate::error::{ActionError, ProviderError, StoreError, TriggerError, Workspa
 use crate::ids::{ProviderRef, RunId};
 use crate::traits::{
     AcquireCtx, Action, ActionCtx, ActionOutcome, InvocationCtx, InvocationOutcome, Provider,
-    RunEvent, RunState, Store, Trigger, TriggerEvent, Workspace, WorkspaceHandle,
+    RunEvent, RunState, RunStatusCount, Store, StoreMetrics, Trigger, TriggerEvent, Workspace,
+    WorkspaceHandle,
 };
 
 /// A provider that echoes its rendered prompt back as stdout.
@@ -112,10 +113,13 @@ impl Workspace for TmpWorkspace {
     }
 }
 
-/// An in-memory store. Proves the durability contract without SQLite.
+/// An in-memory store. Proves the durability contract without SQLite — and implements the read
+/// surface (`recent`/`events`/`metrics`) so an embedder can drive `list`/`status`/the audit log in
+/// a test against it, not just `checkpoint`/`load`.
 #[derive(Default)]
 pub struct MemStore {
     runs: Mutex<HashMap<RunId, RunState>>,
+    events: Mutex<HashMap<RunId, Vec<RunEvent>>>,
 }
 
 impl MemStore {
@@ -136,8 +140,24 @@ impl Store for MemStore {
         Ok(())
     }
 
-    async fn append_event(&self, _run_id: RunId, _event: &RunEvent) -> Result<(), StoreError> {
+    async fn append_event(&self, run_id: RunId, event: &RunEvent) -> Result<(), StoreError> {
+        self.events
+            .lock()
+            .unwrap()
+            .entry(run_id)
+            .or_default()
+            .push(event.clone());
         Ok(())
+    }
+
+    async fn events(&self, run_id: RunId) -> Result<Vec<RunEvent>, StoreError> {
+        Ok(self
+            .events
+            .lock()
+            .unwrap()
+            .get(&run_id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn load_incomplete(&self) -> Result<Vec<RunState>, StoreError> {
@@ -153,6 +173,40 @@ impl Store for MemStore {
 
     async fn load_run(&self, run_id: RunId) -> Result<Option<RunState>, StoreError> {
         Ok(self.runs.lock().unwrap().get(&run_id).cloned())
+    }
+
+    async fn recent(&self, limit: usize) -> Result<Vec<RunState>, StoreError> {
+        let mut runs: Vec<RunState> = self.runs.lock().unwrap().values().cloned().collect();
+        // Newest first, with a run_id tiebreak to match the SQLite store's
+        // `ORDER BY updated_at DESC, run_id DESC` (so same-timestamp order is deterministic and
+        // identical across both stores).
+        runs.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.run_id.0.cmp(&a.run_id.0))
+        });
+        runs.truncate(limit);
+        Ok(runs)
+    }
+
+    async fn metrics(&self) -> Result<StoreMetrics, StoreError> {
+        let mut counts: std::collections::BTreeMap<(String, String), u64> =
+            std::collections::BTreeMap::new();
+        for s in self.runs.lock().unwrap().values() {
+            let status = serde_json::to_value(s.status)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".to_owned());
+            *counts
+                .entry((s.workflow.as_str().to_owned(), status))
+                .or_insert(0) += 1;
+        }
+        Ok(StoreMetrics::new(
+            counts
+                .into_iter()
+                .map(|((w, s), c)| RunStatusCount::new(&w, &s, c))
+                .collect(),
+        ))
     }
 }
 
@@ -203,7 +257,7 @@ mod tests {
     use super::{EchoProvider, MemStore};
     use crate::api::{RunInput, RunStatus};
     use crate::ids::{RunId, StepId, WorkflowId};
-    use crate::traits::{CancelToken, InvocationCtx, Provider, RunState, Store};
+    use crate::traits::{CancelToken, InvocationCtx, Provider, RunEvent, RunState, Store};
     use indexmap::IndexMap;
     use std::sync::Arc;
 
@@ -262,5 +316,43 @@ mod tests {
         assert_eq!(incomplete.len(), 1);
         assert_eq!(incomplete[0].run_id, running_id);
         assert!(store.load_run(running_id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn memstore_recent_events_and_metrics_return_real_data() {
+        let store = MemStore::new();
+        let older = run_state(RunStatus::Succeeded);
+        let mut newer = run_state(RunStatus::Running);
+        newer.updated_at = older.updated_at + chrono::Duration::seconds(1);
+        store.checkpoint(&older).await.unwrap();
+        store.checkpoint(&newer).await.unwrap();
+
+        // recent(): newest first (not the empty trait default).
+        let recent = store.recent(10).await.unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].run_id, newer.run_id, "newest first");
+
+        // append_event/events(): the audit log round-trips (not discarded).
+        store
+            .append_event(
+                older.run_id,
+                &RunEvent::RunStarted {
+                    at: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.events(older.run_id).await.unwrap().len(), 1);
+        assert!(store.events(newer.run_id).await.unwrap().is_empty());
+
+        // metrics(): one (workflow, status) group per distinct status.
+        let m = store.metrics().await.unwrap();
+        assert_eq!(m.runs.len(), 2);
+        assert!(
+            m.runs
+                .iter()
+                .any(|r| r.status == "succeeded" && r.count == 1)
+        );
+        assert!(m.runs.iter().any(|r| r.status == "running" && r.count == 1));
     }
 }

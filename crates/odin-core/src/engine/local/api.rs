@@ -39,6 +39,21 @@ impl Engine for LocalEngine {
         if report.has_errors() {
             return Err(Error::Validation(report));
         }
+        // An approval gate parks the run until a human decision (`submit_approval`), which can only
+        // resume the run from a durable store. With no store the run WOULD suspend, but be
+        // permanently unresumable (and vanish on restart) — and that only surfaced later, at
+        // `submit_approval`. Fail fast at run start instead.
+        if self.store.is_none()
+            && crate::validate::rules::all_steps(workflow)
+                .iter()
+                .any(|(_, s)| matches!(s.kind, crate::ir::StepKind::Approval(_)))
+        {
+            return Err(Error::Input(format!(
+                "workflow {:?} has an approval gate, which requires a durable store to resume from, \
+                 but the engine has none — build it with `.store(...)`",
+                workflow.name.as_str()
+            )));
+        }
         let params = Self::resolve_params(workflow, &input)?;
 
         let run_id = RunId::new();
