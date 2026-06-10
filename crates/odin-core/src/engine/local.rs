@@ -117,6 +117,10 @@ pub(crate) struct LocalEngine {
 /// the oldest live run, which then reappears at its next step boundary.
 const MIRROR_CAP: usize = 256;
 
+/// Max serialized size of a single param value retained in a mirror [`light_snapshot`]; larger
+/// values (e.g. a webhook param mapped from a big payload field) are replaced with a placeholder.
+const MIRROR_PARAM_CAP: usize = 4096;
+
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
 /// executes once even under concurrent decisions. See [`LocalEngine::claim_run`].
 struct RunClaim<'a> {
@@ -298,22 +302,34 @@ impl LocalEngine {
     }
 
     /// A memory-bounded copy of `state` for the mirror: keeps identity, status, per-step
-    /// status/exit/usage/gates, side effects, and timings, but DROPS the heavy, potentially
-    /// unbounded fields — each step's captured output, the `DIFF` artifact, and the trigger payload.
-    /// So `summary()`/`recent()` of a non-durable run report status and shape, not full output (use
-    /// the [`on_event`](super::EventHook) hook or `--stream` for live output).
+    /// status/exit/usage/gates, side effects, timings, and an approval gate's `message`, but DROPS
+    /// the heavy, potentially unbounded fields — each step's captured output, the `DIFF` artifact,
+    /// the trigger payload, and any oversize param value. So `summary()`/`recent()` of a non-durable
+    /// run report status and shape, not full output (use the [`on_event`](super::EventHook) hook or
+    /// `--stream` for live output).
     fn light_snapshot(state: &RunState) -> RunState {
         let steps = state
             .steps
             .iter()
             .map(|(id, st)| {
+                // Keep only an approval gate's `message` output (so a paused run's gate message
+                // still surfaces in the RunView); drop everything else (step stdout, up to 1 MiB).
+                let outputs = if st.status == StepStatus::AwaitingApproval {
+                    st.outputs
+                        .iter()
+                        .filter(|(k, _)| k.as_str() == "message")
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                } else {
+                    IndexMap::new()
+                };
                 (
                     id.clone(),
                     StepState {
                         status: st.status,
                         attempts: st.attempts,
                         exit_code: st.exit_code,
-                        outputs: IndexMap::new(), // dropped (capped, but up to 1 MiB/step)
+                        outputs,
                         usage: st.usage,
                         gates: st.gates.clone(),
                         judge_score: st.judge_score,
@@ -323,10 +339,25 @@ impl LocalEngine {
                 )
             })
             .collect();
+        // Keep typed params, but cap any single value's size — a webhook param can be mapped from a
+        // (large) payload field, which would otherwise re-open the unbounded-memory hole.
+        let params = state
+            .input
+            .params
+            .iter()
+            .map(|(k, v)| {
+                let capped = if serde_json::to_string(v).map_or(0, |s| s.len()) > MIRROR_PARAM_CAP {
+                    Value::String("[omitted: large param]".to_owned())
+                } else {
+                    v.clone()
+                };
+                (k.clone(), capped)
+            })
+            .collect();
         let input = crate::api::RunInput {
             trigger: state.input.trigger.clone(),
             trigger_payload: Value::Null, // dropped (unbounded; attacker-controlled for webhooks)
-            params: state.input.params.clone(),
+            params,
             idempotency_key: state.input.idempotency_key.clone(),
         };
         RunState {
@@ -418,6 +449,9 @@ impl LocalEngine {
         if durable {
             if let Some(store) = &self.store {
                 store.checkpoint(state).await?;
+                // If this run was ever mirrored (its `durable` flag flipped false→true mid-run),
+                // drop the now-redundant mirror entry so the two sources can't overlap.
+                self.mirror.lock().unwrap().shift_remove(&state.run_id);
                 return Ok(());
             }
         }
@@ -571,7 +605,8 @@ impl LocalEngine {
     /// approver) and flips the RUN to `AwaitingApproval`, then checkpoints — persisting the
     /// pause so a crash leaves the run correctly parked (not auto-resumed) until a decision.
     /// (A workflow with an approval step is required to be `durable` — ODIN032 — since a pause
-    /// is unresumable without persistence; so this checkpoint always writes.)
+    /// is unresumable without persistence; so this checkpoint persists, to the store when one is
+    /// configured, else to the in-memory mirror.)
     async fn mark_awaiting(
         &self,
         workflow: &Workflow,
@@ -1106,6 +1141,8 @@ impl StepOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr as _;
+
     use crate::api::RunInput;
     use crate::engine::{Engine, EngineBuilder};
     use crate::error::Error;
@@ -3547,7 +3584,6 @@ steps:
 
         // Grab the run id as soon as it appears (any status), then poll summary directly: while it
         // reports Running (the ~2s sleep gives a wide window), finished_at must be None.
-        use std::str::FromStr as _;
         let mut run_id = None;
         for _ in 0..120 {
             if let Some(v) = eng.recent(10).await.unwrap().first() {
@@ -3606,7 +3642,7 @@ steps:
     }
 
     /// A **durable** run with NO store configured is still visible via the mirror — the
-    /// persisted-vs-durable predicate fix (otherwise it would be invisible to summary()/recent()).
+    /// persisted-vs-durable predicate fix (otherwise it would be invisible to `summary()`/`recent()`).
     #[tokio::test]
     async fn a_durable_run_without_a_store_is_mirrored() {
         let repo = init_repo().await;
@@ -3659,6 +3695,58 @@ steps:
         assert!(
             mirror.contains_key(&live.run_id),
             "the in-flight run must survive eviction of terminal runs"
+        );
+    }
+
+    /// `light_snapshot` drops the heavy fields (step output, diff, payload), caps a large param,
+    /// but keeps an approval gate's `message` so a paused run still shows it.
+    #[test]
+    fn light_snapshot_drops_heavy_keeps_gate_message_and_caps_params() {
+        use crate::ids::StepId;
+        let mut state = mk_mirror_state(RunStatus::AwaitingApproval);
+        let mut outputs = IndexMap::new();
+        outputs.insert("message".to_owned(), json!("ok to ship?"));
+        outputs.insert("stdout".to_owned(), json!("X".repeat(2_000_000)));
+        state.steps.insert(
+            StepId::new("gate"),
+            StepState {
+                status: StepStatus::AwaitingApproval,
+                attempts: 0,
+                exit_code: None,
+                outputs,
+                usage: None,
+                gates: IndexMap::new(),
+                judge_score: None,
+                side_effects: Vec::new(),
+                error: None,
+            },
+        );
+        state.artifacts.insert(DIFF.into(), "Y".repeat(2_000_000));
+        state.input.trigger_payload = json!({ "huge": "Z".repeat(1_000_000) });
+        state
+            .input
+            .params
+            .insert("big".to_owned(), json!("Z".repeat(10_000)));
+        state.input.params.insert("small".to_owned(), json!("ok"));
+
+        let light = LocalEngine::light_snapshot(&state);
+        assert!(light.artifacts.is_empty(), "DIFF dropped");
+        assert_eq!(
+            light.input.trigger_payload,
+            serde_json::Value::Null,
+            "payload dropped"
+        );
+        let gate = &light.steps[&StepId::new("gate")];
+        assert!(gate.outputs.contains_key("message"), "gate message kept");
+        assert!(!gate.outputs.contains_key("stdout"), "step stdout dropped");
+        assert_eq!(light.input.params["small"], json!("ok"), "small param kept");
+        assert!(
+            light.input.params["big"]
+                .as_str()
+                .unwrap()
+                .contains("omitted"),
+            "large param capped: {:?}",
+            light.input.params["big"]
         );
     }
 
