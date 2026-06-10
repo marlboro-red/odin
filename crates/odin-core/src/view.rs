@@ -3,7 +3,7 @@
 //! one documented status schema. The projection exposes only what a status view needs (no
 //! workspace paths, inputs, or trigger payloads).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ids::ArtifactName;
 use crate::traits::RunState;
@@ -14,7 +14,7 @@ const DIFF: &str = "DIFF";
 /// A run projected for a status list: identity, status, per-step progress, and — when the run is
 /// paused — the approval gate. Statuses are the lowercase serde strings (`succeeded`, `running`,
 /// `awaiting_approval`, …), so a view never drifts from the wire representation.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RunView {
     /// The run id (UUID string).
@@ -37,7 +37,7 @@ pub struct RunView {
 }
 
 /// One step in a [`RunView`].
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct StepView {
     /// The step id.
@@ -53,7 +53,7 @@ pub struct StepView {
 }
 
 /// The approval gate of a paused run.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GateView {
     /// The gate step id.
@@ -63,7 +63,7 @@ pub struct GateView {
 }
 
 /// A run's full detail: the [`RunView`] plus the captured diff and run-level error.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RunDetailView {
     /// The list-level view (flattened into the same JSON object).

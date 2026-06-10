@@ -136,6 +136,10 @@ enum Command {
         /// Path to the run-state SQLite database. Overrides `--repo`.
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Read from a remote `odind`'s dashboard API instead of a local store, e.g.
+        /// `--url http://127.0.0.1:9292`. Conflicts with `--repo`/`--db`.
+        #[arg(long, conflicts_with_all = ["repo", "db"])]
+        url: Option<String>,
         /// Maximum number of runs to show.
         #[arg(long, default_value_t = 20)]
         limit: usize,
@@ -493,6 +497,7 @@ fn main() -> ExitCode {
         Command::Status {
             repo,
             db,
+            url,
             limit,
             watch,
             json,
@@ -502,6 +507,7 @@ fn main() -> ExitCode {
             limit,
             watch,
             json,
+            url,
         })),
     }
 }

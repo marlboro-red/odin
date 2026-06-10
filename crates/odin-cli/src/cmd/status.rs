@@ -16,9 +16,25 @@ pub(crate) struct StatusArgs {
     pub limit: usize,
     pub watch: bool,
     pub json: bool,
+    /// Read from a remote `odind`'s `GET /api/runs` instead of the local store — the same
+    /// `RunView` shape, so the render is identical. Mutually exclusive with `--db`/`--repo`.
+    pub url: Option<String>,
 }
 
 pub(crate) fn run(args: StatusArgs) -> anyhow::Result<ExitCode> {
+    // Remote mode: poll a daemon's HTTP API rather than opening a local SQLite store.
+    if let Some(url) = &args.url {
+        if args.watch && !args.json {
+            return watch_remote(url, args.limit);
+        }
+        let views = fetch_remote(url, args.limit)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&views)?);
+        } else {
+            render(&views);
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let path = args.db.unwrap_or_else(|| {
         args.repo
             .unwrap_or_else(|| PathBuf::from("."))
@@ -54,6 +70,46 @@ async fn load(store: &SqliteStore, limit: usize) -> anyhow::Result<Vec<RunView>>
         .iter()
         .map(RunView::project)
         .collect())
+}
+
+/// Fetches `GET <url>/api/runs?limit=N` from a remote daemon and parses the `RunView` list — the
+/// same shape the local store projects, so the caller renders it identically.
+fn fetch_remote(url: &str, limit: usize) -> anyhow::Result<Vec<RunView>> {
+    let base = url.trim_end_matches('/');
+    let endpoint = format!("{base}/api/runs?limit={limit}");
+    let body = ureq::get(&endpoint)
+        .call()
+        .map_err(|e| match e {
+            // A 4xx/5xx carries the daemon's own message; surface it (e.g. "dashboard not enabled").
+            ureq::Error::Status(code, resp) => {
+                let msg = resp.into_string().unwrap_or_default();
+                anyhow::anyhow!("{endpoint} returned HTTP {code}: {}", msg.trim())
+            }
+            // A connection-level failure (refused, DNS, TLS) — the daemon isn't reachable.
+            ureq::Error::Transport(t) => anyhow::anyhow!("requesting {endpoint}: {t}"),
+        })?
+        .into_string()
+        .with_context(|| format!("reading the response from {endpoint}"))?;
+    serde_json::from_str(&body).with_context(|| format!("parsing the run list from {endpoint}"))
+}
+
+/// Re-fetches the remote daemon every 2s until interrupted (ctrl-c).
+fn watch_remote(url: &str, limit: usize) -> anyhow::Result<ExitCode> {
+    loop {
+        match fetch_remote(url, limit) {
+            Ok(views) => {
+                if std::io::stdout().is_terminal() {
+                    print!("\x1b[2J\x1b[H");
+                }
+                render(&views);
+            }
+            // Don't abort the watch on a transient blip (daemon restart); show it and retry.
+            Err(e) => eprintln!("status: {e}"),
+        }
+        println!("\n(watching {url} — ctrl-c to exit)");
+        std::io::stdout().flush().ok();
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }
 
 /// Clears the screen and re-renders every 2s until interrupted (ctrl-c).
@@ -161,5 +217,54 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let kept: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{kept}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fetch_remote;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    /// Serve `body` once over HTTP on an ephemeral port; returns the base URL.
+    fn serve_once(status_line: &'static str, body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf); // drain the request line/headers
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn fetch_remote_parses_the_runview_list() {
+        let body = r#"[{"run_id":"abc12345","workflow":"wf","status":"succeeded","created_at":"2026-06-10T00:00:00+00:00","updated_at":"2026-06-10T00:00:02+00:00","duration_ms":1200,"steps":[],"gate":null}]"#;
+        let url = serve_once("200 OK", body);
+        let views = fetch_remote(&url, 10).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].status, "succeeded");
+        assert_eq!(views[0].duration_ms, Some(1200));
+    }
+
+    #[test]
+    fn fetch_remote_surfaces_an_http_error() {
+        let url = serve_once("404 Not Found", "dashboard not enabled");
+        let err = fetch_remote(&url, 10).unwrap_err().to_string();
+        assert!(
+            err.contains("404"),
+            "expected the HTTP status in the error: {err}"
+        );
+        assert!(
+            err.contains("dashboard not enabled"),
+            "expected the body: {err}"
+        );
     }
 }
