@@ -307,6 +307,14 @@ pub struct StepState {
     /// dependency failed). Persisted so a failed run is debuggable. `None` for a passed step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When the step began executing (provisioning + all attempts), if it ran. `None` for a step
+    /// that hasn't started or was skipped. Added in a later schema; absent in older run records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the step settled (passed/failed/skipped), if it has. With `started_at`, gives the
+    /// step's wall-clock duration — to see where a run's time goes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Per-iteration durable progress of a running `loop:` step, so a crash mid-loop resumes from the

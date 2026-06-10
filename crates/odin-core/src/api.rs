@@ -137,6 +137,13 @@ pub struct StepResult {
     /// step that passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// When the step began executing, if it ran (`None` for a skipped step).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// When the step settled. With `started_at`, gives the step's wall-clock duration — so an
+    /// embedder can chart where a run's time went, per step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 /// Lifecycle status of a run.

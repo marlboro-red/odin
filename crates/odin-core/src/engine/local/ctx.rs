@@ -62,6 +62,8 @@ pub(crate) fn skipped_outcome() -> StepOutcome {
         raw_stdout: String::new(),
         attempts: 1,
         judge_score: None,
+        started_at: None,
+        finished_at: None,
     }
 }
 
@@ -97,6 +99,8 @@ pub(crate) fn step_result(id: &StepId, state: &StepState) -> StepResult {
         judge_score: state.judge_score,
         usage: state.usage,
         error: state.error.clone(),
+        started_at: state.started_at,
+        finished_at: state.finished_at,
     }
 }
 

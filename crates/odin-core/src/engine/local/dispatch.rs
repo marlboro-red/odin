@@ -594,7 +594,7 @@ impl LocalEngine {
     /// Runs one step, provisioning an isolated scratch worktree first if `step.scratch`. A
     /// scratch step's file edits stay in its throwaway worktree; its diff is surfaced as
     /// `outputs.diff` and the worktree is removed. Returns `(id, outcome)` for the driver.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     #[tracing::instrument(name = "step", skip_all, fields(step = %step.id, scratch = step.scratch))]
     pub(crate) async fn run_one(
         &self,
@@ -609,58 +609,65 @@ impl LocalEngine {
         cancel: &CancelToken,
     ) -> (StepId, StepOutcome) {
         let id = step.id.clone();
+        let started = Utc::now();
         // A non-scratch step, or one whose deps did not pass (it will be skipped without
         // touching any workdir), runs against the shared workdir — no worktree needed.
-        if !step.scratch || !deps_passed {
-            let outcome = self
-                .decide_outcome(
-                    run_id,
-                    durable,
-                    step,
-                    &ctx,
-                    base_workdir,
-                    timeout,
-                    deps_passed,
-                    default_retry,
-                    cancel,
-                )
-                .await;
-            return (id, outcome);
-        }
-        match self
-            .acquire_scratch(run_id, base_workdir, &id, cancel)
+        let outcome = if !step.scratch || !deps_passed {
+            self.decide_outcome(
+                run_id,
+                durable,
+                step,
+                &ctx,
+                base_workdir,
+                timeout,
+                deps_passed,
+                default_retry,
+                cancel,
+            )
             .await
-        {
-            Ok(scratch) => {
-                let mut outcome = self
-                    .decide_outcome(
-                        run_id,
-                        durable,
-                        step,
-                        &ctx,
-                        &scratch,
-                        timeout,
-                        deps_passed,
-                        default_retry,
-                        cancel,
-                    )
-                    .await;
-                // Capture the candidate's diff for any step that actually executed — Passed
-                // *or* Failed (a failed candidate's partial work is still worth inspecting by
-                // a downstream judge). A `Skipped` step (e.g. `when: false`) ran nothing.
-                if !matches!(outcome.status, StepStatus::Skipped) {
-                    // The scratch worktree is detached at the shared tree's HEAD, so diffing
-                    // vs `HEAD` captures the candidate's full changes — staged *and* unstaged,
-                    // consistent with the base-relative shared DIFF.
-                    if let Some(d) = self.capture_diff(&scratch, Some("HEAD"), cancel).await {
-                        outcome.outputs.insert("diff".to_owned(), Value::String(d));
+        } else {
+            match self
+                .acquire_scratch(run_id, base_workdir, &id, cancel)
+                .await
+            {
+                Ok(scratch) => {
+                    let mut outcome = self
+                        .decide_outcome(
+                            run_id,
+                            durable,
+                            step,
+                            &ctx,
+                            &scratch,
+                            timeout,
+                            deps_passed,
+                            default_retry,
+                            cancel,
+                        )
+                        .await;
+                    // Capture the candidate's diff for any step that actually executed — Passed
+                    // *or* Failed (a failed candidate's partial work is still worth inspecting by
+                    // a downstream judge). A `Skipped` step (e.g. `when: false`) ran nothing.
+                    if !matches!(outcome.status, StepStatus::Skipped) {
+                        // The scratch worktree is detached at the shared tree's HEAD, so diffing
+                        // vs `HEAD` captures the candidate's full changes — staged *and* unstaged,
+                        // consistent with the base-relative shared DIFF.
+                        if let Some(d) = self.capture_diff(&scratch, Some("HEAD"), cancel).await {
+                            outcome.outputs.insert("diff".to_owned(), Value::String(d));
+                        }
                     }
+                    self.release_scratch(base_workdir, &scratch, cancel).await;
+                    outcome
                 }
-                self.release_scratch(base_workdir, &scratch, cancel).await;
-                (id, outcome)
+                Err(e) => StepOutcome::failed(format!("scratch workspace: {e}")),
             }
-            Err(e) => (id, StepOutcome::failed(format!("scratch workspace: {e}"))),
+        };
+        // Stamp the step's wall-clock window — but not for a step that didn't run (Skipped).
+        let mut outcome = outcome;
+        if outcome.status != StepStatus::Skipped {
+            outcome.started_at = Some(started);
+            outcome.finished_at = Some(Utc::now());
         }
+        (id, outcome)
     }
 }
 
