@@ -51,6 +51,13 @@ opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"], optional = tr
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "trace"], optional = true }
 tracing-opentelemetry = { version = "0.33.0", optional = true }
 
+# Unix-only, for the process-group kill on timeout/cancel (reaping a step's agent tool
+# subprocesses / `sh -c` grandchildren). A safe `killpg` wrapper — the crate forbids `unsafe`, so it
+# can't call `libc::killpg` directly, and shelling out to `kill -<pgid>` proved unreliable across
+# `kill` implementations. Compiled out on non-Unix; `process.rs` (its only user) is runtime-gated.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["process"] }
+
 [dev-dependencies]
 serde_yaml_ng = "0.10.0"
 tempfile = "3.27.0"
