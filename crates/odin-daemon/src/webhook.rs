@@ -407,8 +407,9 @@ impl BoundWebhookServer {
             .route("/approve", post(handle_approve))
             .route("/metrics", get(handle_metrics))
             .route("/health", get(handle_health))
-            // Stamp every response with the API version, so a client can detect contract drift.
-            .layer(axum::middleware::map_response(add_api_version_header))
+            // Stamp every response with the API version and normalize axum-level error rejections
+            // (413/404/405) into the JSON `{error, code}` envelope.
+            .layer(axum::middleware::map_response(finalize_response))
             .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
             .with_state(self.state);
         axum::serve(self.listener, app)
@@ -440,8 +441,41 @@ struct AppState {
 /// breaking change to a response shape so a client can detect drift.
 const API_VERSION: &str = "1";
 
-/// Response-mapping middleware: stamps `X-Odin-Api-Version` on every response.
-async fn add_api_version_header(mut response: Response) -> Response {
+/// Response-mapping middleware applied to EVERY response: stamps `X-Odin-Api-Version`, and — so the
+/// "errors are JSON" contract holds even for axum-LEVEL rejections that never reach a handler
+/// (413 body-too-large, 404 unmatched route, 405 wrong method) — rewrites any error response that
+/// isn't already `application/json` into the `{error, code}` envelope.
+async fn finalize_response(response: Response) -> Response {
+    let status = response.status();
+    let is_error = status.is_client_error() || status.is_server_error();
+    let is_json = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"application/json"));
+
+    let mut response = if is_error && !is_json {
+        // A non-JSON error (an axum rejection) — replace the body with the standard envelope,
+        // preserving the status. Handler errors are already JSON and skip this.
+        let code = match status {
+            StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::METHOD_NOT_ALLOWED => "method_not_allowed",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+            _ => "error",
+        };
+        let message = status.canonical_reason().unwrap_or("error");
+        let mut rewritten = json_err(status, code, message);
+        rewritten.headers_mut().extend(
+            response
+                .headers()
+                .iter()
+                .filter(|(n, _)| *n != axum::http::header::CONTENT_TYPE)
+                .map(|(n, v)| (n.clone(), v.clone())),
+        );
+        rewritten
+    } else {
+        response
+    };
     response.headers_mut().insert(
         "x-odin-api-version",
         axum::http::HeaderValue::from_static(API_VERSION),
@@ -511,11 +545,11 @@ struct RunsQuery {
 #[allow(clippy::unused_async)] // axum route handlers must be async.
 async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Response {
     if !state.dashboard {
-        return (
+        return json_err(
             StatusCode::NOT_FOUND,
+            "dashboard_disabled",
             "dashboard not enabled (pass --dashboard)",
-        )
-            .into_response();
+        );
     }
     Html(crate::dashboard::HTML).into_response()
 }
