@@ -163,6 +163,17 @@ fn db<T>(r: rusqlite::Result<T>) -> Result<T, StoreError> {
     r.map_err(|e| StoreError::Backend(e.to_string()))
 }
 
+/// Deserializes one run-state blob into `out`, **tolerating a poison row**: a single
+/// undeserializable `state` (a row written by a newer schema, or corruption) is logged and
+/// skipped rather than failing the whole bulk read — so one bad row can't block crash recovery
+/// (`load_incomplete`) of every healthy run, nor break `odin status` / the dashboard.
+fn push_state(out: &mut Vec<RunState>, json: &str) {
+    match serde_json::from_str(json) {
+        Ok(state) => out.push(state),
+        Err(e) => tracing::warn!(error = %e, "skipping undeserializable run row"),
+    }
+}
+
 /// The run's status as the lowercase string stored in the `status` column. Matches the
 /// serde representation of [`RunStatus`], so the `load_incomplete` filter is consistent.
 fn status_str(status: RunStatus) -> String {
@@ -226,7 +237,7 @@ impl Store for SqliteStore {
             }))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&db(row)?)?);
+            push_state(&mut out, &db(row)?);
         }
         Ok(out)
     }
@@ -240,7 +251,7 @@ impl Store for SqliteStore {
         let rows = db(stmt.query_map(params![limit], |row| row.get::<_, String>(0)))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&db(row)?)?);
+            push_state(&mut out, &db(row)?);
         }
         Ok(out)
     }
@@ -256,6 +267,24 @@ impl Store for SqliteStore {
         }
     }
 
+    async fn claim_awaiting(&self, run_id: RunId) -> Result<bool, StoreError> {
+        // Atomic compare-and-swap on the indexed `status` column: only the row that *is*
+        // `awaiting_approval` flips to `running`, and `execute` returns the affected-row count, so
+        // exactly one of two racing processes gets `1`. The blob's own `status` field still reads
+        // `awaiting_approval` until the caller checkpoints the recorded decision — and if the
+        // process crashes in that window, resume re-reaches the gate (no decision recorded) and
+        // re-parks the run, healing the column. (See `Store::claim_awaiting`.)
+        let awaiting = status_str(RunStatus::AwaitingApproval);
+        let running = status_str(RunStatus::Running);
+        let id = run_id.to_string();
+        let conn = self.conn.lock().await;
+        let changed = db(conn.execute(
+            "UPDATE runs SET status = ?2 WHERE run_id = ?1 AND status = ?3",
+            params![id, running, awaiting],
+        ))?;
+        Ok(changed == 1)
+    }
+
     async fn events(&self, run_id: RunId) -> Result<Vec<RunEvent>, StoreError> {
         let conn = self.conn.lock().await;
         let run_id = run_id.to_string();
@@ -263,7 +292,11 @@ impl Store for SqliteStore {
         let rows = db(stmt.query_map(params![run_id], |row| row.get::<_, String>(0)))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(serde_json::from_str(&db(row)?)?);
+            let json = db(row)?;
+            match serde_json::from_str(&json) {
+                Ok(event) => out.push(event),
+                Err(e) => tracing::warn!(error = %e, "skipping undeserializable event row"),
+            }
         }
         Ok(out)
     }
@@ -570,6 +603,69 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].run_id, newer.run_id, "newest first");
         assert_eq!(store.recent(1).await.unwrap().len(), 1, "limit respected");
+    }
+
+    /// One undeserializable `state` blob (a row from a newer schema, or corruption) must be
+    /// skipped, not abort the whole bulk read — otherwise a single bad row blocks crash recovery
+    /// of every healthy run and breaks `odin status`.
+    #[tokio::test]
+    async fn a_poison_row_is_skipped_not_fatal() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let good = run_state(RunStatus::Running);
+        store.checkpoint(&good).await.unwrap();
+        // Inject a garbage blob directly. Its far-future `updated_at` makes it sort FIRST in
+        // `recent`, proving the skip happens regardless of position.
+        {
+            let conn = store.conn.lock().await;
+            conn.execute(
+                "INSERT INTO runs(run_id, workflow, status, state, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    "poison",
+                    "w",
+                    "running",
+                    "{ this is not valid run state",
+                    "2099-01-01T00:00:00+00:00"
+                ],
+            )
+            .unwrap();
+        }
+        let incomplete = store.load_incomplete().await.unwrap();
+        assert_eq!(incomplete.len(), 1, "the healthy run is still recovered");
+        assert_eq!(incomplete[0].run_id, good.run_id);
+        assert_eq!(
+            store.recent(10).await.unwrap().len(),
+            1,
+            "recent skips the poison row too"
+        );
+    }
+
+    /// `claim_awaiting` is a one-winner compare-and-swap: it flips `awaiting_approval` -> `running`
+    /// and returns `true` for exactly the caller that won, `false` otherwise — the cross-process
+    /// fence against a double-applied approval.
+    #[tokio::test]
+    async fn claim_awaiting_is_a_one_winner_cas() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let awaiting = run_state(RunStatus::AwaitingApproval);
+        store.checkpoint(&awaiting).await.unwrap();
+        assert!(
+            store.claim_awaiting(awaiting.run_id).await.unwrap(),
+            "the first claim wins"
+        );
+        assert!(
+            !store.claim_awaiting(awaiting.run_id).await.unwrap(),
+            "the second claim loses (the row is now running)"
+        );
+        assert!(
+            !store.claim_awaiting(RunId::new()).await.unwrap(),
+            "an unknown run flips nothing"
+        );
+        let running = run_state(RunStatus::Running);
+        store.checkpoint(&running).await.unwrap();
+        assert!(
+            !store.claim_awaiting(running.run_id).await.unwrap(),
+            "a run that isn't awaiting can't be claimed"
+        );
     }
 
     #[tokio::test]

@@ -670,6 +670,27 @@ impl LocalEngine {
                 attempts = outcome.attempts,
                 "step finished"
             );
+
+            // Graceful-shutdown rewind: a durable run interrupted by `shutdown` (daemon stop)
+            // had this step's subprocess killed, so it came back `Failed`. Leave it back at
+            // `Running` — NOT terminal `Failed` — and checkpoint, so `resume_all` re-runs it on
+            // the next start (exactly like a hard crash, but reached promptly). Don't settle it,
+            // don't fold its partial usage/side-effects, don't emit `StepFinished`: the re-run
+            // produces the real outcome. A USER cancel keeps the kill terminal (the run won't
+            // resume), and a non-durable run can't resume regardless — both fall through.
+            if workflow.durable
+                && cancel.is_shutdown()
+                && matches!(outcome.status, StepStatus::Failed)
+            {
+                if let Some(st) = state.steps.get_mut(&id) {
+                    st.status = StepStatus::Running;
+                    st.error = None;
+                }
+                state.updated_at = Utc::now();
+                self.checkpoint(workflow.durable, state).await?;
+                continue;
+            }
+
             if let Some(u) = &outcome.usage {
                 usage.add(*u);
             }
@@ -759,6 +780,33 @@ impl LocalEngine {
             run_id,
             workflow: workflow.name.clone(),
             status: RunStatus::AwaitingApproval,
+            steps: steps.iter().map(|(id, st)| step_result(id, st)).collect(),
+            usage: exec.usage,
+            side_effects: collect_side_effects(steps),
+            diff: exec.diff.clone(),
+            error: None,
+            started_at,
+            finished_at: None,
+        }
+    }
+
+    /// Builds the summary for a durable run SUSPENDED by graceful shutdown: it kept its workspace
+    /// and snapshot ref and is checkpointed non-terminal (`Running`, `finished_at` unset), so
+    /// `resume_all` completes it on the next start. Shaped like [`suspended_summary`] but carries
+    /// the live `Running` status.
+    ///
+    /// [`suspended_summary`]: Self::suspended_summary
+    fn interrupted_summary(
+        run_id: RunId,
+        workflow: &Workflow,
+        exec: &ExecResult,
+        started_at: chrono::DateTime<Utc>,
+        steps: &IndexMap<StepId, StepState>,
+    ) -> RunSummary {
+        RunSummary {
+            run_id,
+            workflow: workflow.name.clone(),
+            status: RunStatus::Running,
             steps: steps.iter().map(|(id, st)| step_result(id, st)).collect(),
             usage: exec.usage,
             side_effects: collect_side_effects(steps),
@@ -946,9 +994,11 @@ steps:
             "an unknown run id can't be cancelled"
         );
 
-        // A long-sleeping step; cancel it mid-flight and assert the run ends Cancelled promptly.
+        // A long-sleeping step in a NON-durable run; a graceful shutdown abandons it, so it ends
+        // Cancelled promptly. (A *durable* run is instead suspended for resume — see
+        // `shutdown_suspends_a_durable_run_then_resume_completes_it`.)
         let wf = parse(
-            "name: c\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
+            "name: c\ndurable: false\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"sleep 30\"}\n",
         );
         let eng2 = eng.clone();
         let handle = tokio::spawn(async move { eng2.run(&wf, RunInput::manual()).await });
@@ -982,6 +1032,146 @@ steps:
             eng.cancel_all_active(),
             0,
             "the registry is empty after the run ends"
+        );
+    }
+
+    /// Graceful shutdown (`cancel_all_active`) of a **durable** run must SUSPEND it — leave it
+    /// non-terminal and resumable — not strand it as terminal `Cancelled`. A subsequent
+    /// `resume_all` completes it. This is the durability contract that `kill -9` already honored
+    /// but a clean ctrl-C/redeploy previously broke.
+    #[tokio::test]
+    async fn shutdown_suspends_a_durable_run_then_resume_completes_it() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+
+        // First step sleeps (so we can interrupt it mid-flight); a quick second step proves the
+        // run completes after resume. The sleep is short enough that re-running it on resume is
+        // cheap, but the token fires before the sleep even starts, so the first attempt is killed
+        // immediately and deterministically.
+        let wf = parse(
+            "name: sd\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  \
+             - {id: s, run: \"sleep 2\"}\n  - {id: done, run: \"true\", depends_on: [s]}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+
+        let mut fired = 0;
+        for _ in 0..120 {
+            fired = eng.cancel_all_active();
+            if fired >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(fired >= 1, "the durable run should have been active");
+
+        let suspended = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("a shutdown must suspend promptly, not wait out the sleep")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            suspended.status,
+            RunStatus::Running,
+            "a durable run interrupted by shutdown is suspended (non-terminal), not Cancelled; \
+             error: {:?}",
+            suspended.error
+        );
+
+        // The store must show it resumable (non-terminal) — the exact thing the bug broke.
+        let incomplete = store.load_incomplete().await.unwrap();
+        assert!(
+            incomplete.iter().any(|s| s.run_id == suspended.run_id),
+            "the suspended run must be in load_incomplete so resume_all picks it up"
+        );
+
+        // Resume completes it. (A fresh, un-cancelled token is used for the resumed pass.)
+        let resumed = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        let done = resumed
+            .iter()
+            .find(|s| s.run_id == suspended.run_id)
+            .expect("resume_all must complete the suspended run");
+        assert_eq!(
+            done.status,
+            RunStatus::Succeeded,
+            "error: {:?}",
+            done.error
+        );
+        assert!(
+            store
+                .load_incomplete()
+                .await
+                .unwrap()
+                .iter()
+                .all(|s| s.run_id != suspended.run_id),
+            "the resumed run is terminal and no longer incomplete"
+        );
+    }
+
+    /// A USER cancel (`cancel_run`) of a durable run is TERMINAL `Cancelled` — it must NOT be
+    /// resumed (the distinction from graceful shutdown above).
+    #[tokio::test]
+    async fn user_cancel_of_a_durable_run_is_terminal_not_resumed() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+
+        let wf = parse(
+            "name: uc\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  \
+             - {id: s, run: \"sleep 30\"}\n",
+        );
+        let eng2 = eng.clone();
+        let wf2 = wf.clone();
+        let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
+
+        // Find the active run's id from the store, then user-cancel it specifically.
+        let mut run_id = None;
+        for _ in 0..120 {
+            if let Some(s) = store
+                .load_incomplete()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.status == RunStatus::Running)
+            {
+                run_id = Some(s.run_id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let run_id = run_id.expect("the run should have registered as Running");
+        // The run row is checkpointed just before its cancel token registers, so retry briefly.
+        let mut cancelled = false;
+        for _ in 0..120 {
+            if eng.cancel_run(run_id) {
+                cancelled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(cancelled, "the active run must become cancellable");
+
+        let summary = tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("a cancelled run finishes promptly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.status, RunStatus::Cancelled);
+        // It must NOT be resumable.
+        assert!(
+            store
+                .load_incomplete()
+                .await
+                .unwrap()
+                .iter()
+                .all(|s| s.run_id != run_id),
+            "a user-cancelled run is terminal and never resumed"
+        );
+        assert!(
+            eng.resume_all(std::slice::from_ref(&wf)).await.unwrap().is_empty(),
+            "resume_all must not pick up a user-cancelled run"
         );
     }
 

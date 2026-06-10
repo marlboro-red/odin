@@ -37,6 +37,11 @@ impl Engine for LocalEngine {
         let params = Self::resolve_params(workflow, &input)?;
 
         let run_id = RunId::new();
+        // Claim the run id for this whole execution. The id is fresh, so the claim always
+        // succeeds; holding it makes a concurrent `resume_all` sweep refuse to also execute this
+        // run (its early `Running` checkpoint would otherwise make it look crash-recoverable),
+        // so the run's side effects can't be double-applied. Released on return (any path).
+        let _claim = self.claim_run(run_id);
         let started_at = Utc::now();
         let workspace = self.make_workspace(&workflow.workspace);
         let handle = self
@@ -113,6 +118,28 @@ impl Engine for LocalEngine {
             }
             other => other,
         };
+        // Graceful-shutdown suspend: a durable run interrupted by `cancel_all_active` (daemon
+        // shutdown fires each token via `shutdown`) is left RESUMABLE — keep its workspace and
+        // snapshot ref and checkpoint it non-terminal (`Running`) so `resume_all` completes it on
+        // the next start. (The executor already rewound the killed step to `Running`.) A USER
+        // cancel, or a non-durable run, falls through to the terminal path below and ends
+        // `Cancelled`. Only when `execute` returned Ok — an Err during shutdown is a real failure.
+        if workflow.durable && cancel.is_shutdown() {
+            if let Ok(r) = &exec {
+                state.status = RunStatus::Running;
+                state.error = None;
+                state.updated_at = Utc::now();
+                self.checkpoint(workflow.durable, &state).await?;
+                tracing::info!(parent: &run_span, run_id = %run_id, "run suspended for shutdown; will resume on next start");
+                return Ok(Self::interrupted_summary(
+                    run_id,
+                    workflow,
+                    r,
+                    started_at,
+                    &state.steps,
+                ));
+            }
+        }
         // The run is terminal now — drop the snapshot ref so its commits can be collected.
         // Fully unconditional: durable runs snapshot per step, AND a retrying step snapshots
         // even in a NON-durable run (for per-retry workdir restore), so either kind can leave
@@ -188,7 +215,9 @@ impl Engine for LocalEngine {
     fn cancel_all_active(&self) -> usize {
         let map = self.active_cancels.lock().unwrap();
         for token in map.values() {
-            token.cancel();
+            // Graceful shutdown, not a user cancel: a durable run is left resumable (checkpointed
+            // non-terminal) and picked up by `resume_all` next start, rather than dying `Cancelled`.
+            token.shutdown();
         }
         map.len()
     }
@@ -301,6 +330,17 @@ impl Engine for LocalEngine {
             return Err(Error::Input(format!(
                 "run {run_id} is not awaiting approval (status is {:?})",
                 state.status
+            )));
+        }
+        // Cross-process fence: atomically flip `awaiting_approval` -> `running` in the store. Only
+        // the winner of a race between two processes sharing this store (e.g. the CLI `odin
+        // approve` and the daemon's HTTP `/approve`) gets `true` and proceeds, so the resumed run's
+        // downstream side effects run exactly once. The in-process `claim_run` above guards
+        // same-process races; this guards separate processes. (Checked AFTER the workflow/status
+        // validation above so a missing-`--workflow` error never leaves the column flipped.)
+        if !store.claim_awaiting(run_id).await? {
+            return Err(Error::Input(format!(
+                "run {run_id} is already having a decision applied by another process"
             )));
         }
         // The gate parked at `AwaitingApproval` is the one this decision answers.
@@ -445,6 +485,18 @@ impl LocalEngine {
         state.error = Some(error.to_owned());
         state.updated_at = Utc::now();
         self.checkpoint(workflow.durable, state).await?;
+        // Emit the terminal audit event for a run failed off the main `run()` path (a resume
+        // that couldn't recover, a bad-params rerun) — otherwise it has a `RunStarted` with no
+        // matching `RunFinished`.
+        self.emit(
+            state.run_id,
+            workflow.durable,
+            RunEvent::RunFinished {
+                status: RunStatus::Failed,
+                at: Utc::now(),
+            },
+        )
+        .await;
         Ok(RunSummary {
             run_id: state.run_id,
             workflow: state.workflow.clone(),
@@ -470,6 +522,7 @@ impl LocalEngine {
     /// again at a gate). The caller MUST hold the run's [`claim_run`] guard for the duration —
     /// two concurrent resumes of one run would double-run its side effects. Returns `Ok(None)`
     /// if the run can't be resumed because its workspace handle is absent.
+    #[allow(clippy::too_many_lines)]
     async fn resume_state(
         &self,
         workflow: &Workflow,
@@ -518,6 +571,25 @@ impl LocalEngine {
                             )
                         }
                         terminal => {
+                            // Graceful-shutdown during resume: same as run() — keep the durable
+                            // run resumable (workspace + refs kept, checkpointed non-terminal) so
+                            // the NEXT start completes it, rather than ending it `Cancelled`.
+                            if workflow.durable && cancel.is_shutdown() {
+                                if let Ok(r) = &terminal {
+                                    state.status = RunStatus::Running;
+                                    state.error = None;
+                                    state.updated_at = Utc::now();
+                                    self.checkpoint(workflow.durable, &state).await?;
+                                    tracing::info!(run_id = %state.run_id, "resumed run suspended for shutdown; will resume again");
+                                    return Ok(Some(Self::interrupted_summary(
+                                        state.run_id,
+                                        workflow,
+                                        r,
+                                        started_at,
+                                        &state.steps,
+                                    )));
+                                }
+                            }
                             // Reclaim the run's snapshot refs unconditionally (matches run()
                             // and the unserved-workflow path): a retrying step snapshots even
                             // in a non-durable run, and the durable flag may have flipped, so
@@ -546,6 +618,19 @@ impl LocalEngine {
                                     state.error = summary.error.clone();
                                     state.updated_at = Utc::now();
                                     self.checkpoint(workflow.durable, &state).await?;
+                                    // A run completing via the resume path (crash recovery or an
+                                    // approval decision) must still emit its terminal audit event
+                                    // — only `run()` did before, so resumed/approved runs left a
+                                    // started-but-never-finished trail.
+                                    self.emit(
+                                        state.run_id,
+                                        workflow.durable,
+                                        RunEvent::RunFinished {
+                                            status,
+                                            at: Utc::now(),
+                                        },
+                                    )
+                                    .await;
                                     summary
                                 }
                                 Err(e) => {
