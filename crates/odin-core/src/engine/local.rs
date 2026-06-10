@@ -1110,6 +1110,53 @@ steps:
         );
     }
 
+    /// `resume_all` recovers MULTIPLE incomplete runs (concurrently) and completes them all — the
+    /// daemon-restart recovery path. Suspends two durable runs via shutdown, then resumes both.
+    #[tokio::test]
+    async fn resume_all_recovers_multiple_runs() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store.clone());
+        let wf = parse(
+            "name: rm\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  \
+             - {id: s, run: \"sleep 2\"}\n  - {id: done, run: \"true\", depends_on: [s]}\n",
+        );
+
+        // Start two runs and keep firing shutdown so each is suspended as it registers.
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let e = eng.clone();
+            let w = wf.clone();
+            handles.push(tokio::spawn(async move { e.run(&w, RunInput::manual()).await }));
+        }
+        let killer = {
+            let e = eng.clone();
+            tokio::spawn(async move {
+                for _ in 0..150 {
+                    e.cancel_all_active();
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                }
+            })
+        };
+        for h in handles {
+            let s = tokio::time::timeout(std::time::Duration::from_secs(20), h)
+                .await
+                .expect("each run suspends promptly")
+                .unwrap()
+                .unwrap();
+            assert_eq!(s.status, RunStatus::Running, "suspended, not terminal");
+        }
+        killer.abort(); // stop firing shutdown BEFORE resuming, or it would re-suspend them
+
+        let resumed = eng.resume_all(std::slice::from_ref(&wf)).await.unwrap();
+        assert_eq!(resumed.len(), 2, "both incomplete runs are recovered");
+        assert!(
+            resumed.iter().all(|s| s.status == RunStatus::Succeeded),
+            "every recovered run completes: {:?}",
+            resumed.iter().map(|s| (s.run_id, s.status)).collect::<Vec<_>>()
+        );
+    }
+
     /// A USER cancel (`cancel_run`) of a durable run is TERMINAL `Cancelled` — it must NOT be
     /// resumed (the distinction from graceful shutdown above).
     #[tokio::test]

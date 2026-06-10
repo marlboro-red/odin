@@ -26,6 +26,11 @@ use crate::ir::Workflow;
 use crate::traits::{AcquireCtx, CancelToken, PrunePolicy, PruneReport, RunEvent, RunState};
 use crate::usage::Usage;
 
+/// How many crashed runs `resume_all` recovers at once. Bounds concurrent recovery so a restart
+/// with many incomplete runs doesn't spawn an unbounded fan-out, while still overlapping the long
+/// (agentic) resumes instead of serializing them.
+const RESUME_CONCURRENCY: usize = 8;
+
 #[async_trait]
 impl Engine for LocalEngine {
     #[allow(clippy::too_many_lines)]
@@ -223,14 +228,19 @@ impl Engine for LocalEngine {
     }
 
     async fn resume_all(&self, workflows: &[Workflow]) -> Result<Vec<RunSummary>> {
+        use futures_util::stream::StreamExt as _;
+
         let Some(store) = self.store.clone() else {
             return Ok(Vec::new());
         };
         let by_name: HashMap<&str, &Workflow> =
             workflows.iter().map(|w| (w.name.as_str(), w)).collect();
 
-        let mut summaries = Vec::new();
+        // First pass (sequential, cheap): claim each resumable run and pair it with its workflow.
+        // Claiming first means a run is recovered at most once even though the resumes below run
+        // concurrently; an unserved-workflow run gets its leftover snapshot refs reclaimed here.
         let sweep_cancel = CancelToken::new();
+        let mut claimed = Vec::new();
         for state in store.load_incomplete().await? {
             let Some(workflow) = by_name.get(state.workflow.as_str()).copied() else {
                 // The run targets a workflow we no longer serve — best-effort reclaim its
@@ -250,10 +260,33 @@ impl Engine for LocalEngine {
             };
             // Skip a run already being resumed (e.g. by a concurrent approval decision); never
             // execute the same run twice. The claim is held for this run's whole resume.
-            let Some(_claim) = self.claim_run(state.run_id) else {
+            let Some(claim) = self.claim_run(state.run_id) else {
                 continue;
             };
-            if let Some(summary) = self.resume_state(workflow, state).await? {
+            claimed.push((claim, workflow, state));
+        }
+
+        // Second pass: resume the claimed runs CONCURRENTLY (bounded). Recovering one at a time
+        // blocked the daemon's trigger serving behind the *entire* recovery — hours, with several
+        // long durable runs in flight. Each run has its own claim, workspace, and cancel token, so
+        // this is the same concurrency the engine already supports for live dispatch. (Build the
+        // futures in a plain loop rather than `iter.map(closure)` to sidestep a closure-lifetime
+        // HRTB error on the captured `&self`.)
+        let mut futs = Vec::with_capacity(claimed.len());
+        for (claim, workflow, state) in claimed {
+            futs.push(async move {
+                let _claim = claim; // held across the whole resume
+                self.resume_state(workflow, state).await
+            });
+        }
+        let results: Vec<Result<Option<RunSummary>>> = futures_util::stream::iter(futs)
+            .buffer_unordered(RESUME_CONCURRENCY)
+            .collect()
+            .await;
+
+        let mut summaries = Vec::new();
+        for result in results {
+            if let Some(summary) = result? {
                 summaries.push(summary);
             }
         }
