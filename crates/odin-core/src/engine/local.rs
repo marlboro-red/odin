@@ -55,7 +55,7 @@ use crate::ids::{RunId, StepId};
 use crate::ir::{Step, StepKind, Workflow};
 use crate::provider::StreamMux;
 use crate::registry::Registry;
-use crate::traits::{CancelToken, RunEvent, RunState, StepState, Store, Workspace};
+use crate::traits::{CancelToken, Provider, RunEvent, RunState, StepState, Store, Workspace};
 use crate::usage::Usage;
 
 mod api;
@@ -116,6 +116,13 @@ pub(crate) struct LocalEngine {
     /// `<logs_dir>/<run_id>/<step>.<attempt>.log` (the run-state blob keeps only a clipped copy).
     /// Set via [`super::EngineBuilder::logs_dir`]; `None` (the default) disables spooling.
     logs_dir: Option<PathBuf>,
+    /// Cache of `provider id → version`, resolved once via [`Provider::version`] (which may spawn
+    /// the CLI) and reused for the engine's lifetime, so a run with many provider steps doesn't
+    /// re-shell `--version`. The inner `Option` distinguishes "resolved to no version" from "not
+    /// yet resolved".
+    ///
+    /// [`Provider::version`]: crate::traits::Provider::version
+    provider_versions: std::sync::Mutex<HashMap<String, Option<String>>>,
 }
 
 /// Max runs held in the in-memory mirror. When full, a NEW run evicts the oldest *terminal* run;
@@ -218,6 +225,9 @@ pub(crate) struct StepOutcome {
     /// (provisioning + retries). Folded into the persisted [`StepState`] for the timing surface.
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `(provider_id, version)` for a provider step whose CLI reported a version — folded into the
+    /// run's [`provider_versions`](RunState::provider_versions) for reproducibility. Transient.
+    provider_version: Option<(String, String)>,
 }
 
 impl StepOutcome {
@@ -237,6 +247,7 @@ impl StepOutcome {
             judge_score: None,
             started_at: None,
             finished_at: None,
+            provider_version: None,
         }
     }
 
@@ -256,6 +267,7 @@ impl StepOutcome {
             judge_score: None,
             started_at: None,
             finished_at: None,
+            provider_version: None,
         }
     }
 
@@ -319,7 +331,22 @@ impl LocalEngine {
             on_event,
             mirror: std::sync::Mutex::new(IndexMap::new()),
             logs_dir: None,
+            provider_versions: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The provider's reported version, resolved once and cached (see [`Self::provider_versions`]).
+    /// `None` if the provider reports none.
+    async fn cached_provider_version(&self, provider: &Arc<dyn Provider>) -> Option<String> {
+        let id = provider.id().as_str().to_owned();
+        if let Some(v) = self.provider_versions.lock().unwrap().get(&id) {
+            return v.clone();
+        }
+        // Resolve outside the lock (it may spawn the CLI); a concurrent duplicate resolve is
+        // harmless (same result), and the last writer wins.
+        let v = provider.version().await;
+        self.provider_versions.lock().unwrap().insert(id, v.clone());
+        v
     }
 
     /// Sets the directory under which step output is spooled (see [`Self::logs_dir`]); a builder
@@ -1078,6 +1105,14 @@ impl LocalEngine {
                 usage.add(*u);
             }
             side_effects.extend(outcome.side_effects.iter().cloned());
+            // Record the provider's CLI version into the run (for reproducibility); first writer
+            // per provider wins.
+            if let Some((id, version)) = &outcome.provider_version {
+                state
+                    .provider_versions
+                    .entry(id.clone())
+                    .or_insert_with(|| version.clone());
+            }
             // The persisted projection; side effects are kept so a later resume can reconstruct
             // the run's full set without re-running the step (see the resume seed below).
             let mut step_state = outcome.to_state();
@@ -3763,6 +3798,55 @@ steps:
             .expect("run in recent()");
         assert!(v.duration_ms.is_some(), "a terminal run has a duration_ms");
         assert!(v.steps[0].duration_ms.is_some(), "step has a duration_ms");
+    }
+
+    /// A provider that reports a `version()` has it recorded into the run's `provider_versions`.
+    #[tokio::test]
+    async fn provider_version_is_recorded_into_run_state() {
+        use crate::error::ProviderError;
+        use crate::ids::ProviderRef;
+        use crate::traits::{InvocationCtx, InvocationOutcome, Provider};
+
+        struct Versioned;
+        #[async_trait::async_trait]
+        impl Provider for Versioned {
+            fn id(&self) -> ProviderRef {
+                ProviderRef::new("vp")
+            }
+            async fn invoke(
+                &self,
+                ctx: InvocationCtx,
+            ) -> std::result::Result<InvocationOutcome, ProviderError> {
+                Ok(InvocationOutcome::success(ctx.prompt.unwrap_or_default()))
+            }
+            async fn version(&self) -> Option<String> {
+                Some("1.2.3".to_owned())
+            }
+        }
+
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut reg = Registry::with_builtins();
+        reg.register_provider(Arc::new(Versioned));
+        let eng = LocalEngine::new(
+            reg,
+            Some(store.clone()),
+            repo.path().to_path_buf(),
+            None,
+            None,
+        );
+        let wf = parse(
+            "name: pv\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: a, provider: vp, prompt: \"hi\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let state = store.load_run(s.run_id).await.unwrap().unwrap();
+        assert_eq!(
+            state.provider_versions.get("vp").map(String::as_str),
+            Some("1.2.3"),
+            "the provider's version should be recorded: {:?}",
+            state.provider_versions
+        );
     }
 
     /// A `loop:` step — run by the scheduler, not `run_one` — is timed too (the longest step in a

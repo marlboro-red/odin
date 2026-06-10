@@ -64,6 +64,7 @@ pub(crate) fn skipped_outcome() -> StepOutcome {
         judge_score: None,
         started_at: None,
         finished_at: None,
+        provider_version: None,
     }
 }
 

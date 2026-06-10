@@ -247,8 +247,9 @@ pub struct RunState {
     pub steps: IndexMap<StepId, StepState>,
     /// Resolved artifact catalogue: name → path relative to the workdir.
     pub artifacts: IndexMap<ArtifactName, String>,
-    /// Reserved for reproducibility (provider CLI/model versions used). **Not yet populated**
-    /// by the engine — `Provider::version` is not currently captured into run state.
+    /// Provider CLI versions used by this run (`provider id → version`), for reproducibility —
+    /// populated from [`Provider::version`](crate::traits::Provider::version) the first time each
+    /// provider runs a step. Empty for a run that used no provider that reports a version.
     pub provider_versions: IndexMap<String, String>,
     /// The inputs the run started with (deterministic resume & audit).
     pub input: RunInput,
