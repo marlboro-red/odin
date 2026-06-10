@@ -314,34 +314,53 @@ impl Engine for LocalEngine {
     }
 
     async fn summary(&self, run_id: RunId) -> Result<Option<RunSummary>> {
-        // Durable runs are persisted in the store; non-durable runs live only in the in-memory
-        // mirror. Try the store first, then the mirror.
-        let state = match &self.store {
+        // Persisted runs are in the store; unpersisted (non-durable, or durable-without-store) in
+        // the mirror. Try both; if a run is in both (a `durable` flag flipped mid-run), prefer the
+        // one updated more recently so a stale persisted row can't shadow the live mirror entry.
+        let from_store = match &self.store {
             Some(store) => store.load_run(run_id).await?,
             None => None,
         };
-        let state = match state {
-            Some(s) => Some(s),
-            None => self.mirror.lock().unwrap().get(&run_id).cloned(),
+        let from_mirror = self.mirror.lock().unwrap().get(&run_id).cloned();
+        let state = match (from_store, from_mirror) {
+            (Some(a), Some(b)) => Some(if a.updated_at >= b.updated_at { a } else { b }),
+            (s, m) => s.or(m),
         };
         Ok(state.map(Self::summary_from_state))
     }
 
     async fn recent(&self, limit: usize) -> Result<Vec<crate::view::RunView>> {
-        let mut runs: Vec<RunState> = match &self.store {
-            Some(store) => store.recent(limit).await?,
+        // Project both sources to the light `RunView` rather than cloning full states — in
+        // particular the mirror is projected *under its lock* (RunView is small), so a dashboard
+        // poll never clones up to 256 full run states while blocking every step boundary.
+        let mut views: Vec<crate::view::RunView> = match &self.store {
+            Some(store) => store
+                .recent(limit)
+                .await?
+                .iter()
+                .map(crate::view::RunView::project)
+                .collect(),
             None => Vec::new(),
         };
-        // Merge in non-durable runs the engine is tracking in memory (the store never holds them,
-        // so there's no overlap to dedup). Then newest-first and cap to `limit`.
-        runs.extend(self.mirror.lock().unwrap().values().cloned());
-        runs.sort_by(|a, b| {
+        views.extend({
+            let mirror = self.mirror.lock().unwrap();
+            mirror
+                .values()
+                .map(crate::view::RunView::project)
+                .collect::<Vec<_>>()
+        });
+        // Newest first (RFC3339 `updated_at` sorts chronologically), then dedup by run_id keeping
+        // the newest — the persisted/mirror sources normally don't overlap, but a durable flag
+        // flipped mid-run can land a run in both.
+        views.sort_by(|a, b| {
             b.updated_at
                 .cmp(&a.updated_at)
-                .then_with(|| b.run_id.0.cmp(&a.run_id.0))
+                .then_with(|| b.run_id.cmp(&a.run_id))
         });
-        runs.truncate(limit);
-        Ok(runs.iter().map(crate::view::RunView::project).collect())
+        let mut seen = std::collections::HashSet::new();
+        views.retain(|v| seen.insert(v.run_id.clone()));
+        views.truncate(limit);
+        Ok(views)
     }
 
     async fn submit_approval(

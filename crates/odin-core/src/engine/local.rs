@@ -102,15 +102,19 @@ pub(crate) struct LocalEngine {
     /// not), in addition to the durable audit log — the embedder's live view. Set via
     /// [`super::EngineBuilder::on_event`]; see [`super::EventHook`].
     on_event: Option<super::EventHook>,
-    /// In-memory view of **non-durable** runs (which the store never persists), so `summary()` /
-    /// `recent()` and the dashboard can still see them live. Bounded ([`MIRROR_CAP`]); a finished
-    /// non-durable run lingers until evicted or the process exits. Durable runs are NOT mirrored
-    /// (they're already in the store), so the two sources never overlap.
+    /// In-memory view of runs that are NOT persisted to the store (a `durable: false` run, or any
+    /// run when no store is configured), so `summary()` / `recent()` can still see them live. Each
+    /// entry is a **light** snapshot ([`Self::light_snapshot`]): per-step status/exit/usage but NOT
+    /// step output, the diff, or the trigger payload — bounded memory, not full run state. Process-
+    /// local and lost on restart; a finished entry lingers until evicted or exit. Persisted runs
+    /// are never mirrored, so the two sources normally don't overlap (see `recent`'s dedup for the
+    /// one case they can — a `durable` flag flipped mid-run).
     mirror: std::sync::Mutex<IndexMap<RunId, RunState>>,
 }
 
-/// Max non-durable runs held in the in-memory mirror. Newest are kept; when full, the oldest
-/// *terminal* run is evicted first (an in-flight run is never dropped), else the oldest overall.
+/// Max runs held in the in-memory mirror. When full, a NEW run evicts the oldest *terminal* run;
+/// only if all 256 are in-flight (≥256 concurrent unpersisted runs — pathological) does it evict
+/// the oldest live run, which then reappears at its next step boundary.
 const MIRROR_CAP: usize = 256;
 
 /// An execution claim on a run id, released when dropped. Held across a whole resume so the run
@@ -273,10 +277,12 @@ impl LocalEngine {
         }
     }
 
-    /// Records a non-durable run's latest state in the in-memory mirror (durable runs go to the
-    /// store instead). Bounded to [`MIRROR_CAP`]: an update keeps the run's slot; a new run over
-    /// the cap evicts the oldest terminal run (never an in-flight one), else the oldest overall.
+    /// Records a not-persisted run's latest state in the in-memory mirror (persisted runs go to the
+    /// store instead). Stores a [`Self::light_snapshot`] (no step output / diff / payload), bounded
+    /// to [`MIRROR_CAP`]: an update keeps the run's slot; a new run over the cap evicts the oldest
+    /// terminal run, else (all in-flight) the oldest overall.
     fn mirror_put(&self, state: &RunState) {
+        let light = Self::light_snapshot(state);
         let mut mirror = self.mirror.lock().unwrap();
         if !mirror.contains_key(&state.run_id) && mirror.len() >= MIRROR_CAP {
             let victim = mirror
@@ -288,7 +294,59 @@ impl LocalEngine {
                 mirror.shift_remove(&victim);
             }
         }
-        mirror.insert(state.run_id, state.clone());
+        mirror.insert(state.run_id, light);
+    }
+
+    /// A memory-bounded copy of `state` for the mirror: keeps identity, status, per-step
+    /// status/exit/usage/gates, side effects, and timings, but DROPS the heavy, potentially
+    /// unbounded fields — each step's captured output, the `DIFF` artifact, and the trigger payload.
+    /// So `summary()`/`recent()` of a non-durable run report status and shape, not full output (use
+    /// the [`on_event`](super::EventHook) hook or `--stream` for live output).
+    fn light_snapshot(state: &RunState) -> RunState {
+        let steps = state
+            .steps
+            .iter()
+            .map(|(id, st)| {
+                (
+                    id.clone(),
+                    StepState {
+                        status: st.status,
+                        attempts: st.attempts,
+                        exit_code: st.exit_code,
+                        outputs: IndexMap::new(), // dropped (capped, but up to 1 MiB/step)
+                        usage: st.usage,
+                        gates: st.gates.clone(),
+                        judge_score: st.judge_score,
+                        side_effects: st.side_effects.clone(),
+                        error: st.error.clone(),
+                    },
+                )
+            })
+            .collect();
+        let input = crate::api::RunInput {
+            trigger: state.input.trigger.clone(),
+            trigger_payload: Value::Null, // dropped (unbounded; attacker-controlled for webhooks)
+            params: state.input.params.clone(),
+            idempotency_key: state.input.idempotency_key.clone(),
+        };
+        RunState {
+            run_id: state.run_id,
+            workflow: state.workflow.clone(),
+            schema_major: state.schema_major,
+            status: state.status,
+            error: state.error.clone(),
+            steps,
+            artifacts: IndexMap::new(), // dropped (the uncapped DIFF)
+            provider_versions: state.provider_versions.clone(),
+            approvals: state.approvals.clone(),
+            input,
+            workspace: state.workspace.clone(),
+            base_commit: state.base_commit.clone(),
+            snapshot: state.snapshot.clone(),
+            loop_state: state.loop_state.clone(),
+            created_at: state.created_at,
+            updated_at: state.updated_at,
+        }
     }
 
     /// The live-output sink for `step`, derived from the engine's [`StreamMux`] (the `--stream`
@@ -353,16 +411,17 @@ impl LocalEngine {
     }
 
     async fn checkpoint(&self, durable: bool, state: &RunState) -> Result<()> {
+        // A run is *persisted* iff it's durable AND a store is configured. Everything else — a
+        // `durable: false` run, OR a durable run with no store — would otherwise be invisible, so
+        // mirror it in memory. Keying on "persisted" (not just `durable`) closes the gap where a
+        // durable run without a store vanished from `summary()`/`recent()`.
         if durable {
             if let Some(store) = &self.store {
                 store.checkpoint(state).await?;
+                return Ok(());
             }
-        } else {
-            // Non-durable runs aren't persisted; mirror them in memory so `summary()`/`recent()`
-            // and the dashboard can still see them live (the store never will). Called at every
-            // step boundary, so the mirror tracks progress like a checkpoint would.
-            self.mirror_put(state);
         }
+        self.mirror_put(state);
         Ok(())
     }
 
@@ -1059,6 +1118,28 @@ mod tests {
 
     fn parse(yaml: &str) -> Workflow {
         Workflow::from_yaml_str(yaml).unwrap()
+    }
+
+    /// A minimal `RunState` for exercising the mirror directly.
+    fn mk_mirror_state(status: RunStatus) -> RunState {
+        RunState {
+            run_id: RunId::new(),
+            workflow: crate::ids::WorkflowId::new("w"),
+            schema_major: 1,
+            status,
+            error: None,
+            steps: IndexMap::new(),
+            artifacts: IndexMap::new(),
+            provider_versions: IndexMap::new(),
+            approvals: IndexMap::new(),
+            input: RunInput::manual(),
+            workspace: None,
+            base_commit: None,
+            snapshot: None,
+            loop_state: IndexMap::new(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
     }
 
     /// An engine over `repo` with an `echo` provider registered alongside the built-ins.
@@ -3464,28 +3545,121 @@ steps:
         let wf2 = wf.clone();
         let handle = tokio::spawn(async move { eng2.run(&wf2, RunInput::manual()).await });
 
+        // Grab the run id as soon as it appears (any status), then poll summary directly: while it
+        // reports Running (the ~2s sleep gives a wide window), finished_at must be None.
+        use std::str::FromStr as _;
+        let mut run_id = None;
+        for _ in 0..120 {
+            if let Some(v) = eng.recent(10).await.unwrap().first() {
+                run_id = Some(RunId::from_str(&v.run_id).unwrap());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let run_id = run_id.expect("the non-durable run should appear in the mirror");
         let mut checked = false;
         for _ in 0..120 {
-            let recent = eng.recent(10).await.unwrap();
-            if let Some(v) = recent.iter().find(|v| v.status == "running") {
-                use std::str::FromStr as _;
-                let run_id = RunId::from_str(&v.run_id).unwrap();
-                let summary = eng.summary(run_id).await.unwrap().unwrap();
-                assert_eq!(summary.status, RunStatus::Running);
+            let summary = eng.summary(run_id).await.unwrap().unwrap();
+            if summary.status == RunStatus::Running {
                 assert!(
                     summary.finished_at.is_none(),
                     "an in-flight run must not report finished_at"
                 );
                 checked = true;
-                break;
+            } else {
+                break; // terminal — done observing the running window
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         }
-        assert!(
-            checked,
-            "the running non-durable run should have appeared in the mirror"
-        );
+        assert!(checked, "should have observed the run while Running");
         handle.await.unwrap().unwrap();
+    }
+
+    /// A **durable** run is never mirrored (it's persisted) — guards the `if durable && store`
+    /// predicate so a regression can't duplicate durable runs into `recent()`.
+    #[tokio::test]
+    async fn a_durable_run_with_a_store_is_not_mirrored() {
+        let repo = init_repo().await;
+        let store: Arc<dyn Store> = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let mut reg = Registry::with_builtins();
+        reg.register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = LocalEngine::new(
+            reg,
+            Some(store.clone()),
+            repo.path().to_path_buf(),
+            None,
+            None,
+        );
+        let wf = parse(
+            "name: dm\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        assert!(
+            store.load_run(s.run_id).await.unwrap().is_some(),
+            "in the store"
+        );
+        assert!(
+            eng.mirror.lock().unwrap().is_empty(),
+            "a durable, persisted run must NOT be mirrored"
+        );
+    }
+
+    /// A **durable** run with NO store configured is still visible via the mirror — the
+    /// persisted-vs-durable predicate fix (otherwise it would be invisible to summary()/recent()).
+    #[tokio::test]
+    async fn a_durable_run_without_a_store_is_mirrored() {
+        let repo = init_repo().await;
+        let mut reg = Registry::with_builtins();
+        reg.register_provider(Arc::new(EchoProvider::new("echo")));
+        let eng = LocalEngine::new(reg, None, repo.path().to_path_buf(), None, None);
+        let wf = parse(
+            "name: dns\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: s, run: \"true\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let summary = eng.summary(s.run_id).await.unwrap();
+        assert!(
+            summary.is_some(),
+            "a durable, store-less run must be visible via the mirror"
+        );
+        assert!(
+            eng.recent(10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|v| v.run_id == s.run_id.to_string())
+        );
+    }
+
+    /// The mirror is bounded: inserting past `MIRROR_CAP` keeps the count capped and evicts
+    /// terminal entries first, never a still-in-flight one (until all slots are in-flight).
+    #[tokio::test]
+    async fn mirror_is_bounded_and_evicts_terminal_first() {
+        let repo = init_repo().await;
+        let eng = LocalEngine::new(
+            Registry::with_builtins(),
+            None,
+            repo.path().to_path_buf(),
+            None,
+            None,
+        );
+        // One in-flight run, then flood with terminal runs past the cap.
+        let live = mk_mirror_state(RunStatus::Running);
+        eng.mirror_put(&live);
+        for _ in 0..MIRROR_CAP + 50 {
+            eng.mirror_put(&mk_mirror_state(RunStatus::Succeeded));
+        }
+        let mirror = eng.mirror.lock().unwrap();
+        assert!(
+            mirror.len() <= MIRROR_CAP,
+            "mirror exceeded its cap: {}",
+            mirror.len()
+        );
+        assert!(
+            mirror.contains_key(&live.run_id),
+            "the in-flight run must survive eviction of terminal runs"
+        );
     }
 
     /// A clean (non-cancelled) run emits NO `RunCancelled`, and `RunStarted`/`RunFinished` bracket
