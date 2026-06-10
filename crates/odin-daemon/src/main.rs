@@ -166,10 +166,13 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     }
     let store: Arc<dyn Store> =
         Arc::new(SqliteStore::open(&db).context("opening the run state database")?);
-    let engine = EngineBuilder::new()
-        .repo(&cli.repo)
-        .store(store.clone())
-        .build()?;
+    let mut builder = EngineBuilder::new().repo(&cli.repo).store(store.clone());
+    // Spool full step output under the state directory's `logs/` (e.g. `<repo>/.odin/logs`) — the
+    // unattended daemon especially benefits from a complete on-disk record of a failed run.
+    if let Some(parent) = db.parent() {
+        builder = builder.logs_dir(parent.join("logs"));
+    }
+    let engine = builder.build()?;
 
     // Build the webhook server from every `github_webhook` decl (before the workflows are
     // moved into the daemon), collecting the pull-side triggers to register.

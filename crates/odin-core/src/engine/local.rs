@@ -112,6 +112,10 @@ pub(crate) struct LocalEngine {
     /// are never mirrored, so the two sources normally don't overlap (see `recent`'s dedup for the
     /// one case they can — a `durable` flag flipped mid-run).
     mirror: std::sync::Mutex<IndexMap<RunId, RunState>>,
+    /// When set, each step attempt's FULL output is spooled to
+    /// `<logs_dir>/<run_id>/<step>.<attempt>.log` (the run-state blob keeps only a clipped copy).
+    /// Set via [`super::EngineBuilder::logs_dir`]; `None` (the default) disables spooling.
+    logs_dir: Option<PathBuf>,
 }
 
 /// Max runs held in the in-memory mirror. When full, a NEW run evicts the oldest *terminal* run;
@@ -204,6 +208,10 @@ pub(crate) struct StepOutcome {
     /// Captured stderr from the dispatch (provider/`run:`), folded into `error` on failure.
     /// Transient — not persisted to `StepState`.
     stderr: String,
+    /// The FULL (un-clipped) captured stdout from the dispatch — spooled to the on-disk step log
+    /// when a `logs_dir` is configured, so the complete output survives even though `outputs.stdout`
+    /// is clipped to [`STDOUT_MAX`] for the run-state blob. Transient — not persisted.
+    raw_stdout: String,
     attempts: u8,
     judge_score: Option<f32>,
 }
@@ -220,6 +228,7 @@ impl StepOutcome {
             error: Some(error.into()),
             failure_detail: None,
             stderr: String::new(),
+            raw_stdout: String::new(),
             attempts: 1,
             judge_score: None,
         }
@@ -236,6 +245,7 @@ impl StepOutcome {
             error: None,
             failure_detail: None,
             stderr: String::new(),
+            raw_stdout: String::new(),
             attempts: 1,
             judge_score: None,
         }
@@ -298,6 +308,49 @@ impl LocalEngine {
             stream,
             on_event,
             mirror: std::sync::Mutex::new(IndexMap::new()),
+            logs_dir: None,
+        }
+    }
+
+    /// Sets the directory under which step output is spooled (see [`Self::logs_dir`]); a builder
+    /// helper so existing `new` call sites stay unchanged.
+    pub(crate) fn with_logs_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.logs_dir = dir;
+        self
+    }
+
+    /// Spools a step attempt's full output to `<logs_dir>/<run_id>/<step>.<attempt>.log` when a
+    /// `logs_dir` is configured. Best-effort: a spool failure is a WARN, never fails the step.
+    async fn spool_step_log(
+        &self,
+        run_id: RunId,
+        step: &StepId,
+        attempt: u32,
+        outcome: &StepOutcome,
+    ) {
+        let Some(base) = &self.logs_dir else { return };
+        // Nothing useful to write for a step that produced no output (e.g. a skipped/internal step).
+        if outcome.raw_stdout.is_empty() && outcome.stderr.is_empty() {
+            return;
+        }
+        let dir = base.join(run_id.to_string());
+        let path = dir.join(format!("{}.{attempt}.log", step.as_str()));
+        let mut body = outcome.raw_stdout.clone();
+        if !outcome.stderr.is_empty() {
+            if !body.is_empty() && !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str("--- stderr ---\n");
+            body.push_str(&outcome.stderr);
+        }
+        let write = async {
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::write(&path, body.as_bytes()).await
+        };
+        if let Err(e) = write.await {
+            tracing::warn!(run_id = %run_id, step = %step, error = %e, "failed to spool step log");
+        } else {
+            tracing::debug!(run_id = %run_id, step = %step, path = %path.display(), "spooled step log");
         }
     }
 
@@ -3598,6 +3651,63 @@ steps:
             !err.contains("exited with code"),
             "must not report a synthetic exit code for a timeout: {err:?}"
         );
+    }
+
+    /// A configured `logs_dir` spools each step's full output to
+    /// `<logs_dir>/<run_id>/<step>.<attempt>.log`.
+    #[tokio::test]
+    async fn step_output_is_spooled_to_the_logs_dir() {
+        let repo = init_repo().await;
+        let logs = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = EngineBuilder::new()
+            .repo(repo.path())
+            .store(store)
+            .logs_dir(logs.path())
+            .build()
+            .unwrap();
+        let wf = parse(
+            "name: s\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"echo hello-spool\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Succeeded);
+        let logfile = logs.path().join(s.run_id.to_string()).join("a.1.log");
+        let body = std::fs::read_to_string(&logfile)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", logfile.display()));
+        assert!(body.contains("hello-spool"), "log body: {body:?}");
+    }
+
+    /// Pruning a run also removes its spooled step logs.
+    #[tokio::test]
+    async fn prune_removes_spooled_logs() {
+        let repo = init_repo().await;
+        let logs = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = EngineBuilder::new()
+            .repo(repo.path())
+            .store(store)
+            .logs_dir(logs.path())
+            .build()
+            .unwrap();
+        let wf = parse(
+            "name: p\ndurable: true\nworkspace: { type: worktree }\nsteps:\n  - {id: a, run: \"echo x\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        let run_dir = logs.path().join(s.run_id.to_string());
+        assert!(run_dir.exists(), "logs should exist before prune");
+        let report = eng
+            .prune(
+                &PrunePolicy {
+                    max_age: None,
+                    keep_last: Some(0),
+                    workflow: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.runs_pruned, 1);
+        assert!(!run_dir.exists(), "logs should be gone after prune");
     }
 
     /// A gate killed by its timeout reports "gate … timed out", not a bare "gate … failed".

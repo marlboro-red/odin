@@ -145,6 +145,7 @@ pub struct EngineBuilder {
     repo_root: Option<PathBuf>,
     stream: Option<StreamMux>,
     on_event: Option<EventHook>,
+    logs_dir: Option<PathBuf>,
 }
 
 impl EngineBuilder {
@@ -157,6 +158,7 @@ impl EngineBuilder {
             repo_root: None,
             stream: None,
             on_event: None,
+            logs_dir: None,
         }
     }
 
@@ -194,6 +196,16 @@ impl EngineBuilder {
         self
     }
 
+    /// Spools each step attempt's FULL output to `<dir>/<run_id>/<step>.<attempt>.log` — the
+    /// complete, un-clipped record for after-the-fact debugging (the run-state blob keeps only a
+    /// 1 MiB-clipped copy). Unset by default (no spooling); the `odin` CLI and `odind` point this
+    /// at `<repo>/.odin/logs`. A spool failure is logged, never fatal to the run.
+    #[must_use]
+    pub fn logs_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.logs_dir = Some(dir.into());
+        self
+    }
+
     /// Accesses the registry to register custom plugins.
     pub fn registry_mut(&mut self) -> &mut Registry {
         &mut self.registry
@@ -212,12 +224,15 @@ impl EngineBuilder {
         // doubles into a nonexistent path and the CLI fails with "No such file or directory".
         // `absolute` (unlike `canonicalize`) doesn't resolve symlinks, keeping paths stable.
         let repo_root = std::path::absolute(&repo_root).unwrap_or(repo_root);
-        Ok(Arc::new(local::LocalEngine::new(
-            self.registry,
-            self.store,
-            repo_root,
-            self.stream,
-            self.on_event,
-        )))
+        Ok(Arc::new(
+            local::LocalEngine::new(
+                self.registry,
+                self.store,
+                repo_root,
+                self.stream,
+                self.on_event,
+            )
+            .with_logs_dir(self.logs_dir),
+        ))
     }
 }

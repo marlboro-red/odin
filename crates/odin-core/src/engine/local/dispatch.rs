@@ -152,6 +152,7 @@ impl LocalEngine {
                             .entry("stdout".to_owned())
                             .or_insert(Value::String(clip_middle(&o.stdout, STDOUT_MAX)));
                         let mut outcome = StepOutcome::passing(o.exit_code, outputs, o.usage);
+                        outcome.raw_stdout = o.stdout; // full, for the on-disk step log
                         outcome.stderr = o.stderr;
                         outcome
                     }
@@ -179,6 +180,7 @@ impl LocalEngine {
                             Value::String(clip_middle(&out.stdout, STDOUT_MAX)),
                         );
                         let mut outcome = StepOutcome::passing(out.exit_code, outputs, None);
+                        outcome.raw_stdout = out.stdout; // full, for the on-disk step log
                         outcome.stderr = out.stderr;
                         if let Some(reason) = reason {
                             outcome.status = StepStatus::Failed;
@@ -528,6 +530,10 @@ impl LocalEngine {
             let attempt_ctx = attempt_context(ctx, retry.feedback, attempt, prior_error.as_deref());
             let mut outcome = self
                 .exec_step(step, &attempt_ctx, workdir, timeout, cancel)
+                .await;
+            // Spool this attempt's full output to disk (a no-op without a configured `logs_dir`),
+            // so each attempt — passing or failing — leaves a complete, un-clipped log on disk.
+            self.spool_step_log(run_id, &step.id, attempt, &outcome)
                 .await;
             if outcome.status != StepStatus::Failed || attempt >= max_attempts {
                 outcome.attempts = u8::try_from(attempt).unwrap_or(u8::MAX);
