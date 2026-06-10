@@ -236,13 +236,41 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
     }
     let shutdown = daemon.cancellation_token();
 
-    // On ctrl-c, ask the daemon + webhook server to stop accepting new events and drain
-    // in-flight work (rather than dropping the futures mid-flight).
+    // On a shutdown signal, ask the daemon + webhook server to stop accepting new events and
+    // drain in-flight work (rather than dropping the futures mid-flight). We honor SIGTERM as
+    // well as ctrl-C (SIGINT) so a managed stop — `systemctl stop`, `docker stop`, a redeploy —
+    // drains through the same path instead of being hard-killed past it.
     let signal_token = shutdown.clone();
     let signal = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("ctrl-c received, draining in-flight runs");
-            signal_token.cancel();
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => {
+                    let why = tokio::select! {
+                        r = tokio::signal::ctrl_c() => r.is_ok().then_some("ctrl-c"),
+                        _ = term.recv() => Some("SIGTERM"),
+                    };
+                    if let Some(why) = why {
+                        tracing::info!(signal = why, "shutdown signal received, draining in-flight runs");
+                        signal_token.cancel();
+                    }
+                }
+                // Couldn't register SIGTERM (unusual) — fall back to ctrl-C only.
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not install SIGTERM handler; ctrl-c only");
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        signal_token.cancel();
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                tracing::info!("ctrl-c received, draining in-flight runs");
+                signal_token.cancel();
+            }
         }
     });
 

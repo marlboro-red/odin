@@ -62,11 +62,23 @@ CREATE TABLE IF NOT EXISTS pruned_counts (
 );
 ";
 
+/// An index on `updated_at` (descending) serving the hot `recent()` list query
+/// (`ORDER BY updated_at DESC, run_id DESC LIMIT ?`) — the dashboard poll, `odin status --watch`,
+/// and `odin list`. Without it that sort builds a temp B-tree over every row on each call; with it
+/// the rows stream from the index in already-sorted order and the `LIMIT` stops early.
+const SCHEMA_V4_UPDATED_AT_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS runs_updated_at ON runs(updated_at DESC, run_id DESC);";
+
 /// Ordered migrations tracked by SQLite's `PRAGMA user_version`. The entry at index `i`
 /// upgrades the database from version `i` to `i + 1` (so `MIGRATIONS.len()` is the current
 /// version). **Append** new migrations; never edit or reorder a released one — an in-place
 /// edit would not re-run on a database already at that version.
-const MIGRATIONS: &[&str] = &[SCHEMA_V1, SCHEMA_V2_METRICS_INDEX, SCHEMA_V3_PRUNED_COUNTS];
+const MIGRATIONS: &[&str] = &[
+    SCHEMA_V1,
+    SCHEMA_V2_METRICS_INDEX,
+    SCHEMA_V3_PRUNED_COUNTS,
+    SCHEMA_V4_UPDATED_AT_INDEX,
+];
 
 /// A durable run store backed by a SQLite database.
 pub struct SqliteStore {
@@ -684,6 +696,20 @@ mod tests {
         let incomplete = store.load_incomplete().await.unwrap();
         assert_eq!(incomplete.len(), 1);
         assert_eq!(incomplete[0].run_id, run_id);
+    }
+
+    #[tokio::test]
+    async fn recent_query_is_backed_by_an_updated_at_index() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().await;
+        let has_index: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'runs_updated_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_index, "the recent() list query must have an updated_at index");
     }
 
     #[tokio::test]

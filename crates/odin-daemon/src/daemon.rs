@@ -222,25 +222,18 @@ impl Daemon {
                 // In-flight dispatches for this trigger, so a burst runs concurrently and
                 // shutdown can drain them.
                 let mut dispatches = tokio::task::JoinSet::new();
-                // Spawns a run for one event, holding a concurrency permit for the whole run.
+                // Spawns a run for one event. The concurrency permit is acquired by the LOOP before
+                // calling this (not inside the task) and moved in, so it's held for the whole run
+                // AND the loop parks on a full pool — propagating backpressure to the bounded
+                // channel and its 503. `None` only on the shutdown-drain path (best-effort
+                // last-gasp dispatches that are about to be cancelled).
                 let spawn_dispatch = |dispatches: &mut tokio::task::JoinSet<()>,
+                                      permit: Option<tokio::sync::OwnedSemaphorePermit>,
                                       event: TriggerEvent| {
                     let engine = Arc::clone(&engine);
                     let workflows = Arc::clone(&workflows);
-                    let permits = Arc::clone(&permits);
-                    let kind = kind.clone();
                     dispatches.spawn(async move {
-                        // Acquire a slot first; the permit is held for the whole run. Acquire only
-                        // fails if the semaphore was closed — unreachable while this task holds an
-                        // `Arc<Semaphore>`, but log rather than drop the event silently if a future
-                        // change ever closes it.
-                        let Ok(_permit) = permits.acquire_owned().await else {
-                            tracing::error!(
-                                %kind,
-                                "dispatch slot unavailable (semaphore closed); event dropped"
-                            );
-                            return;
-                        };
+                        let _permit = permit; // held for the whole run
                         dispatch(engine.as_ref(), &workflows, event).await;
                     });
                 };
@@ -261,7 +254,11 @@ impl Daemon {
                                 tokio::time::timeout(DRAIN_GRACE, trigger.next_event()).await
                             {
                                 while dispatches.try_join_next().is_some() {}
-                                spawn_dispatch(&mut dispatches, event);
+                                // Take a permit if one is free; else dispatch unbounded — these
+                                // are about to be cancelled, so don't wedge the drain on a full
+                                // pool whose runs aren't cancelled until after this loop.
+                                let permit = Arc::clone(&permits).try_acquire_owned().ok();
+                                spawn_dispatch(&mut dispatches, permit, event);
                             }
                             break;
                         }
@@ -270,7 +267,25 @@ impl Daemon {
                     // Reap finished dispatches so the set doesn't grow without bound.
                     while dispatches.try_join_next().is_some() {}
                     match event {
-                        Ok(Some(event)) => spawn_dispatch(&mut dispatches, event),
+                        Ok(Some(event)) => {
+                            // Acquire a concurrency permit BEFORE spawning: when every slot is busy
+                            // the loop parks here, the bounded channel fills, and the webhook
+                            // handler's `try_send` rejects with 503 — the documented backpressure
+                            // that was previously defeated by acquiring inside the spawned task.
+                            // Race shutdown so a full pool can't wedge a stop.
+                            let permit = tokio::select! {
+                                biased;
+                                () = shutdown.cancelled() => break,
+                                p = Arc::clone(&permits).acquire_owned() => {
+                                    let Ok(p) = p else {
+                                        tracing::error!(%kind, "dispatch semaphore closed; stopping trigger");
+                                        break;
+                                    };
+                                    p
+                                },
+                            };
+                            spawn_dispatch(&mut dispatches, Some(permit), event);
+                        }
                         Ok(None) => break,
                         Err(e) => {
                             tracing::error!(%kind, error = %e, "trigger stopped");
