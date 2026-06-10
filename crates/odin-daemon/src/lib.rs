@@ -32,7 +32,6 @@
 //!
 //! [`Trigger`]: odin_core::Trigger
 //! [`Engine`]: odin_core::Engine
-#![doc(html_root_url = "https://docs.rs/odin-daemon/0.0.1")]
 
 mod daemon;
 mod dashboard;

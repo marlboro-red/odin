@@ -11,8 +11,8 @@ use crate::error::StoreError;
 use crate::ids::{ArtifactName, RunId, StepId, WorkflowId};
 use crate::usage::Usage;
 
-/// Durable persistence for run state. The SQLite implementation lands in a later
-/// milestone; this trait is fixed now.
+/// Durable persistence for run state. The built-in SQLite implementation is
+/// [`crate::storage::SqliteStore`]; this trait is the pluggable contract.
 ///
 /// The contract is deliberately tiny: **checkpoint** the whole [`RunState`] at step
 /// boundaries, **append** events to an audit log, and **load incomplete** runs on

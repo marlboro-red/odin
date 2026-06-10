@@ -18,10 +18,11 @@ pub trait Workspace: Send + Sync {
     /// Registry key (e.g. `"worktree"` | `"slot_pool"`).
     fn kind(&self) -> &str;
 
-    /// Claims a workdir for a run. May block/queue if a finite pool is exhausted.
+    /// Claims a workdir for a run. **Blocks/queues** if a finite pool is exhausted (it waits for a
+    /// free slot rather than erroring).
     ///
     /// # Errors
-    /// Returns a [`WorkspaceError`] if provisioning fails (git error, pool exhausted).
+    /// Returns a [`WorkspaceError`] if provisioning fails (a git or I/O error).
     async fn acquire(&self, ctx: AcquireCtx) -> Result<WorkspaceHandle, WorkspaceError>;
 
     /// Releases/resets a previously acquired workspace. Idempotent.

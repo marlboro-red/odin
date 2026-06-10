@@ -413,8 +413,8 @@ external resource should do the same (query-before-create) to be resume-safe.
 ## Errors
 
 `odin_core::Result<T>` is `Result<T, Error>`. `Error` is a `#[non_exhaustive]` enum organized
-by phase — `Parse`, `Io`, `Validation(ValidationReport)`, `SchemaVersion`, `Input`,
-`Unregistered`, `Template`, `Unimplemented` — plus a transparent wrapper per trait
+by phase — `Parse`, `Io`, `Validation(ValidationReport)`, `SchemaVersion`, `Input`, `Template`
+— plus a transparent wrapper per trait
 (`Provider`/`Workspace`/`Store`/`Action`/`Trigger`Error). Each trait error has an
 `Other(#[from] anyhow::Error)` variant, so a custom impl can wrap arbitrary errors:
 

@@ -61,8 +61,8 @@ pub struct Workflow {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
 
-    /// Declared triggers. Empty = manual-only. Evaluation of non-manual triggers is a
-    /// later milestone; they parse and validate now.
+    /// Declared triggers. Empty = manual-only. Non-manual triggers (webhook/cron) are evaluated
+    /// by the `odind` daemon; the core engine runs manual invocations directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub triggers: Vec<TriggerDecl>,
 
