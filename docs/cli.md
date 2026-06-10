@@ -252,7 +252,8 @@ render, no SQLite access (so you can check a remote daemon you can't reach the d
 must be started with `--dashboard`. A non-2xx response surfaces the daemon's own message (e.g.
 `dashboard not enabled`); `--watch` tolerates a transient blip (a daemon restart) and keeps polling.
 
-**Exit:** `0` (incl. no database — `--json` still emits `[]`); `2` on a store error.
+**Exit:** `0` (incl. no database — `--json` still emits `[]`); `2` on a store error or, with `--url`,
+an HTTP/transport/parse failure (a 15 s per-request timeout bounds a stalled daemon).
 
 ---
 

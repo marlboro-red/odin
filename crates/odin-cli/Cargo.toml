@@ -26,6 +26,8 @@ serde_yaml_ng = "0.10.0"
 tokio = { version = "1.52.3", default-features = false, features = ["rt-multi-thread", "signal"] }
 tracing = "0.1.41"
 # A small blocking HTTP client for `odin status --url` (read a remote daemon's /api/runs).
+# Default features keep TLS (rustls) so `--url https://…` works for a daemon behind a proxy; the
+# daemon itself serves plain HTTP, so loopback/LAN use needs no TLS.
 ureq = "2.12"
 
 [dev-dependencies]
