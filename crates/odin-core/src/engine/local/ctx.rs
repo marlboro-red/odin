@@ -148,6 +148,36 @@ pub(crate) fn clip_tail(s: &str, max: usize) -> String {
     format!("…{}", &s[start..])
 }
 
+/// The maximum stdout persisted/exposed per step. Generous (1 MiB) so it never truncates a real
+/// agent answer or downstream-needed output, while bounding the run-state blob (and every later
+/// checkpoint's re-serialization of it) when a step emits pathologically large output.
+pub(crate) const STDOUT_MAX: usize = 1 << 20;
+
+/// Caps `s` to ~`max` bytes by keeping its HEAD and TAIL (both ends carry signal for a step's
+/// output) with a marker in the middle, on char boundaries. Used to bound a step's persisted
+/// `outputs.stdout`, which is otherwise re-serialized into the run-state blob at every later
+/// checkpoint.
+pub(crate) fn clip_middle(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_owned();
+    }
+    let half = max / 2;
+    let mut head_end = half.min(s.len());
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - half;
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n…[{omitted} bytes truncated]…\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
 /// The raw diagnostic `retry.feedback` surfaces: the un-wrapped `detail` (tail-capped to the most
 /// recent bytes, with no synthetic headline so its *first* line is real content), or the `headline`
 /// alone when there is no detail. Distinct from [`with_stderr_tail`], which keeps the headline for a
@@ -327,5 +357,36 @@ pub(crate) fn attempt_context(
     minijinja::context! {
         retry => minijinja::context! { attempt => attempt, feedback => fb },
         ..base.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clip_middle;
+
+    #[test]
+    fn clip_middle_keeps_short_output_whole() {
+        assert_eq!(clip_middle("hello", 1024), "hello");
+        assert_eq!(clip_middle("", 1024), "");
+    }
+
+    #[test]
+    fn clip_middle_keeps_head_and_tail_with_a_marker() {
+        let s = "A".repeat(100) + &"B".repeat(100);
+        let out = clip_middle(&s, 40);
+        assert!(out.starts_with("AAAAAAAAAAAAAAAAAAAA\n"), "keeps the head: {out:?}");
+        assert!(out.ends_with("\nBBBBBBBBBBBBBBBBBBBB"), "keeps the tail: {out:?}");
+        assert!(out.contains("bytes truncated"), "marks the omission: {out:?}");
+        // The omitted count is the gap between the kept head and tail.
+        assert!(out.contains("160 bytes truncated"), "{out:?}");
+    }
+
+    #[test]
+    fn clip_middle_respects_char_boundaries() {
+        // Multi-byte chars must not be split (no panic, valid UTF-8 out).
+        let s = "é".repeat(1000); // 2 bytes each
+        let out = clip_middle(&s, 101); // odd, lands mid-char without the boundary walk
+        assert!(out.is_char_boundary(0));
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
     }
 }

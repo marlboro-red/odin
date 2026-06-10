@@ -15,8 +15,8 @@ use indexmap::IndexMap;
 use serde_json::Value;
 
 use super::ctx::{
-    attempt_context, backoff_delay, effective_retry, failure_detail, join_streams, parse_score,
-    skipped_outcome, with_stderr_tail,
+    STDOUT_MAX, attempt_context, backoff_delay, clip_middle, effective_retry, failure_detail,
+    join_streams, parse_score, skipped_outcome, with_stderr_tail,
 };
 use super::{DIFF, LocalEngine, StepOutcome};
 use crate::api::{RunInput, StepStatus};
@@ -139,9 +139,12 @@ impl LocalEngine {
                 match provider.invoke(ictx).await {
                     Ok(o) => {
                         let mut outputs = o.outputs;
+                        // Cap the persisted/exposed stdout so a runaway agent can't bloat the
+                        // run-state blob (re-serialized at every later checkpoint). 1 MiB is far
+                        // beyond any real answer, so this only bites pathological output.
                         outputs
                             .entry("stdout".to_owned())
-                            .or_insert(Value::String(o.stdout));
+                            .or_insert(Value::String(clip_middle(&o.stdout, STDOUT_MAX)));
                         let mut outcome = StepOutcome::passing(o.exit_code, outputs, o.usage);
                         outcome.stderr = o.stderr;
                         outcome
@@ -161,7 +164,10 @@ impl LocalEngine {
                 {
                     Ok((code, stdout, stderr)) => {
                         let mut outputs = IndexMap::new();
-                        outputs.insert("stdout".to_owned(), Value::String(stdout));
+                        outputs.insert(
+                            "stdout".to_owned(),
+                            Value::String(clip_middle(&stdout, STDOUT_MAX)),
+                        );
                         let mut outcome = StepOutcome::passing(code, outputs, None);
                         outcome.stderr = stderr;
                         outcome
