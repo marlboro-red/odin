@@ -114,18 +114,18 @@ impl LocalEngine {
                     Ok(s) => s,
                     Err(e) => return StepOutcome::failed(e),
                 };
-                tracing::debug!(
-                    step = %step.id,
-                    provider = %p.provider.as_str(),
-                    prompt_bytes = prompt.len(),
-                    "invoking provider"
-                );
                 let Some(provider) = self.registry.provider(p.provider.as_str()).cloned() else {
                     return StepOutcome::failed(format!(
                         "provider {:?} is not registered",
                         p.provider.as_str()
                     ));
                 };
+                tracing::debug!(
+                    step = %step.id,
+                    provider = %p.provider.as_str(),
+                    prompt_bytes = prompt.len(),
+                    "invoking provider"
+                );
                 let inputs = step
                     .artifacts
                     .requires
@@ -558,8 +558,9 @@ impl LocalEngine {
         outcome
     }
 
-    /// Runs a shell command in `workdir`, returning `(exit_code, stdout, stderr)`. With a
-    /// `stream` sink (the `--stream` view) the command's output is teed to the terminal live.
+    /// Runs a shell command in `workdir`, returning the full [`ProcessOutput`] (exit code, captured
+    /// streams, and the `timed_out`/`cancelled` flags the callers use to report *why* a step was
+    /// killed). With a `stream` sink (the `--stream` view) the output is teed to the terminal live.
     async fn shell(
         &self,
         command: &str,
@@ -567,7 +568,7 @@ impl LocalEngine {
         timeout: Option<Duration>,
         cancel: &CancelToken,
         stream: Option<&StreamSink>,
-    ) -> Result<crate::provider::process::ProcessOutput> {
+    ) -> Result<ProcessOutput> {
         let opts = ProcessOptions {
             workdir: Some(workdir.to_path_buf()),
             timeout,
@@ -653,9 +654,15 @@ impl LocalEngine {
 
 /// Why a subprocess was killed, for the step failure headline — so a timed-out or cancelled
 /// `run:`/gate step reads "timed out after 30s" / "cancelled" instead of the bare, misleading
-/// "exited with code -1" the synthetic exit code would otherwise produce. `None` for a normal
-/// (non-zero) exit, which the caller reports as usual.
+/// "exited with code -1" the synthetic exit code would otherwise produce.
+///
+/// Returns `None` when the child exited cleanly (`exit_code == 0`) even though a kill was issued —
+/// a race where the process finished right as the timeout/cancel fired counts as success, NOT a
+/// timeout. Both the `run:` and gate handlers consult this, so they agree on that boundary.
 fn killed_reason(out: &ProcessOutput, timeout: Option<Duration>) -> Option<String> {
+    if out.exit_code == 0 {
+        return None; // finished cleanly before/as the kill landed — not a timeout/cancel
+    }
     if out.timed_out {
         Some(match timeout {
             Some(d) => format!("timed out after {d:?}"),

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use odin_core::ir::TriggerDecl;
 use odin_core::traits::TriggerEvent;
-use odin_core::{Engine, PrunePolicy, RunStatus, Trigger, Workflow, WorkflowId};
+use odin_core::{Engine, PrunePolicy, Trigger, Workflow, WorkflowId};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -362,19 +362,13 @@ async fn dispatch(
     };
     tracing::info!("dispatching run");
     match engine.run(workflow, event.input).await {
-        // A failed run from a trigger is a WARN here (the engine already logged the ERROR with the
-        // terminal reason); the unattended daemon shouldn't have a failed webhook/cron run vanish
-        // into INFO. A clean finish stays INFO.
-        Ok(summary) if summary.status == RunStatus::Failed => tracing::warn!(
-            run_id = %summary.run_id,
-            status = ?summary.status,
-            "triggered run failed"
-        ),
+        // The engine already logs the run's terminal outcome at the right level (a failed run at
+        // ERROR with its reason), so just note the dispatch result at INFO here — no duplicate WARN.
         Ok(summary) => tracing::info!(
             run_id = %summary.run_id,
             status = ?summary.status,
-            "run finished"
+            "dispatched run finished"
         ),
-        Err(e) => tracing::error!(error = %e, "run failed"),
+        Err(e) => tracing::error!(error = %e, "dispatch returned an error"),
     }
 }
