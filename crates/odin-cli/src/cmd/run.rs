@@ -39,7 +39,18 @@ pub(crate) fn run(args: RunArgs) -> anyhow::Result<ExitCode> {
     let workflow = match Workflow::from_yaml_str(&src) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("✗ {}: parse error\n  {e}", file.display());
+            if args.json {
+                // Same envelope as `odin validate --json` so a `run --json` consumer never gets
+                // empty stdout on a malformed workflow.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::cmd::validate::json_parse_envelope(
+                        &e.to_string()
+                    ))?
+                );
+            } else {
+                eprintln!("✗ {}: parse error\n  {e}", file.display());
+            }
             return Ok(ExitCode::from(2));
         }
     };
@@ -157,14 +168,25 @@ async fn execute(workflow: &Workflow, args: RunArgs) -> anyhow::Result<ExitCode>
             })
         }
         Err(Error::Validation(report)) => {
-            for diagnostic in &report.diagnostics {
-                eprintln!("{diagnostic}\n");
+            if args.json {
+                // Emit the same `{ok:false, phase:"validate", diagnostics, error}` shape as
+                // `odin validate --json`, so `run --json` is parseable on a validation failure too.
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&crate::cmd::validate::json_validation_envelope(
+                        &report
+                    ))?
+                );
+            } else {
+                for diagnostic in &report.diagnostics {
+                    eprintln!("{diagnostic}\n");
+                }
+                eprintln!(
+                    "✗ {}: {} error(s)",
+                    args.file.display(),
+                    report.error_count()
+                );
             }
-            eprintln!(
-                "✗ {}: {} error(s)",
-                args.file.display(),
-                report.error_count()
-            );
             Ok(ExitCode::from(1))
         }
         Err(e) => {

@@ -21,12 +21,10 @@ pub(crate) fn run(arg: &Path, recipes_dir: Option<&Path>, json: bool) -> anyhow:
         Ok(wf) => wf,
         Err(e) => {
             if json {
-                let obj = serde_json::json!({
-                    "ok": false,
-                    "phase": "parse",
-                    "error": e.to_string(),
-                });
-                println!("{}", serde_json::to_string_pretty(&obj)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json_parse_envelope(&e.to_string()))?
+                );
             } else {
                 eprintln!("✗ {}: parse error", file.display());
                 eprintln!("  {e}");
@@ -38,7 +36,10 @@ pub(crate) fn run(arg: &Path, recipes_dir: Option<&Path>, json: bool) -> anyhow:
     let report = validate_source(&src, &wf, &KnownNames::builtin());
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_validation_envelope(&report))?
+        );
     } else {
         print_human(file, &report);
     }
@@ -47,6 +48,29 @@ pub(crate) fn run(arg: &Path, recipes_dir: Option<&Path>, json: bool) -> anyhow:
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    })
+}
+
+/// The unified `--json` envelope for a validation result: `{ ok, phase: "validate", diagnostics,
+/// error: null }`. Shared with `odin run --json` so both emit the same shape on a validation
+/// failure. `ok` is true iff there are no error-severity diagnostics (warnings keep `ok: true`).
+pub(crate) fn json_validation_envelope(report: &ValidationReport) -> serde_json::Value {
+    serde_json::json!({
+        "ok": !report.has_errors(),
+        "phase": "validate",
+        "diagnostics": &report.diagnostics,
+        "error": serde_json::Value::Null,
+    })
+}
+
+/// The unified `--json` envelope for a parse failure: `{ ok: false, phase: "parse", diagnostics:
+/// [], error }`. Same top-level keys as [`json_validation_envelope`] so one consumer handles both.
+pub(crate) fn json_parse_envelope(error: &str) -> serde_json::Value {
+    serde_json::json!({
+        "ok": false,
+        "phase": "parse",
+        "diagnostics": [],
+        "error": error,
     })
 }
 

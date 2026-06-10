@@ -21,6 +21,9 @@ pub(crate) struct ApprovalArgs {
     pub rerun: bool,
     pub repo: Option<PathBuf>,
     pub db: Option<PathBuf>,
+    /// Emit the resulting `RunSummary` (or `RerunOutcome`) as JSON on stdout instead of the
+    /// human summary, so an approval bot can parse the outcome.
+    pub json: bool,
 }
 
 /// Approves the run's pending gate and resumes it.
@@ -83,6 +86,7 @@ fn resolve(args: &ApprovalArgs) -> anyhow::Result<Resolved> {
 }
 
 fn submit(decision: Decision, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
+    let json = args.json;
     let r = resolve(&args)?;
     let result = r.runtime.block_on(r.engine.submit_approval(
         r.run_id,
@@ -93,7 +97,11 @@ fn submit(decision: Decision, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
     ));
     match result {
         Ok(Some(summary)) => {
-            crate::cmd::run::print_summary(&summary);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                crate::cmd::run::print_summary(&summary);
+            }
             Ok(exit_for(summary.status))
         }
         Ok(None) => {
@@ -108,6 +116,7 @@ fn submit(decision: Decision, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
 }
 
 fn reject_rerun(note: String, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
+    let json = args.json;
     let r = resolve(&args)?;
     let result = r.runtime.block_on(r.engine.reject_and_rerun(
         r.run_id,
@@ -117,9 +126,14 @@ fn reject_rerun(note: String, args: ApprovalArgs) -> anyhow::Result<ExitCode> {
     ));
     match result {
         Ok(Some(outcome)) => {
-            crate::cmd::run::print_summary(&outcome.rejected);
-            println!("↻ rerunning as {} with your feedback", outcome.rerun.run_id);
-            crate::cmd::run::print_summary(&outcome.rerun);
+            if json {
+                // `{ "rejected": RunSummary, "rerun": RunSummary }`.
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            } else {
+                crate::cmd::run::print_summary(&outcome.rejected);
+                println!("↻ rerunning as {} with your feedback", outcome.rerun.run_id);
+                crate::cmd::run::print_summary(&outcome.rerun);
+            }
             // The rerun's outcome is the actionable one (it may pause again at the gate).
             Ok(exit_for(outcome.rerun.status))
         }

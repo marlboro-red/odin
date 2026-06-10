@@ -25,10 +25,13 @@ Wherever a command takes a workflow `<FILE>`, you can give a **recipe name** ins
 name is resolved against the [recipe catalog](#odin-recipe-subcommand) when no file exists at
 that path. An existing file path always wins.
 
-Every command takes `--json` for machine-readable output on **stdout**. A command's normal
-report — including `validate`'s diagnostics, errors and all — also goes to stdout. Failures go
-to **stderr**: `validate`/`run` print `✗ <file>: parse error` on a malformed file, while an
-I/O error, a bad UUID, or a store error prints an `error: …` line. Either way the process
+Every command that produces a result takes `--json` for machine-readable output on **stdout** —
+`validate`, `run`, `list`, `show`, `logs`, `status`, `prune`, `recipe list`, **`approve`**,
+**`reject`**, and **`cancel`** (the `recipe init/add/show/path/new` management commands have no
+`--json`). On a **validation or parse failure**, `validate --json` and `run --json` both emit the
+same envelope on stdout — `{ "ok": false, "phase": "validate" | "parse", "diagnostics": [...],
+"error": <string|null> }` — so a script never gets empty stdout. Diagnostics and `error` go to
+**stderr** in the non-`--json` mode (`✗ <file>: parse error`, `error: …`); either way the process
 exits non-zero.
 
 ---
@@ -54,8 +57,11 @@ warning[ODIN023]: on_fallback_provider is declared but routing/fallback is not i
 ✓ examples/fix-flaky-test.yaml is valid (1 warning(s))
 ```
 
-`--json` emits the full [`ValidationReport`](#json-shapes) (or, on a parse failure, a
-`{"ok": false, "phase": "parse", "error": "…"}` object).
+`--json` emits a single envelope: `{ "ok": <bool>, "phase": "validate" | "parse", "diagnostics":
+[ <diagnostic>, … ], "error": <string|null> }` — `ok` is true iff there are no error-severity
+diagnostics (warnings keep it true), `phase` is `parse` for a malformed file (with `error` set and
+`diagnostics: []`), else `validate`. `odin run --json` emits the **same** shape on a validation/parse
+failure.
 
 **Exit codes:** `0` valid (warnings are OK), `1` validation errors, `2` parse error or file
 I/O error.
@@ -255,6 +261,7 @@ odin reject  <RUN_ID> --workflow <FILE> --by bob   --note "handle empty input to
 | `--by <NAME>` | Who is deciding (recorded for the audit trail; default `cli`). |
 | `--note <TEXT>` | Free-text note. **Required** on `reject` — it's the feedback, surfaced as `steps.<gate>.outputs.feedback`. |
 | `--rerun` | (`reject` only) After failing the gate, start a **fresh run** of the workflow carrying the note as the `feedback` param. |
+| `--json` | Emit the resulting `RunSummary` (or, with `--rerun`, `{ "rejected": …, "rerun": … }`) as JSON on stdout, for an approval bot. |
 | `--repo` / `--db` | Database location (as above). |
 
 **Approve** resumes the run (it continues to completion, or pauses again at a later gate).
@@ -286,7 +293,7 @@ these commands.
 
 ---
 
-## `odin cancel <RUN_ID> [--repo DIR | --db FILE]`
+## `odin cancel <RUN_ID> [--repo DIR | --db FILE] [--json]`
 
 Requests cancellation of an **in-flight** run. Because the run may be executing inside a separate
 `odind` process (whose in-memory cancel tokens this command can't reach), the request is written to
@@ -296,8 +303,12 @@ seconds. Only **durable** runs (which have a store row) can be cancelled this wa
 `odin run` is instead stopped with ctrl-C.
 
 ```sh
-odin cancel 6f1c…   # → ⏹ cancel requested for run 6f1c…
+odin cancel 6f1c…          # → ⏹ cancel requested for run 6f1c…
+odin cancel 6f1c… --json   # → {"run_id":"6f1c…","requested":true}
 ```
+
+`--json` emits `{ "run_id": …, "requested": <bool> }` on stdout (`requested: false` + exit `2`
+when no cancellable run with that id exists).
 
 Exit codes: `0` requested; `2` no cancellable (non-terminal) run with that id, or a store error.
 
@@ -418,8 +429,9 @@ available), the catalog directory can't be resolved/created, or a file can't be 
   [`GET /api/runs`](daemon.md#dashboard) returns (and `/api/runs/{id}` adds `"diff"` + `"error"`),
   so one schema serves the CLI, the API, and the dashboard.
 
-Statuses serialize snake_case (`pending`, `running`, `succeeded`, `failed`, `cancelled` for a
-run; `pending`, `running`, `passed`, `failed`, `skipped` for a step). `cost_micros` is integer micro-dollars (cost is display-only; the engine never
+Statuses serialize snake_case (`pending`, `running`, `awaiting_approval`, `succeeded`, `failed`,
+`cancelled` for a run; `pending`, `running`, `awaiting_approval`, `passed`, `failed`, `skipped` for
+a step). A run that paused at an approval gate exits `0` (it's awaiting input, not a failure). `cost_micros` is integer micro-dollars (cost is display-only; the engine never
 loses precision to floats).
 
 ---
@@ -429,3 +441,43 @@ loses precision to floats).
 A `run:`-only or action-only workflow executes with no API cost. A `provider:` step invokes
 the real agent CLI (`claude` / `codex` / `copilot`), which must be installed, on `PATH`, and
 authenticated. Pin a provider per step with `provider:` and a judge with `judge.provider`.
+
+---
+
+## In CI (GitHub Actions, etc.)
+
+Every read/run/mutation command is scriptable, so wrapping Odin in CI is just download → run →
+parse. A minimal job that runs a workflow and fails the build if any step failed:
+
+```yaml
+# .github/workflows/odin.yml
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install odin
+        run: |
+          TAG=v0.0.5
+          TARGET=x86_64-unknown-linux-gnu
+          base="https://github.com/marlboro-red/odin/releases/download/$TAG"
+          curl -fsSLO "$base/odin-$TAG-$TARGET.tar.gz"
+          curl -fsSLO "$base/odin-$TAG-$TARGET.tar.gz.sha256"
+          sha256sum -c "odin-$TAG-$TARGET.tar.gz.sha256"   # verify the checksum sidecar
+          tar -xzf "odin-$TAG-$TARGET.tar.gz" && sudo mv odin odind /usr/local/bin/
+      - name: Run a workflow
+        run: |
+          # `--mock` runs provider steps without a real agent CLI (drop it for a real run).
+          odin run examples/quickstart.yaml --repo . --no-store --mock --json > summary.json
+          jq -e '.status == "succeeded"' summary.json   # non-zero exit fails the job
+          jq -r '.side_effects[]?' summary.json          # surface PRs/branches pushed, if any
+```
+
+Notes for scripting:
+
+- **Exit codes** are stable per command (see each command above): `0` success / awaiting-approval,
+  `1` run-failed or workflow-invalid, `2` parse/IO/store error or unknown run.
+- On a **validation/parse failure**, `run --json` and `validate --json` emit the
+  `{ ok, phase, diagnostics, error }` envelope on stdout — check `.ok` before trusting a result.
+- `--json` keeps **stdout pure** (logs and the `--stream` view go to stderr), so `… --json | jq …`
+  is always safe.

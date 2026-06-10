@@ -18,6 +18,8 @@ pub(crate) struct CancelArgs {
     pub run_id: String,
     pub repo: Option<PathBuf>,
     pub db: Option<PathBuf>,
+    /// Emit `{"run_id":…,"requested":bool}` on stdout instead of the human line.
+    pub json: bool,
 }
 
 /// Records a cross-process cancel request for the run.
@@ -31,7 +33,19 @@ pub(crate) fn cancel(args: CancelArgs) -> anyhow::Result<ExitCode> {
     let store = SqliteStore::open(&db).context("opening the run state database")?;
     let runtime = Runtime::new().context("starting the async runtime")?;
 
-    if runtime.block_on(store.request_cancel(run_id))? {
+    let requested = runtime.block_on(store.request_cancel(run_id))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({ "run_id": run_id.to_string(), "requested": requested })
+        );
+        return Ok(if requested {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        });
+    }
+    if requested {
         println!(
             "⏹ cancel requested for run {run_id}; if it is running it will stop within a few \
              seconds (terminally cancelled)"
