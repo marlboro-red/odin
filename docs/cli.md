@@ -232,9 +232,10 @@ glyph, short id, workflow, step progress, and age; an awaiting-approval run show
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--repo` / `--db` | `.` / `<repo>/.odin/state.db` | Database location (as above). |
+| `--repo` / `--db` | `.` / `<repo>/.odin/state.db` | Local database location (as above). |
+| `--url <URL>` | — | Read from a **remote** `odind`'s dashboard API (`GET <URL>/api/runs`) instead of a local store — e.g. `--url http://127.0.0.1:9292`. Conflicts with `--repo`/`--db`. |
 | `--limit <N>` | `20` | Maximum number of runs to show. |
-| `--watch` | off | Live-refresh every 2 s until `ctrl-c`. |
+| `--watch` | off | Live-refresh every 2 s until `ctrl-c` (re-polls the store or the `--url` daemon). |
 | `--json` | off | Emit the runs as JSON — the same [`RunView`](#json-shapes) shape as the daemon's `/api/runs`. |
 
 ```text
@@ -246,7 +247,13 @@ glyph, short id, workflow, step progress, and age; an awaiting-approval run show
 ✗ failed    c4d5a6b7 fix-flaky            1/3    5m
 ```
 
-**Exit:** `0` (incl. no database — `--json` still emits `[]`); `2` on a store error.
+`--url` makes `odin status` a thin client for the [daemon dashboard](daemon.md#dashboard): same
+render, no SQLite access (so you can check a remote daemon you can't reach the disk of). The daemon
+must be started with `--dashboard`. A non-2xx response surfaces the daemon's own message (e.g.
+`dashboard not enabled`); `--watch` tolerates a transient blip (a daemon restart) and keeps polling.
+
+**Exit:** `0` (incl. no database — `--json` still emits `[]`); `2` on a store error or, with `--url`,
+an HTTP/transport/parse failure (a 15 s per-request timeout bounds a stalled daemon).
 
 ---
 
