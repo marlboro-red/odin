@@ -195,9 +195,13 @@ impl From<PruneCmd> for cmd::prune::PruneArgs {
 struct ApprovalCmd {
     /// The run id (UUID) of the paused run.
     run_id: String,
-    /// The workflow file the run was started from (needed to resume).
+    /// The workflow the run was started from (needed to resume): a path to a YAML file, or a
+    /// recipe name in the catalog (the same as `odin run` accepts).
     #[arg(long)]
     workflow: PathBuf,
+    /// Override the recipe catalog directory used to resolve a `--workflow` name.
+    #[arg(long, value_name = "DIR")]
+    recipes_dir: Option<PathBuf>,
     /// Who is approving/rejecting (recorded for the audit trail).
     #[arg(long, default_value = "cli")]
     by: String,
@@ -221,6 +225,7 @@ impl From<ApprovalCmd> for cmd::approval::ApprovalArgs {
         Self {
             run_id: c.run_id,
             workflow: c.workflow,
+            recipes_dir: c.recipes_dir,
             by: c.by,
             note: c.note,
             rerun: c.rerun,

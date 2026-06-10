@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN044`).
+(`ODIN001`–`ODIN045`).
 
 Two phases govern a workflow file, and it helps to keep them distinct:
 
@@ -60,6 +60,7 @@ steps:                           # REQUIRED — the DAG
 | `name` | string | **yes** | — | Stable identity and display name of the workflow. |
 | `version` | string | no | — | *Your* semantic version of the workflow content. Opaque to the engine. |
 | `description` | string | no | — | Free-text description. |
+| `tags` | list of strings | no | `[]` | Opaque labels for catalog filtering (`odin recipe list --tag`). Normalized (trimmed/lowercased); a malformed entry warns ([ODIN045](#odin045)). |
 | `durable` | bool | no | `true` | Checkpoint runs to the [store](#durability--resume) so a crashed run resumes. |
 | `workspace` | [`WorkspaceConfig`](#workspaces) | no | `{ type: worktree }` | How each run's working directory is provisioned. |
 | `max_parallel` | integer ≥ 1 | no | `1` | Max steps running at once within a run. `1` (or omitted) is sequential. See [concurrency](#concurrency). |
@@ -542,7 +543,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN044`)
+## Diagnostics catalogue (`ODIN001`–`ODIN045`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -593,6 +594,7 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin042"></a>ODIN042 | **warning** | A `loop:` node carries its own `gates:`/`judge:`/`scratch:` — inert; a loop's verification is its `until` over the body. |
 | <a id="odin043"></a>ODIN043 | error | A `loop:` body step sets `scratch: true` — unsupported; the body runs sequentially on the shared workdir, so the step's edits would vanish into a throwaway worktree. |
 | <a id="odin044"></a>ODIN044 | **warning** | A `durable: true` workflow uses a `slot_pool` workspace — its lease state is in-memory and lost on restart, so a resumed run may race another for its slot; prefer `worktree`. |
+| <a id="odin045"></a>ODIN045 | **warning** | A `tags:` entry was malformed and dropped (empty after trimming), or normalized (case/whitespace), so the parsed workflow no longer shows the original token. |
 
 ¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
 

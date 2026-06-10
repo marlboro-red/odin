@@ -77,11 +77,13 @@ pass `--webhook-allow-unsigned`):
 ```sh
 export ODIN_WEBHOOK_SECRET=$(openssl rand -hex 32)
 
+# --repo .   the git repo runs provision worktrees from
+# --dashboard   serve the approve/status page at http://127.0.0.1:9292/
 target/release/odind \
   --workflows ~/odin-prod/workflows \
-  --repo .                       \  # the git repo runs provision worktrees from
-  --webhook-addr 127.0.0.1:9292  \
-  --dashboard                       # serve the approve/status page at http://127.0.0.1:9292/
+  --repo . \
+  --webhook-addr 127.0.0.1:9292 \
+  --dashboard
 ```
 
 You should see:

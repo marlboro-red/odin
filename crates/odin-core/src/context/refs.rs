@@ -376,8 +376,9 @@ fn check_var(
             DiagCode::TriggerIntoShell,
             pointer.to_owned(),
             "interpolates an untrusted trigger payload (`trigger.*`) into a shell command; \
-             a webhook-supplied value reaches `sh -c` unescaped (injection risk). Map the \
-             fields you trust into typed params and reference those instead"
+             a webhook-supplied value reaches `sh -c` unescaped (injection risk). Shell-quote \
+             it with the `| shquote` filter (e.g. `{{ trigger.x | shquote }}`), which wraps the \
+             value as one inert shell word"
                 .to_owned(),
         ));
     }

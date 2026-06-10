@@ -15,6 +15,7 @@ use tokio::runtime::Runtime;
 pub(crate) struct ApprovalArgs {
     pub run_id: String,
     pub workflow: PathBuf,
+    pub recipes_dir: Option<PathBuf>,
     pub by: String,
     pub note: Option<String>,
     pub rerun: bool,
@@ -54,10 +55,13 @@ struct Resolved {
 fn resolve(args: &ApprovalArgs) -> anyhow::Result<Resolved> {
     let run_id = RunId::from_str(&args.run_id)
         .map_err(|_| anyhow::anyhow!("invalid run id {:?}", args.run_id))?;
-    let src = std::fs::read_to_string(&args.workflow)
-        .with_context(|| format!("reading {}", args.workflow.display()))?;
+    // Accept a recipe name as well as a file path for `--workflow`, matching `odin run` — so a run
+    // started by name (`odin run gated-deploy`) can be approved by name too.
+    let file = crate::catalog::resolve_arg(&args.workflow, args.recipes_dir.as_deref())?;
+    let src = std::fs::read_to_string(&file)
+        .with_context(|| format!("reading {}", file.display()))?;
     let workflow = Workflow::from_yaml_str(&src)
-        .map_err(|e| anyhow::anyhow!("{}: parse error\n  {e}", args.workflow.display()))?;
+        .map_err(|e| anyhow::anyhow!("{}: parse error\n  {e}", file.display()))?;
 
     let repo = args.repo.clone().unwrap_or_else(|| PathBuf::from("."));
     let db = args

@@ -226,11 +226,12 @@ do not.
 | ODIN042 | warning | a `loop:` node carries its own inert `gates:`/`judge:`/`scratch:` |
 | ODIN043 | error | a `loop:` body step sets `scratch: true` (unsupported; the body runs sequentially on the shared workdir) |
 | ODIN044 | warning | a `durable:` workflow uses a `slot_pool` workspace (in-memory lease state is lost on restart; prefer `worktree`) |
+| ODIN045 | warning | a `tags:` entry was malformed (dropped/normalized), so the parsed workflow no longer shows the original token |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
 nested fields, invalid durations, and a step with zero or more than one kind. The full
 per-field catalogue with exact trigger conditions is in the
-[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin042).
+[workflow reference](workflow-reference.md#diagnostics-catalogue-odin001odin045).
 
 ## Concurrency
 
@@ -341,7 +342,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Status
 
-**Implemented & tested:** the workflow IR; the validator (44 diagnostics); the
+**Implemented & tested:** the workflow IR; the validator (45 diagnostics); the
 templating/context model; the five integration traits + registry; the SQLite `Store`; the
 worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
 (subprocess management, version/health checks, token-usage parsing); the built-in `Action`s

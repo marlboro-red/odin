@@ -20,7 +20,29 @@ pub fn build_context<T: Serialize>(value: &T) -> Value {
 fn strict_env() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_undefined_behavior(UndefinedBehavior::Strict);
+    // `shquote`: shell-quote an untrusted value for safe interpolation into a `sh -c` command.
+    env.add_filter("shquote", shquote);
     env
+}
+
+/// Shell-quotes a value for safe interpolation into a POSIX `sh -c` command: wraps it in single
+/// quotes and escapes any embedded single quote (`'` -> `'\''`), so an attacker-influenced value —
+/// a webhook payload field mapped into a param, or a step's raw agent stdout — becomes one inert
+/// shell *word* instead of executable syntax. Use it on any untrusted value in a `run:`/gate
+/// command, e.g. `run: "echo {{ params.title | shquote }}"`.
+fn shquote(value: &minijinja::Value) -> String {
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Renders a template string against `ctx`.
@@ -85,6 +107,19 @@ mod tests {
     fn undefined_reference_is_an_error() {
         let ctx = build_context(&json!({ "params": {} }));
         assert!(render_template("{{ params.missing }}", &ctx, "test").is_err());
+    }
+
+    #[test]
+    fn shquote_neutralizes_shell_metacharacters() {
+        let ctx = build_context(&json!({ "params": { "title": "$(rm -rf /); `whoami`" } }));
+        let out = render_template("echo {{ params.title | shquote }}", &ctx, "test").unwrap();
+        // The whole value is wrapped in single quotes, so nothing is a command substitution.
+        assert_eq!(out, "echo '$(rm -rf /); `whoami`'");
+
+        // An embedded single quote is escaped so it can't terminate the quoting and break out.
+        let ctx = build_context(&json!({ "params": { "x": "a'b; rm -rf /" } }));
+        let out = render_template("echo {{ params.x | shquote }}", &ctx, "test").unwrap();
+        assert_eq!(out, r"echo 'a'\''b; rm -rf /'");
     }
 
     #[test]
