@@ -494,6 +494,13 @@ fn json_err(status: StatusCode, code: &str, message: impl Into<String>) -> Respo
         .into_response()
 }
 
+/// Counts one webhook delivery outcome on the metrics registry (a no-op when metrics are off).
+fn count_webhook(state: &AppState, result: crate::metrics::WebhookResult) {
+    if let Some(m) = &state.metrics {
+        m.record_webhook(result);
+    }
+}
+
 #[allow(clippy::unused_async)] // axum route handlers must be async.
 async fn handle_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
@@ -783,6 +790,7 @@ async fn handle_webhook(
     };
     if let Some(rejection) = verify_signature(state.secret.as_deref(), &headers, &body, sig_header)
     {
+        count_webhook(&state, crate::metrics::WebhookResult::Rejected);
         return rejection;
     }
 
@@ -790,6 +798,7 @@ async fn handle_webhook(
         Ok(value) => value,
         Err(e) => {
             tracing::warn!(error = %e, "webhook: rejecting invalid JSON body");
+            count_webhook(&state, crate::metrics::WebhookResult::Rejected);
             return json_err(StatusCode::BAD_REQUEST, "invalid_json", "invalid JSON body");
         }
     };
@@ -839,6 +848,7 @@ async fn handle_webhook(
             matched,
         )
     } else {
+        count_webhook(&state, crate::metrics::WebhookResult::Rejected);
         json_err(
             StatusCode::BAD_REQUEST,
             "missing_event_header",
@@ -882,6 +892,7 @@ fn dispatch_webhook(
     // deliveries of one id both enqueuing (a duplicate run), never a dropped one.
     if delivery != "?" && dedup(state).contains(delivery) {
         tracing::info!(%delivery, "webhook: duplicate delivery ignored");
+        count_webhook(state, crate::metrics::WebhookResult::Duplicate);
         return (
             StatusCode::OK,
             Json(serde_json::json!({ "status": "duplicate", "matched": [] })),
@@ -916,6 +927,7 @@ fn dispatch_webhook(
             %label, %delivery, dropped, matched = total,
             "webhook: enqueue(s) failed; returning 503 so the sender retries"
         );
+        count_webhook(state, crate::metrics::WebhookResult::Rejected);
         return json_err(
             StatusCode::SERVICE_UNAVAILABLE,
             "queue_full",
@@ -926,6 +938,7 @@ fn dispatch_webhook(
     if delivery != "?" {
         dedup(state).record(delivery);
     }
+    count_webhook(state, crate::metrics::WebhookResult::Accepted);
     tracing::info!(%label, %delivery, matched = total, "webhook: delivery accepted");
     (
         StatusCode::ACCEPTED,
