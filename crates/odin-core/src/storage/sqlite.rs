@@ -297,14 +297,13 @@ impl Store for SqliteStore {
         let conn = self.conn.lock().await;
         // Only mark a run that exists and is NOT terminal — a finished run can't be cancelled, and
         // an unknown id should report "not found" rather than leave an orphan signal.
-        let cancellable: bool = db(conn.query_row(
-            &format!(
-                "SELECT 1 FROM runs WHERE run_id = ?1 AND status NOT IN ({in_terminal})"
-            ),
-            params_from_iter(std::iter::once(id.clone()).chain(terminal)),
-            |_| Ok(true),
-        )
-        .optional())?
+        let cancellable: bool = db(conn
+            .query_row(
+                &format!("SELECT 1 FROM runs WHERE run_id = ?1 AND status NOT IN ({in_terminal})"),
+                params_from_iter(std::iter::once(id.clone()).chain(terminal)),
+                |_| Ok(true),
+            )
+            .optional())?
         .unwrap_or(false);
         if cancellable {
             db(conn.execute(
@@ -794,7 +793,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(has_index, "the recent() list query must have an updated_at index");
+        assert!(
+            has_index,
+            "the recent() list query must have an updated_at index"
+        );
     }
 
     #[tokio::test]

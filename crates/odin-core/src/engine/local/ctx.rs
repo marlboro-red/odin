@@ -374,9 +374,18 @@ mod tests {
     fn clip_middle_keeps_head_and_tail_with_a_marker() {
         let s = "A".repeat(100) + &"B".repeat(100);
         let out = clip_middle(&s, 40);
-        assert!(out.starts_with("AAAAAAAAAAAAAAAAAAAA\n"), "keeps the head: {out:?}");
-        assert!(out.ends_with("\nBBBBBBBBBBBBBBBBBBBB"), "keeps the tail: {out:?}");
-        assert!(out.contains("bytes truncated"), "marks the omission: {out:?}");
+        assert!(
+            out.starts_with("AAAAAAAAAAAAAAAAAAAA\n"),
+            "keeps the head: {out:?}"
+        );
+        assert!(
+            out.ends_with("\nBBBBBBBBBBBBBBBBBBBB"),
+            "keeps the tail: {out:?}"
+        );
+        assert!(
+            out.contains("bytes truncated"),
+            "marks the omission: {out:?}"
+        );
         // The omitted count is the gap between the kept head and tail.
         assert!(out.contains("160 bytes truncated"), "{out:?}");
     }

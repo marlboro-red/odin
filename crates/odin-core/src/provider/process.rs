@@ -6,9 +6,9 @@
 //! child is killed and reaped; partial output captured so far is still returned.
 //!
 //! On Unix the child is spawned in its own process group, so termination SIGKILLs the whole
-//! group (the agent CLI plus any tool/`sh -c` grandchildren) via the `kill` binary — the crate is
-//! `unsafe`-forbidden, so it can't call `libc::killpg` directly (see `kill_tree`). A graceful
-//! SIGINT-then-SIGKILL escalation remains a deliberate later refinement.
+//! group (the agent CLI plus any tool/`sh -c` grandchildren) via `rustix`'s safe `killpg` — the
+//! crate is `unsafe`-forbidden, so it can't call `libc::killpg` directly (see `kill_tree`). A
+//! graceful SIGINT-then-SIGKILL escalation remains a deliberate later refinement.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -426,11 +426,11 @@ pub async fn run_process(
     let (timed_out, cancelled, status) = match waited {
         Wait::Done(s) => (false, false, Some(s)),
         Wait::Timeout => {
-            kill_tree(&mut child).await;
+            kill_tree(&mut child);
             (true, false, child.wait().await.ok())
         }
         Wait::Cancel => {
-            kill_tree(&mut child).await;
+            kill_tree(&mut child);
             (false, true, child.wait().await.ok())
         }
     };
@@ -481,23 +481,21 @@ where
 }
 
 /// Kills a timed-out/cancelled child **and its descendants**. On Unix the child leads its own
-/// process group (`process_group(0)` at spawn), so one SIGKILL to the negated group id reaps the
-/// agent CLI's tool subprocesses and `sh -c` grandchildren too — which would otherwise survive the
-/// direct-child kill and keep running (and writing into the workspace). We shell out to `kill`
-/// because the crate forbids `unsafe`, so it can't call `libc::killpg` directly; `start_kill` is a
-/// belt-and-suspenders fallback (and the only step on non-Unix).
-async fn kill_tree(child: &mut tokio::process::Child) {
+/// process group (`process_group(0)` at spawn), so one `killpg(SIGKILL)` reaps the agent CLI's tool
+/// subprocesses and `sh -c` grandchildren too — which would otherwise survive the direct-child kill
+/// and keep running (and writing into the workspace). Uses `rustix` (a safe `killpg`) since the
+/// crate forbids `unsafe`; `start_kill` is a belt-and-suspenders fallback (and the only step on
+/// non-Unix).
+fn kill_tree(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        // `-<pid>` targets the process group (pgid == leader pid). Best-effort: ignore failures.
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await;
+        // `kill_process_group` sends to the group led by `pid` (== pgid here). Best-effort.
+        if let Some(pid) = i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
     }
     let _ = child.start_kill();
 }

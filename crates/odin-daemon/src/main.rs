@@ -252,7 +252,10 @@ async fn serve(cli: Cli) -> anyhow::Result<()> {
                         _ = term.recv() => Some("SIGTERM"),
                     };
                     if let Some(why) = why {
-                        tracing::info!(signal = why, "shutdown signal received, draining in-flight runs");
+                        tracing::info!(
+                            signal = why,
+                            "shutdown signal received, draining in-flight runs"
+                        );
                         signal_token.cancel();
                     }
                 }

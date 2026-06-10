@@ -48,7 +48,9 @@ impl LocalEngine {
         // ODIN016 failure the cache exists to prevent). The closure runs only on a miss.
         let mut cache = self.workspaces.lock().unwrap();
         let workspace = cache.entry(key).or_insert_with(|| match cfg {
-            WorkspaceConfig::Worktree(_) => Arc::new(WorktreeWorkspace::new(self.repo_root.clone())),
+            WorkspaceConfig::Worktree(_) => {
+                Arc::new(WorktreeWorkspace::new(self.repo_root.clone()))
+            }
             WorkspaceConfig::SlotPool(c) => {
                 // The on-disk pool dir is keyed by the config (a hash of the same JSON the
                 // instance cache uses), so two DISTINCT slot-pool configs never share physical

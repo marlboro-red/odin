@@ -931,6 +931,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",
