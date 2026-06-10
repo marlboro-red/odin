@@ -148,6 +148,26 @@ Point a GitHub webhook (content type `application/json`, secret = your `--webhoo
 This unlocks the marquee flow — label an issue, and `issues.labeled → issue-to-pr` runs. See
 [`examples/issue-to-pr.yaml`](../examples/issue-to-pr.yaml).
 
+### Generic `webhook` trigger (any service)
+
+For a non-GitHub source — a CI system, a deploy tool, an internal app — declare a `webhook`
+trigger instead. It shares the same `/webhook` endpoint, signing, dedup, and dispatch as the GitHub
+path, but drops the GitHub event/repo model: it matches an optional event name against the
+`X-Odin-Event` header and maps params from the JSON body by dot-path.
+
+```yaml
+triggers:
+  - type: webhook
+    event: deploy           # matched against the `X-Odin-Event` header; omit to fire on any event
+    params:
+      ref: deployment.ref   # map body fields → run params (dot-path), same as github_webhook
+```
+
+The sender POSTs to `/webhook` with `X-Odin-Event: <name>`, an optional `X-Odin-Delivery: <id>`
+(for retry de-duplication), and — when a secret is configured — `X-Odin-Signature-256:
+sha256=<hmac>` (HMAC-SHA256 of the raw body, same scheme as GitHub). See
+[`examples/deploy-on-webhook.yaml`](../examples/deploy-on-webhook.yaml).
+
 > **Setting one up?** The end-to-end [webhook walkthrough](webhook-walkthrough.md) covers the two
 > steps this reference assumes — exposing the daemon publicly (a tunnel) and creating the webhook on
 > GitHub — plus the full open-PR → review → approve → comment loop, worked against

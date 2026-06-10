@@ -18,7 +18,7 @@ pub use step::{
     ActionStep, ApprovalStep, Artifacts, Backoff, CaseBranch, CaseStep, FeedbackMode, JudgeSpec,
     LoopStep, ProviderStep, RetrySpec, RunStep, Step, StepKind,
 };
-pub use trigger::{CronDecl, GithubWebhookDecl, TriggerDecl};
+pub use trigger::{CronDecl, GithubWebhookDecl, TriggerDecl, WebhookDecl};
 pub use workflow::{
     CURRENT_SCHEMA_MAJOR, CURRENT_SCHEMA_MINOR, SchemaVersion, Workflow, WorkflowDefaults,
 };
