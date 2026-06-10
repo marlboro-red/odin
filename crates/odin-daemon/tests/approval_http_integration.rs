@@ -353,6 +353,16 @@ async fn dashboard_serves_the_page_and_lists_runs_unauthenticated() {
     let (status, page) = get(h.addr, "/").await;
     assert!(status.contains("200"), "got: {status}");
     assert!(page.contains("Odin"), "the dashboard HTML should render");
+    // The duration formatter + its run/step wiring are embedded (regression guard for the
+    // dashboard duration_ms rendering).
+    assert!(
+        page.contains("function dur("),
+        "dashboard should embed the duration formatter"
+    );
+    assert!(
+        page.contains("dur(r.duration_ms)") && page.contains("dur(s.duration_ms)"),
+        "dashboard should render run + step durations"
+    );
 
     // The read API lists the paused run with its gate message.
     let (api_status, body) = get(h.addr, "/api/runs").await;

@@ -62,7 +62,8 @@ pub(crate) const HTML: &str = r##"<!doctype html>
   .row1 { display: flex; align-items: center; gap: var(--s3); }
   .wf { font-weight: 600; font-size: 15px; }
   .id { color: var(--text-mut); font-family: var(--mono); font-size: 12px; }
-  .ago { color: var(--text-mut); font-size: 12px; margin-left: auto; white-space: nowrap; }
+  .dur { color: var(--text-mut); font-size: 12px; margin-left: auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .ago { color: var(--text-mut); font-size: 12px; margin-left: 8px; white-space: nowrap; }
   .badge { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
            text-transform: uppercase; letter-spacing: .04em; }
   .b-succeeded { background: #10381f; color: var(--ok); }
@@ -206,6 +207,17 @@ function ago(iso) {
   return Math.floor(s/86400) + "d ago";
 }
 
+// Formats a wall-clock duration in ms; matches the CLI's `fmt_duration_ms` for the sub-minute case
+// (`Nms` / `N.Ns`) and rolls over to minutes for longer runs. Empty string for absent/negative.
+function dur(ms) {
+  if (ms == null || ms < 0) return "";
+  if (ms < 1000) return ms + "ms";
+  const totalS = Math.floor(ms / 1000);
+  if (totalS < 60) return Math.floor(ms/1000) + "." + Math.floor((ms%1000)/100) + "s";
+  const m = Math.floor(totalS / 60), s = totalS % 60;
+  return m + "m" + (s ? " " + s + "s" : "");
+}
+
 async function sign(secret, body) {
   if (!secret) throw new Error("set the webhook secret (top right) to approve or reject");
   if (!crypto.subtle) throw new Error("signing needs a secure context — use http://localhost or HTTPS");
@@ -301,15 +313,18 @@ function glyph(s) { return {passed:"✓", failed:"✗", skipped:"⊘", running:"
 // A signature over only what a card RENDERS — excludes `updated_at`, so a poll that merely bumps
 // the timestamp does not blow the card away (the relative time updates separately, see tick()).
 function cardSig(r) {
-  return JSON.stringify([r.status, r.workflow, r.gate ? r.gate.message : null,
-    r.steps.map(s => [s.id, s.status, s.exit_code, s.error || null])]);
+  return JSON.stringify([r.status, r.workflow, r.gate ? r.gate.message : null, r.duration_ms ?? null,
+    r.steps.map(s => [s.id, s.status, s.exit_code, s.error || null, s.duration_ms ?? null])]);
 }
 
 function cardHTML(r, sig) {
   // The glyph is decorative (aria-hidden); a visually-hidden span carries the status word so a
   // screen reader announces e.g. "passed build (0)" rather than just "build (0)".
-  const steps = r.steps.map(s =>
-    `<span class="step" title="${esc(s.error||"")}"><span class="g g-${s.status}" aria-hidden="true">${glyph(s.status)}</span><span class="sr-only">${s.status.replace("_"," ")} </span>${esc(s.id)}${s.exit_code!=null?` (${s.exit_code})`:""}</span>`).join("");
+  const steps = r.steps.map(s => {
+    const d = dur(s.duration_ms);
+    const title = esc(s.id) + (d ? " — " + d : "") + (s.error ? " — " + esc(s.error) : "");
+    return `<span class="step" title="${title}"><span class="g g-${s.status}" aria-hidden="true">${glyph(s.status)}</span><span class="sr-only">${s.status.replace("_"," ")} </span>${esc(s.id)}${s.exit_code!=null?` (${s.exit_code})`:""}</span>`;
+  }).join("");
   // Failed steps carry their error in the list payload — surface it inline (not just a hover title).
   const stepErrs = r.steps.filter(s => s.status === "failed" && s.error)
     .map(s => `<div class="err">${esc(s.id)}: ${esc(s.error)}</div>`).join("");
@@ -330,6 +345,7 @@ function cardHTML(r, sig) {
       <span class="badge b-${r.status}" aria-label="status: ${r.status.replace("_"," ")}">${r.status.replace("_"," ")}</span>
       <span class="wf">${esc(r.workflow)}</span>
       <span class="id">${esc(r.run_id.slice(0,8))}</span>
+      <span class="dur" title="${r.duration_ms!=null?"run duration":""}">${dur(r.duration_ms)}</span>
       <span class="ago" data-iso="${esc(r.updated_at)}" title="${esc(r.updated_at)}">${ago(r.updated_at)}</span>
     </div>
     <div class="steps">${steps}</div>
