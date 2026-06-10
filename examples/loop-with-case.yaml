@@ -1,11 +1,21 @@
-# Showcase: a `case:` selector nested INSIDE a `loop:` body. Each iteration runs the tests,
-# classifies how they failed, and re-prompts the fixer with that classification — repeating until
-# the tests pass (or `max` iterations elapse). Combines two control-flow features: the multi-step
-# `loop:` (see `iterate.yaml`) and the `case:` branch selector (see `triage.yaml`).
+# Showcase: a `case:` selector nested INSIDE a `loop:` body. Each iteration classifies the
+# PRIOR round's test failure, re-prompts the fixer with that classification, then re-runs the
+# tests — repeating until they pass (or `max` iterations elapse). Combines two control-flow
+# features: the multi-step `loop:` (see `iterate.yaml`) and the `case:` selector (see `triage.yaml`).
 #
-# The loop body is a self-contained sub-DAG: `test` → `classify` (a case selector over `test`'s
-# result) → `repair` (re-prompts using the selected label and the iteration counter). Inner step
-# ids are globally unique and the case is validated like any top-level one (ODIN033–036).
+# Loop body (a self-contained sub-DAG, run once per iteration):
+#   classify → repair → test
+#
+#   - `classify` is a `case:` over `loop.feedback` — the PRIOR iteration's test output. It always
+#     runs (it depends on nothing) and always passes, recording `outputs.selected`, so the steps
+#     after it never skip. On the first iteration `loop.feedback` is empty, so it selects `else`.
+#   - `repair` re-prompts the agent using the selected label + the failure text.
+#   - `test` runs last; the loop's `until` checks ITS status. A failing `test` does not skip the
+#     fixer — `repair` ran before it — and its output becomes the next iteration's `loop.feedback`.
+#
+# This ordering matters: a step whose dependency FAILED is skipped, so the failing check must be
+# the LAST step in the body (as in `iterate.yaml`), never a dependency of the fixer. Inner step ids
+# are globally unique and the case is validated like any top-level one (ODIN033–036).
 #
 # A VALIDATION showcase (running it needs a real repo + the `claude` CLI). Validates cleanly.
 #
@@ -25,24 +35,34 @@ steps:
       until: "steps.test.status == 'passed'"
       max: 4
       steps:
-        - id: test
-          run: "cargo test --quiet"
-
         - id: classify
           # The case records `outputs.selected`: the first branch whose `when:` holds, else `else`.
+          # It reads `loop.feedback` (the prior round's failure), so it never depends on — and is
+          # never skipped by — the failing `test` step.
           case:
             branches:
               - label: compile
-                when: "steps.test.exit_code != 0"
+                when: "'cannot find' in loop.feedback or 'mismatched types' in loop.feedback"
             else: runtime
-          depends_on: [test]
 
         - id: repair
           provider: claude
           prompt: |
+            {% if loop.counter > 1 %}
             The tests failed with a {{ steps.classify.outputs.selected }} problem (iteration
-            {{ loop.counter }}). Fix the most likely cause and stop.
+            {{ loop.counter }}). The failure output was:
+
+                {{ loop.feedback }}
+
+            Fix the most likely cause and stop.
+            {% else %}
+            Make the failing tests pass. Fix the most likely cause and stop.
+            {% endif %}
           depends_on: [classify]
+
+        - id: test
+          run: "cargo test --quiet"
+          depends_on: [repair]
 
   - id: report
     run: "echo 'converged after' {{ steps.fix.outputs.iterations }} 'iteration(s)'"

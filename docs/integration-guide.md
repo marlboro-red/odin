@@ -439,7 +439,9 @@ beyond `odin-core`:
 
 ```toml
 [dependencies]
-odin-daemon = "0.0.1"
+# Odin is not published to crates.io; depend on it by git (the crates.io `odin-core`
+# name is an unrelated crate). Pin a tag/rev for reproducibility.
+odin-daemon = { git = "https://github.com/marlboro-red/odin" }
 tokio = { version = "1", features = ["full"] }   # for the runtime + tokio::join!
 ```
 

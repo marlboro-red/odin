@@ -77,13 +77,13 @@ impl Action for GitPush {
                 .to_owned(),
         };
 
-        // Refuse a remote/branch that git would parse as an option (these come from
-        // templated `with:` values that may include trigger data).
-        if remote.starts_with('-') || branch.starts_with('-') {
-            return Err(ActionError::Other(anyhow::anyhow!(
-                "git.push: remote/branch must not start with '-' (remote={remote:?}, branch={branch:?})"
-            )));
-        }
+        // `remote`/`branch` come from templated `with:` values that may include untrusted
+        // trigger/agent data, and `branch` is passed to git as a *refspec* positional. Reject
+        // anything that isn't a plain ref name so a crafted value can't force-push (`+work:main`),
+        // retarget a branch (`HEAD:refs/heads/release`), redirect the push to a URL remote, or
+        // smuggle a leading-`-` option.
+        validate_push_arg("remote", &remote)?;
+        validate_push_arg("branch", &branch)?;
         super::checked(
             "git",
             &["push", "--set-upstream", remote.as_str(), branch.as_str()],
@@ -103,9 +103,31 @@ impl Action for GitPush {
     }
 }
 
+/// Rejects a `git.push` `remote`/`branch` that isn't a plain ref name. Blocks: a leading `-`
+/// (option injection), a leading `+` (force-push refspec), a `:` (a `src:dst` refspec or a URL
+/// remote like `https://…`/`git@host:…`), and any whitespace (argument smuggling) — plus the empty
+/// string. Conservative on purpose: a templated value carrying untrusted trigger/agent data must
+/// not be able to change *where* or *how* the push lands.
+fn validate_push_arg(kind: &str, value: &str) -> Result<(), ActionError> {
+    let invalid = value.is_empty()
+        || value.starts_with('-')
+        || value.starts_with('+')
+        || value.contains(':')
+        || value.chars().any(char::is_whitespace);
+    if invalid {
+        return Err(ActionError::Other(anyhow::anyhow!(
+            "git.push: {kind} {value:?} is not a plain ref name — it must not be empty, start with \
+             '-' or '+', contain ':' (a refspec or URL), or contain whitespace (these come from \
+             templated `with:` values that may include untrusted data, so a crafted value could \
+             force-push, retarget a branch, or redirect the push)"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GitCommit, GitPush};
+    use super::{GitCommit, GitPush, validate_push_arg};
     use crate::api::SideEffect;
     use crate::ids::StepId;
     use crate::traits::{Action, ActionCtx};
@@ -181,6 +203,29 @@ mod tests {
             .output()
             .unwrap();
         assert!(String::from_utf8_lossy(&listed.stdout).contains("work"));
+    }
+
+    #[test]
+    fn push_arg_validation_blocks_refspec_and_url_injection() {
+        // Plain ref names are fine.
+        assert!(validate_push_arg("branch", "work").is_ok());
+        assert!(validate_push_arg("branch", "feature/x-1").is_ok());
+        assert!(validate_push_arg("remote", "origin").is_ok());
+        // Force-push, retarget, option, URL, whitespace, and empty are all rejected.
+        for bad in [
+            "+work:main",            // force-push refspec
+            "HEAD:refs/heads/main",  // retarget another branch
+            "--upload-pack=evil",    // option injection
+            "https://evil/x.git",    // URL remote (contains ':')
+            "git@host:owner/repo",   // scp-like URL (contains ':')
+            "a branch",              // whitespace
+            "",                      // empty
+        ] {
+            assert!(
+                validate_push_arg("branch", bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]

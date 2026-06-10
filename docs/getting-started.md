@@ -53,15 +53,19 @@ The fastest way to see the engine work — **zero dependencies**, no agent CLI o
 provider-free [`quickstart`](../examples/quickstart.yaml) (it runs in any git repo, e.g. this one):
 
 ```sh
-odin run quickstart --repo . --no-store
+odin run examples/quickstart.yaml --repo . --no-store
 # ✓ hello  ✓ write  ✓ check  — provisions a worktree, runs the DAG, captures the diff
 ```
+
+> The `examples/*.yaml` paths above run straight from a checkout of this repo. To run workflows by
+> short **name** instead (`odin run quickstart`), first seed the catalog with `odin recipe init`
+> (see [Run by name](#run-by-name-the-recipe-catalog) below).
 
 To run a **provider-using** workflow offline too, add `--mock` — `provider:` steps echo their
 prompt instead of invoking a real agent CLI:
 
 ```sh
-odin run deep-review --repo . --no-store --mock --param out="$PWD/REVIEW.md"
+odin run examples/deep-review.yaml --repo . --no-store --mock --param out="$PWD/REVIEW.md"
 ```
 
 Then the real thing — a provider workflow with the agent CLIs installed:
@@ -182,7 +186,7 @@ verification and dedup, and the fail-closed security model.
 
 ## Where next
 
-- [Workflow reference](workflow-reference.md) — every field and all 44 diagnostics.
+- [Workflow reference](workflow-reference.md) — every field and all 45 diagnostics.
 - [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references, including the
   [recipe catalog](cli.md#odin-recipe-subcommand) (run workflows by name).
 - [Webhook walkthrough](webhook-walkthrough.md) — wire a GitHub webhook end-to-end (tunnel →
