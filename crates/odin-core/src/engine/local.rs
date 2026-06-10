@@ -483,7 +483,16 @@ impl LocalEngine {
         }
         if durable {
             if let Some(store) = &self.store {
-                let _ = store.append_event(run_id, &event).await;
+                // A dropped audit event isn't fatal to the run, but silently swallowing the store
+                // error hides a failing/full disk — surface it at WARN with the event kind.
+                if let Err(e) = store.append_event(run_id, &event).await {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        event = ?std::mem::discriminant(&event),
+                        error = %e,
+                        "failed to append run event to the store; event dropped"
+                    );
+                }
             }
         }
     }
@@ -896,13 +905,25 @@ impl LocalEngine {
             };
             exclusive_running = false; // an exclusive step ran alone, so this clears it
 
-            tracing::info!(
-                step = %id,
-                status = ?outcome.status,
-                exit_code = outcome.exit_code,
-                attempts = outcome.attempts,
-                "step finished"
-            );
+            // A failed step is logged at WARN (with its reason) so it's visible at the default
+            // log level — debugging a run shouldn't require turning on DEBUG to see what broke.
+            if outcome.status == StepStatus::Failed {
+                tracing::warn!(
+                    step = %id,
+                    exit_code = outcome.exit_code,
+                    attempts = outcome.attempts,
+                    reason = outcome.error.as_deref().unwrap_or("(none)"),
+                    "step failed"
+                );
+            } else {
+                tracing::info!(
+                    step = %id,
+                    status = ?outcome.status,
+                    exit_code = outcome.exit_code,
+                    attempts = outcome.attempts,
+                    "step finished"
+                );
+            }
 
             // Graceful-shutdown rewind: a durable run interrupted by `shutdown` (daemon stop)
             // had this step's subprocess killed, so it came back `Failed`. Leave it back at
@@ -3529,6 +3550,30 @@ steps:
                 .iter()
                 .any(|e| matches!(e, RunEvent::RunResumed { .. })),
             "missing RunResumed: {events:?}"
+        );
+    }
+
+    /// A `run:` step killed by its timeout reports "timed out", not the misleading
+    /// "exited with code -1" that the synthetic exit code would otherwise produce.
+    #[tokio::test]
+    async fn a_timed_out_run_step_reports_timeout_not_crash() {
+        let repo = init_repo().await;
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let eng = engine(repo.path(), store);
+        let wf = parse(
+            "name: t\nworkspace: { type: worktree }\nsteps:\n  - {id: slow, run: \"sleep 5\", timeout: \"1s\"}\n",
+        );
+        let s = eng.run(&wf, RunInput::manual()).await.unwrap();
+        assert_eq!(s.status, RunStatus::Failed);
+        let step = s.steps.iter().find(|st| st.id.as_str() == "slow").unwrap();
+        let err = step.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout reason, got: {err:?}"
+        );
+        assert!(
+            !err.contains("exited with code"),
+            "must not report a synthetic exit code for a timeout: {err:?}"
         );
     }
 

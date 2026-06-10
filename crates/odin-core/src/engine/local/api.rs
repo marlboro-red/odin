@@ -214,15 +214,36 @@ impl Engine for LocalEngine {
         )
         .await;
         let elapsed_ms = (Utc::now() - started_at).num_milliseconds();
-        tracing::info!(
-            parent: &run_span,
-            run_id = %run_id,
-            status = ?status,
-            steps = summary.steps.len(),
-            cost_micros = summary.usage.cost_micros,
-            elapsed_ms,
-            "run finished"
-        );
+        // A failed run is logged at ERROR (with its terminal reason) so an operator watching at
+        // the default level sees it; a cancellation is a WARN; success/awaiting stay INFO.
+        if status == RunStatus::Failed {
+            tracing::error!(
+                parent: &run_span,
+                run_id = %run_id,
+                steps = summary.steps.len(),
+                cost_micros = summary.usage.cost_micros,
+                elapsed_ms,
+                error = summary.error.as_deref().unwrap_or("(none)"),
+                "run failed"
+            );
+        } else if status == RunStatus::Cancelled {
+            tracing::warn!(
+                parent: &run_span,
+                run_id = %run_id,
+                elapsed_ms,
+                "run cancelled"
+            );
+        } else {
+            tracing::info!(
+                parent: &run_span,
+                run_id = %run_id,
+                status = ?status,
+                steps = summary.steps.len(),
+                cost_micros = summary.usage.cost_micros,
+                elapsed_ms,
+                "run finished"
+            );
+        }
 
         Ok(summary)
     }

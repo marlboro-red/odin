@@ -20,7 +20,13 @@ ODIN_LOG=odin_core::engine=debug,info odin run wf.yaml --repo .   # engine at de
 ```
 
 At `info` you see run lifecycle + per-step outcomes; at `debug` you also see each loaded
-workflow, provider dispatch, and gate/judge detail.
+workflow, provider dispatch (`invoking provider`), and gate/judge detail.
+
+**Failures are loud at the default level.** A failed step logs at **WARN** (`step failed`, with its
+`reason`), a failed run at **ERROR** (`run failed`, with the terminal `error`), and a cancelled run
+at WARN — so an operator at the default `info` sees what broke without dropping to `debug`. A store
+error while appending an audit event is a WARN (`failed to append run event …`) rather than being
+silently swallowed.
 
 ## Format
 
@@ -42,9 +48,10 @@ Spans nest, so every event carries its run/step context:
 | `dispatch` | `source`, `workflow` | the daemon, one per trigger event (wraps the `run` span) |
 
 Key events (all within the spans above): `run started` / `run finished` (`status`, `steps`,
-`cost_micros`, `elapsed_ms`), `step finished` (`status`, `exit_code`, `attempts`), webhook
-`delivery accepted` / `duplicate delivery ignored` / 503 retries, cron-trigger skips, resume
-counts.
+`cost_micros`, `elapsed_ms`) — or `run failed` at **ERROR** (`error`) / `run cancelled` at WARN;
+`step finished` (`status`, `exit_code`, `attempts`) — or `step failed` at **WARN** (`reason`);
+`invoking provider` (`provider`, `prompt_bytes`, at DEBUG); webhook `delivery accepted` /
+`duplicate delivery ignored` / 503 retries, cron-trigger skips, resume counts.
 
 ```text
 2026-06-03T18:22:04Z  INFO run{run_id=7f3c… workflow=issue-to-pr durable=true}: run started
