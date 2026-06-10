@@ -427,17 +427,13 @@ pub async fn run_process(
         }
     };
 
-    // After a kill, bound how long we wait to drain the pipes. A surviving grandchild
-    // (e.g. a backgrounded process in `sh -c`, or an agent's tool subprocess) can keep
-    // the stdout/stderr fd open, and `read_to_end` would otherwise block forever —
-    // defeating the very timeout/cancel that just fired.
-    let killed = timed_out || cancelled;
-    // Drain both pipes concurrently. After a kill a surviving grandchild (e.g. a `sleep`
-    // forked by `sh -c`, immune to the parent's kill on platforms without process-group
-    // teardown) can hold either fd open for the full `KILL_DRAIN_GRACE`; draining
-    // sequentially would pay that grace twice (~4s), so the call would linger for two grace
-    // windows instead of one after the timeout/cancel already fired.
-    let (stdout, stderr) = tokio::join!(collect(out_task, killed), collect(err_task, killed));
+    // Drain both pipes concurrently, each bounded by `KILL_DRAIN_GRACE` (see `collect`). The
+    // bound applies on EVERY path, not just after a kill: a child that exits *cleanly* but leaks a
+    // backgrounded grandchild (`./server & echo done; exit 0`, or an agent's lingering tool
+    // subprocess) leaves that grandchild holding the stdout/stderr fd open, so an unbounded
+    // `read_to_end` would wedge the run forever even though `child.wait()` already returned.
+    // Draining concurrently also avoids paying the grace twice (~4s) when both fds are held.
+    let (stdout, stderr) = tokio::join!(collect(out_task), collect(err_task));
     let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
 
     Ok(ProcessOutput {
@@ -487,20 +483,19 @@ async fn sleep_opt(d: Option<Duration>) {
 /// How long to keep draining a killed child's pipes before abandoning partial output.
 const KILL_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Joins a reader task. On the normal path it awaits fully; after a kill it bounds the
-/// wait by a grace period and then aborts the task, so a surviving grandchild holding the
-/// pipe open cannot hang the call.
-async fn collect(task: tokio::task::JoinHandle<Vec<u8>>, killed: bool) -> String {
-    let bytes = if killed {
-        let abort = task.abort_handle();
-        if let Ok(Ok(b)) = tokio::time::timeout(KILL_DRAIN_GRACE, task).await {
-            b
-        } else {
-            abort.abort();
-            Vec::new()
-        }
+/// Joins a pipe-reader task, bounding the wait by [`KILL_DRAIN_GRACE`] and then aborting it.
+/// The bound applies even when the child exited cleanly: at that point the child has closed its
+/// own pipe ends so EOF is imminent (at most a pipe buffer remains), UNLESS a surviving grandchild
+/// inherited the fd and holds it open — in which case an unbounded join would hang the run. The
+/// grace is generous enough to drain any real buffered tail and short enough to keep a leaked
+/// grandchild from wedging the call.
+async fn collect(task: tokio::task::JoinHandle<Vec<u8>>) -> String {
+    let abort = task.abort_handle();
+    let bytes = if let Ok(Ok(b)) = tokio::time::timeout(KILL_DRAIN_GRACE, task).await {
+        b
     } else {
-        task.await.unwrap_or_default()
+        abort.abort();
+        Vec::new()
     };
     String::from_utf8_lossy(&bytes).into_owned()
 }
@@ -801,6 +796,30 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "run_process must return promptly after timeout, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // The inverse of the test above: the child exits CLEANLY (exit 0, no timeout, no cancel) but
+    // leaks a backgrounded grandchild that keeps the stdout pipe open. The drain must still be
+    // bounded — an unbounded `read_to_end` here wedged the run until the grandchild died.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn clean_exit_returns_even_if_a_grandchild_holds_the_pipe() {
+        let started = std::time::Instant::now();
+        let out = run_process(
+            "sh",
+            &args(&["-c", "sleep 10 & echo done; exit 0"]),
+            &ProcessOptions::default(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.exit_code, 0, "the child exited cleanly");
+        assert!(!out.timed_out && !out.cancelled);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a cleanly-exited step with a leaked grandchild must not wedge the run, took {:?}",
             started.elapsed()
         );
     }

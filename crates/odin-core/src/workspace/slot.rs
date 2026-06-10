@@ -22,6 +22,14 @@ use crate::error::WorkspaceError;
 use crate::ir::ResetMode;
 use crate::traits::{AcquireCtx, Workspace, WorkspaceHandle};
 
+/// Durable ref (inside each slot's own `.git`) recording the slot's pristine commit, so a
+/// `git_clean` reset can fully restore the slot between leases — including undoing any commits a
+/// prior lease made, which a plain `reset --hard` to the *current* HEAD would leave behind.
+const PRISTINE_REF: &str = "refs/odin/pristine";
+/// Git-config key (inside each slot) recording the pristine branch name (empty if the clone left
+/// HEAD detached at `base`), so the reset restores the original branch, not a detached HEAD.
+const PRISTINE_BRANCH_CFG: &str = "odin.pristineBranch";
+
 /// A pool of `size` pre-cloned slots under `pool_dir`, each reset before reuse.
 pub struct SlotPoolWorkspace {
     repo_root: PathBuf,
@@ -89,6 +97,35 @@ impl SlotPoolWorkspace {
         if let Some(base) = &self.base {
             git(slot, &["checkout", base.as_str()]).await?;
         }
+        // Record the pristine state (a durable ref + the branch name) so `reset_slot` can restore
+        // the slot exactly between leases, undoing not just uncommitted changes but any commits or
+        // branch moves a prior lease made. Both live in the slot's own `.git`, so they also survive
+        // a daemon restart (a healthy slot is reused, not re-cloned).
+        git(slot, &["update-ref", PRISTINE_REF, "HEAD"]).await?;
+        let branch = git(slot, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .await
+            .unwrap_or_default();
+        git(slot, &["config", PRISTINE_BRANCH_CFG, branch.trim()]).await?;
+        Ok(())
+    }
+
+    /// Restores a slot to its recorded pristine commit/branch, discarding all working-tree changes
+    /// AND any commits a prior lease added. Errors if the slot isn't a healthy clone with the
+    /// pristine markers (e.g. an old slot, or a crash-corrupted one) — the caller then re-clones.
+    async fn restore_pristine(&self, slot: &Path) -> Result<(), WorkspaceError> {
+        let branch = git(slot, &["config", "--get", PRISTINE_BRANCH_CFG])
+            .await
+            .unwrap_or_default();
+        let branch = branch.trim();
+        if branch.is_empty() {
+            // The clone left HEAD detached at `base`; restore that detached pristine commit.
+            git(slot, &["checkout", "-f", "--detach", PRISTINE_REF]).await?;
+        } else {
+            // `-B` re-creates/moves the original branch to the pristine commit and checks it out,
+            // force-discarding tracked changes and undoing any commits the prior lease added.
+            git(slot, &["checkout", "-f", "-B", branch, PRISTINE_REF]).await?;
+        }
+        git(slot, &["clean", "-fdx"]).await?;
         Ok(())
     }
 
@@ -122,13 +159,14 @@ impl SlotPoolWorkspace {
     async fn reset_slot(&self, slot: &Path) -> Result<(), WorkspaceError> {
         match self.reset {
             ResetMode::GitClean => {
-                // If the reset fails the slot isn't a healthy repo (e.g. corrupted by a crash) —
-                // re-clone it rather than cycle a dead slot back to the free set forever.
-                if git(slot, &["reset", "--hard"]).await.is_err() {
+                // Restore to the recorded pristine commit/branch (undoing a prior lease's commits,
+                // not just its uncommitted edits). If that fails the slot isn't a healthy clone
+                // with pristine markers (corrupted by a crash, or cloned by an older odin) — re-
+                // clone it rather than cycle a dead slot back to the free set forever.
+                if self.restore_pristine(slot).await.is_err() {
                     let _ = tokio::fs::remove_dir_all(slot).await;
                     return self.provision(slot).await;
                 }
-                git(slot, &["clean", "-fdx"]).await?;
             }
             ResetMode::Reclone => {
                 let _ = tokio::fs::remove_dir_all(slot).await;
@@ -244,6 +282,58 @@ mod tests {
             "reset cleaned the untracked file"
         );
         assert!(h2.path.join("README.md").exists());
+        ws.release(h2).await.unwrap();
+    }
+
+    /// A prior lease's COMMITS (and branch moves) must be undone on reset, not just its
+    /// uncommitted edits — otherwise the next run inherits the prior run's HEAD as its
+    /// `base_commit` and its committed files, silently corrupting the DIFF and what gets pushed.
+    #[tokio::test]
+    async fn a_committed_change_is_undone_on_reset_between_uses() {
+        let repo = init_repo().await;
+        let pool = tempfile::tempdir().unwrap();
+        let ws = SlotPoolWorkspace::new(repo.path(), pool.path(), 1, ResetMode::GitClean, None);
+
+        let h1 = ws.acquire(ctx()).await.unwrap();
+        let slot = h1.path.clone();
+        let g = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(&slot)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        std::fs::write(slot.join("leaked.txt"), "x").unwrap();
+        g(&["checkout", "-q", "-b", "prior-work"]);
+        g(&["add", "."]);
+        g(&["commit", "-q", "-m", "prior lease commit"]);
+        ws.release(h1).await.unwrap();
+
+        let h2 = ws.acquire(ctx()).await.unwrap();
+        assert!(
+            !h2.path.join("leaked.txt").exists(),
+            "the prior lease's committed file must be gone after reset"
+        );
+        let log = std::process::Command::new("git")
+            .current_dir(&h2.path)
+            .args(["log", "--oneline"])
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            !log.contains("prior lease commit"),
+            "the prior lease's commit must be undone on reset: {log}"
+        );
+        let branch = std::process::Command::new("git")
+            .current_dir(&h2.path)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap();
+        assert_ne!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            "prior-work",
+            "the slot must be restored to its pristine branch, not the prior lease's"
+        );
         ws.release(h2).await.unwrap();
     }
 
