@@ -5,9 +5,10 @@
 //! child against an optional timeout and a [`CancelToken`]. On timeout or cancel the
 //! child is killed and reaped; partial output captured so far is still returned.
 //!
-//! Termination currently uses `start_kill` (SIGKILL on Unix). A graceful
-//! SIGINT-then-SIGKILL escalation is a deliberate later refinement — it needs a signal
-//! crate, and the crate is `unsafe`-forbidden, so it cannot use raw `libc::kill`.
+//! On Unix the child is spawned in its own process group, so termination SIGKILLs the whole
+//! group (the agent CLI plus any tool/`sh -c` grandchildren) via the `kill` binary — the crate is
+//! `unsafe`-forbidden, so it can't call `libc::killpg` directly (see `kill_tree`). A graceful
+//! SIGINT-then-SIGKILL escalation remains a deliberate later refinement.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -365,6 +366,13 @@ pub async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // On Unix, put the child in its OWN process group so a kill reaps the whole tree — the agent
+    // CLI plus the tool subprocesses / `sh -c` grandchildren it forks. Without this, SIGKILL hits
+    // only the direct child and the grandchildren survive as orphans that keep mutating the
+    // workspace (and a slot pool would then reset + re-lease a dir still being written). See
+    // `kill_tree`.
+    #[cfg(unix)]
+    cmd.process_group(0);
     if let Some(dir) = &opts.workdir {
         cmd.current_dir(dir);
     }
@@ -418,11 +426,11 @@ pub async fn run_process(
     let (timed_out, cancelled, status) = match waited {
         Wait::Done(s) => (false, false, Some(s)),
         Wait::Timeout => {
-            let _ = child.start_kill();
+            kill_tree(&mut child).await;
             (true, false, child.wait().await.ok())
         }
         Wait::Cancel => {
-            let _ = child.start_kill();
+            kill_tree(&mut child).await;
             (false, true, child.wait().await.ok())
         }
     };
@@ -470,6 +478,28 @@ where
     }
     sink.flush(&mut pending).await;
     buf
+}
+
+/// Kills a timed-out/cancelled child **and its descendants**. On Unix the child leads its own
+/// process group (`process_group(0)` at spawn), so one SIGKILL to the negated group id reaps the
+/// agent CLI's tool subprocesses and `sh -c` grandchildren too — which would otherwise survive the
+/// direct-child kill and keep running (and writing into the workspace). We shell out to `kill`
+/// because the crate forbids `unsafe`, so it can't call `libc::killpg` directly; `start_kill` is a
+/// belt-and-suspenders fallback (and the only step on non-Unix).
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // `-<pid>` targets the process group (pgid == leader pid). Best-effort: ignore failures.
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.start_kill();
 }
 
 /// Sleeps for `d`, or never resolves if `d` is `None`.
@@ -821,6 +851,31 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "a cleanly-exited step with a leaked grandchild must not wedge the run, took {:?}",
             started.elapsed()
+        );
+    }
+
+    // The process-group kill must reap a BACKGROUNDED grandchild, not just the direct child. The
+    // grandchild here would `touch` a marker after 1s; the group is killed at 200ms, so if it were
+    // orphaned (only the direct child killed) the marker would appear — and must not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_reaps_backgrounded_grandchildren() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let script = format!("(sleep 1; touch '{}') & sleep 30", marker.display());
+        let opts = ProcessOptions {
+            timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        let out = run_process("sh", &args(&["-c", &script]), &opts, &CancelToken::new())
+            .await
+            .unwrap();
+        assert!(out.timed_out);
+        // Wait past when the grandchild WOULD have touched the marker, had it survived.
+        tokio::time::sleep(Duration::from_millis(1400)).await;
+        assert!(
+            !marker.exists(),
+            "the backgrounded grandchild must be reaped by the process-group kill, not orphaned"
         );
     }
 
