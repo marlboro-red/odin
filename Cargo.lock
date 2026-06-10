@@ -902,7 +902,7 @@ dependencies = [
 
 [[package]]
 name = "odin-cli"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -918,7 +918,7 @@ dependencies = [
 
 [[package]]
 name = "odin-core"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "odin-daemon"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
