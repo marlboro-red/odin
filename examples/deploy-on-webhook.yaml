@@ -18,4 +18,4 @@ params:
 
 steps:
   - id: announce
-    run: "echo deploying {{ params.ref }}"
+    run: "echo deploying {{ params.ref | shquote }}"

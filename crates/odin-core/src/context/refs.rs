@@ -131,14 +131,23 @@ fn process_templates(
                 format!("template syntax error: {e}"),
             )),
             Ok(vars) => {
+                // A value piped through `| shquote` is shell-safe; re-analyze with the shquoted
+                // interpolations stripped so the injection lints (ODIN031/ODIN046) fire ONLY for
+                // variables used UNPROTECTED in a shell sink.
+                let unprotected = if tpl.shell {
+                    analyze(&strip_shquoted(&source)).unwrap_or_default()
+                } else {
+                    HashSet::new()
+                };
                 for var in vars {
+                    let shell_sink = tpl.shell && unprotected.contains(&var);
                     check_var(
                         &var,
                         shape,
                         requires,
                         ancestors,
                         &tpl.pointer,
-                        tpl.shell,
+                        shell_sink,
                         used_params,
                         d,
                     );
@@ -343,6 +352,42 @@ fn collect_templates(ptr: &str, s: &crate::ir::Step) -> Vec<Templated> {
     out
 }
 
+/// Removes every `{{ … | shquote }}` interpolation from a template, so re-analyzing the remainder
+/// yields only the variables used WITHOUT `shquote` — the injection-risky ones. A value the author
+/// piped through `shquote` is already shell-safe and must not be flagged (ODIN031/ODIN046), or the
+/// lint couldn't be satisfied by applying its own suggested fix.
+fn strip_shquoted(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            // Unterminated `{{` — keep the remainder verbatim (the syntax error is reported elsewhere).
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        if last_filter_is_shquote(&after_open[..close]) {
+            // shquote-protected — drop it (a space avoids joining the adjacent shell tokens).
+            out.push(' ');
+        } else {
+            // Unprotected — keep the whole `{{ … }}` so its variables are still analyzed + flagged.
+            out.push_str(&rest[open..open + 2 + close + 2]);
+        }
+        rest = &after_open[close + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether the LAST filter of a minijinja interpolation is `shquote` (`x | shquote`,
+/// `x | upper | shquote`, or `x | shquote(…)`). Conservative: anything it can't clearly read as a
+/// trailing `shquote` is treated as NOT shquoted, so the value is still flagged.
+fn last_filter_is_shquote(inner: &str) -> bool {
+    let last = inner.rsplit('|').next().unwrap_or("").trim();
+    last.split('(').next().unwrap_or("").trim() == "shquote"
+}
+
 /// Compiles `source` and returns the set of (possibly dotted) variable paths it uses.
 /// A compile error becomes `ODIN018`.
 fn analyze(source: &str) -> Result<HashSet<String>, minijinja::Error> {
@@ -392,6 +437,22 @@ fn check_var(
                         diag = diag.with_help(format!("did you mean {sg:?}?"));
                     }
                     d.push(diag);
+                } else if shell && shape.webhook_params.contains(name) {
+                    // ODIN046 — a declared param that is mapped from a webhook trigger carries the
+                    // untrusted payload value (just like `trigger.*`), so interpolating it into a
+                    // shell command is the same injection risk. Scoped to webhook-mapped params so a
+                    // caller-supplied/default param doesn't false-positive.
+                    d.push(Diagnostic::new(
+                        DiagCode::WebhookParamIntoShell,
+                        pointer.to_owned(),
+                        format!(
+                            "interpolates `params.{name}`, which is mapped from a webhook payload \
+                             (so its value is attacker-controlled), into a shell command; it \
+                             reaches `sh -c` unescaped (injection risk). Shell-quote it with the \
+                             `| shquote` filter (e.g. `{{{{ params.{name} | shquote }}}}`), which \
+                             wraps the value as one inert shell word"
+                        ),
+                    ));
                 }
             }
         }

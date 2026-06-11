@@ -1,4 +1,4 @@
-//! One integration test per validation rule (`ODIN001`–`ODIN045`), driving the public
+//! One integration test per validation rule (`ODIN001`–`ODIN046`), driving the public
 //! `odin_core` API end-to-end. Each crafts a minimal workflow that should trip exactly
 //! the rule under test, plus negative tests asserting clean workflows stay clean.
 
@@ -328,6 +328,52 @@ fn odin031_does_not_fire_for_trigger_in_a_prompt() {
         "name: x\nsteps:\n  - {id: a, provider: claude, prompt: \"{{ trigger.issue.title }}\"}\n",
     );
     assert!(!r.contains(DiagCode::TriggerIntoShell), "got:\n{r}");
+}
+
+#[test]
+fn odin046_webhook_mapped_param_into_a_shell_command() {
+    // A param FILLED FROM A WEBHOOK payload is as untrusted as `trigger.*`; reaching `sh -c` in a
+    // `run:` step is the same injection risk.
+    assert_fires(
+        "name: x\ntriggers:\n  - {type: webhook, event: e, params: {title: issue.title}}\n\
+         params:\n  title: {}\nsteps:\n  - {id: a, run: \"echo {{ params.title }}\"}\n",
+        DiagCode::WebhookParamIntoShell,
+    );
+}
+
+#[test]
+fn odin046_does_not_fire_for_a_non_webhook_param() {
+    // A caller-supplied / default param is trusted — no injection lint, even in a shell.
+    let r = report(
+        "name: x\nparams:\n  title: {}\nsteps:\n  - {id: a, run: \"echo {{ params.title }}\"}\n",
+    );
+    assert!(!r.contains(DiagCode::WebhookParamIntoShell), "got:\n{r}");
+}
+
+#[test]
+fn shquote_suppresses_the_shell_injection_lints() {
+    // The fix the lints suggest — `| shquote` — must clear them, or they're an unsatisfiable nag.
+    let trig = report("name: x\nsteps:\n  - {id: a, run: \"echo {{ trigger.x | shquote }}\"}\n");
+    assert!(
+        !trig.contains(DiagCode::TriggerIntoShell),
+        "ODIN031 should clear when shquoted:\n{trig}"
+    );
+    let param = report(
+        "name: x\ntriggers:\n  - {type: webhook, event: e, params: {r: deployment.ref}}\n\
+         params:\n  r: {}\nsteps:\n  - {id: a, run: \"echo {{ params.r | shquote }}\"}\n",
+    );
+    assert!(
+        !param.contains(DiagCode::WebhookParamIntoShell),
+        "ODIN046 should clear when shquoted:\n{param}"
+    );
+    // ...but a SECOND, unquoted use in the same command still fires (per-occurrence, not per-name).
+    let mixed = report(
+        "name: x\nsteps:\n  - {id: a, run: \"echo {{ trigger.x | shquote }} {{ trigger.y }}\"}\n",
+    );
+    assert!(
+        mixed.contains(DiagCode::TriggerIntoShell),
+        "the unquoted `trigger.y` must still fire:\n{mixed}"
+    );
 }
 
 #[test]

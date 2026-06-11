@@ -147,6 +147,13 @@ pub enum DiagCode {
     /// duplicate of an earlier tag (collapsed), or carrying characters outside `[a-z0-9._-]`
     /// (kept, but may need shell-quoting on `--tag`). Tags never block a run (warning).
     MalformedTag,
+    /// ODIN046 — a param that is **mapped from a webhook trigger** (so its value comes from the
+    /// untrusted webhook payload, exactly like `trigger.*`) is interpolated into a shell command
+    /// (`run:`, a gate, or `shell.exec`'s `command`) without `| shquote`. The sibling of
+    /// [`TriggerIntoShell`](Self::TriggerIntoShell), but for the `params.*` path the daemon fills
+    /// from the event body. A non-webhook (caller-supplied / default) param does NOT trigger it
+    /// (warning).
+    WebhookParamIntoShell,
 }
 
 impl DiagCode {
@@ -199,6 +206,7 @@ impl DiagCode {
             DiagCode::LoopBodyScratch => "ODIN043",
             DiagCode::SlotPoolNotDurable => "ODIN044",
             DiagCode::MalformedTag => "ODIN045",
+            DiagCode::WebhookParamIntoShell => "ODIN046",
         }
     }
 
@@ -216,6 +224,7 @@ impl DiagCode {
             | DiagCode::ScratchOnAction
             | DiagCode::DynamicTemplateRef
             | DiagCode::TriggerIntoShell
+            | DiagCode::WebhookParamIntoShell
             | DiagCode::CaseInertChecks
             | DiagCode::LoopInertChecks
             | DiagCode::SlotPoolNotDurable
@@ -416,13 +425,14 @@ mod tests {
             DiagCode::LoopBodyScratch,
             DiagCode::SlotPoolNotDurable,
             DiagCode::MalformedTag,
+            DiagCode::WebhookParamIntoShell,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for c in all {
             assert!(c.as_str().starts_with("ODIN"));
             assert!(seen.insert(c.as_str()), "duplicate code {}", c.as_str());
         }
-        assert_eq!(seen.len(), 45);
+        assert_eq!(seen.len(), 46);
     }
 
     #[test]

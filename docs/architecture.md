@@ -227,6 +227,7 @@ do not.
 | ODIN043 | error | a `loop:` body step sets `scratch: true` (unsupported; the body runs sequentially on the shared workdir) |
 | ODIN044 | warning | a `durable:` workflow uses a `slot_pool` workspace (in-memory lease state is lost on restart; prefer `worktree`) |
 | ODIN045 | warning | a `tags:` entry was malformed (dropped/normalized), so the parsed workflow no longer shows the original token |
+| ODIN046 | warning | a webhook-mapped `params.*` value (untrusted, like `trigger.*`) is interpolated into a shell command without `\| shquote` |
 
 Structural problems caught at *parse* time (and so not in this table) include unknown
 nested fields, invalid durations, and a step with zero or more than one kind. The full
@@ -342,7 +343,7 @@ Kept because they are cheap; everything else was cut as speculative.
 
 ## Status
 
-**Implemented & tested:** the workflow IR; the validator (45 diagnostics); the
+**Implemented & tested:** the workflow IR; the validator (46 diagnostics); the
 templating/context model; the five integration traits + registry; the SQLite `Store`; the
 worktree and slot-pool `Workspace`s; the `claude`/`codex`/`copilot` `Provider` adapters
 (subprocess management, version/health checks, token-usage parsing); the built-in `Action`s

@@ -9,11 +9,10 @@
 # It exercises a wide slice of the engine: webhook trigger + payload→param mapping, `max_parallel`
 # scratch fan-out, cross-provider `judge:`, an `approval:` gate before an outward side effect, and
 # the "map trusted fields into typed params and reference those in shells" pattern.
-#   CAVEAT: ODIN031 flags only a raw `trigger.*` value reaching a shell — it does NOT shell-escape
-#   a param. This file is safe because `repo` is pinned by the trigger's `repo:` filter and `pr`
-#   is numeric; feeding a *string* param from an attacker-controlled payload field (e.g.
-#   `title: pull_request.title`) into a `run:` would inject silently and unlinted. Keep
-#   shell-bound params numeric or trigger-pinned.
+#   SECURITY: a param mapped from the webhook payload is as attacker-controlled as `trigger.*`
+#   (the signature authenticates the transport, not the content), so any such param reaching a
+#   shell is escaped with `| shquote` below — and ODIN046 lints a missing one. (`repo` is also
+#   pinned by the trigger's `repo:` filter and `pr` is numeric, but `shquote` is the real guard.)
 # A VALIDATION showcase: running it needs `odind`, a webhook secret, the claude/codex/copilot
 # CLIs, and `gh`. Validates cleanly.
 #
@@ -34,8 +33,9 @@ triggers:
   - type: github_webhook
     events: ["pull_request.opened"]
     repo: marlboro-red/odin
-    # Pull the trusted, typed fields we need out of the SIGNED webhook payload into params, then
-    # reference *those* in shell commands below — never a raw `trigger.*` value (ODIN031).
+    # Pull the typed fields we need out of the SIGNED webhook payload into params, then reference
+    # those (shell-escaped with `| shquote`) below — never a raw `trigger.*` value (ODIN031), and
+    # never a webhook-mapped param into a shell unquoted (ODIN046).
     params:
       pr: number
       repo: repository.full_name
@@ -51,7 +51,7 @@ params:
 steps:
   # 1. Fetch the PR's unified diff. Its stdout is the input every reviewer reads.
   - id: fetch
-    run: "gh pr diff {{ params.pr }} --repo {{ params.repo }}"
+    run: "gh pr diff {{ params.pr | shquote }} --repo {{ params.repo | shquote }}"
 
   # 2. Three reviewers, three lenses, run in parallel. They edit nothing — each writes its review
   #    to stdout. (For very large diffs, codex can stall; prefer a single reviewer or chunk it.)
@@ -121,4 +121,4 @@ steps:
       cat > review.md <<'ODIN_REVIEW_EOF_9f2c7a1b4e6d'
       {{ steps.synthesize.outputs.stdout }}
       ODIN_REVIEW_EOF_9f2c7a1b4e6d
-      gh pr comment {{ params.pr }} --repo {{ params.repo }} --body-file review.md
+      gh pr comment {{ params.pr | shquote }} --repo {{ params.repo | shquote }} --body-file review.md
