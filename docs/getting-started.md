@@ -191,7 +191,7 @@ verification and dedup, and the fail-closed security model.
 
 ## Where next
 
-- [Workflow reference](workflow-reference.md) — every field and all 45 diagnostics.
+- [Workflow reference](workflow-reference.md) — every field and all 46 diagnostics.
 - [`odin` CLI](cli.md) and [`odind` daemon](daemon.md) references, including the
   [recipe catalog](cli.md#odin-recipe-subcommand) (run workflows by name).
 - [Webhook walkthrough](webhook-walkthrough.md) — wire a GitHub webhook end-to-end (tunnel →

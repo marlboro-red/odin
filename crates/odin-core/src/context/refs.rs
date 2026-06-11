@@ -131,14 +131,23 @@ fn process_templates(
                 format!("template syntax error: {e}"),
             )),
             Ok(vars) => {
+                // A value piped through `| shquote` is shell-safe; re-analyze with the shquoted
+                // interpolations stripped so the injection lints (ODIN031/ODIN046) fire ONLY for
+                // variables used UNPROTECTED in a shell sink.
+                let unprotected = if tpl.shell {
+                    unprotected_shell_vars(&source)
+                } else {
+                    HashSet::new()
+                };
                 for var in vars {
+                    let shell_sink = tpl.shell && unprotected.contains(&var);
                     check_var(
                         &var,
                         shape,
                         requires,
                         ancestors,
                         &tpl.pointer,
-                        tpl.shell,
+                        shell_sink,
                         used_params,
                         d,
                     );
@@ -343,6 +352,69 @@ fn collect_templates(ptr: &str, s: &crate::ir::Step) -> Vec<Templated> {
     out
 }
 
+/// The variable paths a (shell) template interpolates WITHOUT shquoting them — the injection-risky
+/// ones (used to gate ODIN031/ODIN046). A value piped through `| shquote` is shell-safe and must
+/// not be flagged, or the lint can't be satisfied by applying its own suggested fix.
+///
+/// We do NOT try to reason about minijinja precedence lexically (that's fragile: `|` binds tighter
+/// than `~`/ternary, so `{{ a ~ b | shquote }}` shquotes only `b`). Instead we BLANK OUT only the
+/// interpolations we can prove safe — a single bare variable piped through exactly `shquote`,
+/// `{{ var | shquote }}`, which by construction contains no quotes or `}}` so its boundary is
+/// unambiguous — and hand everything else **verbatim** to minijinja's real lexer ([`analyze`]),
+/// which counts the risky vars correctly even across string literals and concatenations. Anything
+/// fancier than a lone shquoted variable (multi-filter, concat, ternary, subscript) is conservatively
+/// treated as unprotected (it may over-warn, never under-warn).
+fn unprotected_shell_vars(source: &str) -> HashSet<String> {
+    let mut masked = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{{") {
+        masked.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            masked.push_str(&rest[open..]); // unterminated — ODIN018 reports the syntax error.
+            break;
+        };
+        if is_lone_shquoted_var(&after_open[..close]) {
+            masked.push(' '); // proven safe — drop it so its variable isn't counted.
+        } else {
+            // Keep verbatim. For a block with a string literal containing `}}`, `find` lands on the
+            // literal's `}}` and we copy a truncated slice — but since we change nothing, the rest of
+            // the block follows and `masked` reconstructs the original, which minijinja parses right.
+            masked.push_str(&rest[open..open + 2 + close + 2]);
+        }
+        rest = &after_open[close + 2..];
+    }
+    masked.push_str(rest);
+    analyze(&masked).unwrap_or_default()
+}
+
+/// Whether an interpolation's inner is EXACTLY a bare variable path piped through `shquote`
+/// (`trigger.x | shquote`, optionally `{{- … -}}` whitespace-control or `shquote(args)`). Requires
+/// the shquoted operand to BE the variable — no concatenation, ternary, extra filters, quotes, or
+/// subscripts — so `shquote` provably wraps the whole untrusted value. Conservative: anything else
+/// is `false` (treated as unprotected).
+fn is_lone_shquoted_var(inner: &str) -> bool {
+    let inner = inner.trim().trim_matches('-').trim();
+    let Some((path, filter)) = inner.split_once('|') else {
+        return false;
+    };
+    let filter = filter.trim();
+    // Exactly one filter, and it is `shquote` (with or without `(args)`).
+    if filter.contains('|') || filter.split('(').next().unwrap_or("").trim() != "shquote" {
+        return false;
+    }
+    // The operand must be a bare dot-path variable: a letter/`_` start, then `[A-Za-z0-9_.]`.
+    let path = path.trim();
+    !path.is_empty()
+        && path
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+}
+
 /// Compiles `source` and returns the set of (possibly dotted) variable paths it uses.
 /// A compile error becomes `ODIN018`.
 fn analyze(source: &str) -> Result<HashSet<String>, minijinja::Error> {
@@ -392,6 +464,22 @@ fn check_var(
                         diag = diag.with_help(format!("did you mean {sg:?}?"));
                     }
                     d.push(diag);
+                } else if shell && shape.webhook_params.contains(name) {
+                    // ODIN046 — a declared param that is mapped from a webhook trigger carries the
+                    // untrusted payload value (just like `trigger.*`), so interpolating it into a
+                    // shell command is the same injection risk. Scoped to webhook-mapped params so a
+                    // caller-supplied/default param doesn't false-positive.
+                    d.push(Diagnostic::new(
+                        DiagCode::WebhookParamIntoShell,
+                        pointer.to_owned(),
+                        format!(
+                            "interpolates `params.{name}`, which is mapped from a webhook payload \
+                             (so its value is attacker-controlled), into a shell command; it \
+                             reaches `sh -c` unescaped (injection risk). Shell-quote it with the \
+                             `| shquote` filter (e.g. `{{{{ params.{name} | shquote }}}}`), which \
+                             wraps the value as one inert shell word"
+                        ),
+                    ));
                 }
             }
         }

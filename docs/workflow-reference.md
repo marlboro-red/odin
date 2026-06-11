@@ -2,7 +2,7 @@
 
 A workflow is a YAML file describing a directed acyclic graph of steps that Odin runs.
 This page documents **every field** of the schema and **every validator diagnostic**
-(`ODIN001`–`ODIN045`).
+(`ODIN001`–`ODIN046`).
 
 > **Editor support.** [`docs/workflow.schema.json`](workflow.schema.json) is a JSON Schema for
 > workflow files — point your editor's YAML language server at it for autocomplete and inline
@@ -550,7 +550,7 @@ are the durable record and snapshotting disengages. See the
 
 ---
 
-## Diagnostics catalogue (`ODIN001`–`ODIN045`)
+## Diagnostics catalogue (`ODIN001`–`ODIN046`)
 
 Run `odin validate` to see these. **Errors** make a workflow invalid (it won't run);
 **warnings** are runnable but suspicious or inert. Validation collects *all* of them at once.
@@ -602,8 +602,9 @@ Run `odin validate` to see these. **Errors** make a workflow invalid (it won't r
 | <a id="odin043"></a>ODIN043 | error | A `loop:` body step sets `scratch: true` — unsupported; the body runs sequentially on the shared workdir, so the step's edits would vanish into a throwaway worktree. |
 | <a id="odin044"></a>ODIN044 | **warning** | A `durable: true` workflow uses a `slot_pool` workspace — its lease state is in-memory and lost on restart, so a resumed run may race another for its slot; prefer `worktree`. |
 | <a id="odin045"></a>ODIN045 | **warning** | A `tags:` entry was malformed and dropped (empty after trimming), or normalized (case/whitespace), so the parsed workflow no longer shows the original token. |
+| <a id="odin046"></a>ODIN046 | **warning** | A param **mapped from a webhook trigger** (so its value comes from the untrusted webhook payload, like `trigger.*`) is interpolated into a shell command (`run:`/gate/`shell.exec`) without `\| shquote`. The `params.*` sibling of ODIN031; a non-webhook (caller-supplied/default) param does not trigger it. |
 
-¹ ODIN017, ODIN018, ODIN024, ODIN029, and ODIN031 require the `templating` feature (on by default).
+¹ ODIN017, ODIN018, ODIN024, ODIN029, ODIN031, and ODIN046 require the `templating` feature (on by default).
 
 A workflow validates **cleanly** when it has zero diagnostics; it's still **runnable** with
 warnings (only errors block a run). See [`examples/fix-flaky-test.yaml`](../examples/fix-flaky-test.yaml)
