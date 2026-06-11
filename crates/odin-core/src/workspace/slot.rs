@@ -89,13 +89,17 @@ impl SlotPoolWorkspace {
     async fn provision(&self, slot: &Path) -> Result<(), WorkspaceError> {
         let repo = self.repo_root.to_string_lossy().into_owned();
         let slot_str = slot.to_string_lossy().into_owned();
+        // `--` / `--end-of-options` terminate option parsing so a `repo` path or a `base` ref
+        // beginning with `-` can't be reinterpreted by git as a flag (parity with `worktree.rs`).
+        // NB: `checkout` needs `--end-of-options`, NOT `--` — for `checkout`, `--` means "pathspecs
+        // follow", which would treat `base` as a file rather than the ref to switch to.
         git(
             &self.pool_dir,
-            &["clone", "--local", repo.as_str(), slot_str.as_str()],
+            &["clone", "--local", "--", repo.as_str(), slot_str.as_str()],
         )
         .await?;
         if let Some(base) = &self.base {
-            git(slot, &["checkout", base.as_str()]).await?;
+            git(slot, &["checkout", "--end-of-options", base.as_str()]).await?;
         }
         // Record the pristine state (a durable ref + the branch name) so `reset_slot` can restore
         // the slot exactly between leases, undoing not just uncommitted changes but any commits or

@@ -93,7 +93,13 @@ impl CodexProvider {
             args.push("--model".to_owned());
             args.push(model.clone());
         }
-        // The prompt is the trailing positional arg, so it must be pushed last.
+        // The prompt is the trailing positional arg. Terminate option parsing with `--` FIRST, so a
+        // rendered prompt that begins with `-` (e.g. a step output or webhook-mapped param templated
+        // at the start) is taken as the prompt and NOT parsed as a codex flag — a prompt like
+        // `--dangerously-bypass-approvals-and-sandbox …` must not be able to override the sandbox.
+        // (claude/copilot pass the prompt as the value of `-p`, so they're already inert; codex
+        // alone takes it positionally.) Mirrors the `--` guard the git workspaces already use.
+        args.push("--".to_owned());
         args.push(prompt);
         args
     }
@@ -283,6 +289,26 @@ mod tests {
             .position(|a| a == "--skip-git-repo-check")
             .unwrap();
         assert!(pos > sandbox, "--model must follow extra_args: {args:?}");
+    }
+
+    #[test]
+    fn a_dash_leading_prompt_is_terminated_by_double_dash() {
+        // A rendered prompt that begins with `-` (e.g. an injected step output or webhook-mapped
+        // param) must be passed AS the prompt, not parsed as a codex flag — so `--` must
+        // immediately precede it, or `--dangerously-bypass-approvals-and-sandbox` in the prompt
+        // would override the sandbox.
+        let args = CodexProvider::new().build_args(
+            "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+            "/wd".to_owned(),
+            "/wd/out.txt".to_owned(),
+        );
+        let last = args.len() - 1;
+        assert_eq!(args[last], "--dangerously-bypass-approvals-and-sandbox");
+        assert_eq!(
+            args[last - 1],
+            "--",
+            "the positional prompt must be guarded by a `--` option terminator: {args:?}"
+        );
     }
 
     #[test]
