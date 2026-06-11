@@ -75,4 +75,24 @@ fn the_schema_rejects_malformed_workflows() {
             "malformed case #{i} should have been rejected by the schema: {instance}"
         );
     }
+
+    // A unitless YAML NUMBER duration is rejected (HumanDuration deserializes from a string only).
+    let numeric_timeout = serde_json::json!({
+        "name": "x", "steps": [{ "id": "a", "run": "true", "timeout": 30 }]
+    });
+    assert!(
+        !validator.is_valid(&numeric_timeout),
+        "a numeric (unquoted) duration should be rejected: {numeric_timeout}"
+    );
+
+    // ...but every accepted string unit (s/m/h/d/w + bare seconds) validates.
+    for d in ["45", "30s", "5m", "2h", "7d", "2w"] {
+        let ok = serde_json::json!({
+            "name": "x", "steps": [{ "id": "a", "run": "true", "timeout": d }]
+        });
+        assert!(
+            validator.is_valid(&ok),
+            "duration {d:?} should be accepted by the schema"
+        );
+    }
 }

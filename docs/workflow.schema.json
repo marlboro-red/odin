@@ -5,6 +5,7 @@
   "description": "Schema for an Odin workflow YAML file. An editor aid (autocomplete + typo-catching via yaml-language-server); `odin validate` is the authoritative validator and additionally enforces semantic rules (the ODIN### diagnostics) and the exactly-one-of step kind. Add `# yaml-language-server: $schema=...` atop a file, or map it in your editor's YAML schema settings.",
   "type": "object",
   "required": ["name", "steps"],
+  "$comment": "additionalProperties:false here is deliberately stricter than the engine, which TOLERATES unknown root keys (a forward-compat warning, ODIN025) so a file authored for a newer schema_version still loads. The schema favors typo-catching for editors; if you author for a newer minor with additive root keys, expect the editor to flag them until the schema updates.",
   "additionalProperties": false,
   "properties": {
     "schema_version": {
@@ -57,11 +58,9 @@
   },
   "$defs": {
     "duration": {
-      "description": "A human duration: `30s` / `5m` / `2h`, or bare seconds (`45` or \"45\").",
-      "oneOf": [
-        { "type": "string", "pattern": "^[0-9]+[smh]?$" },
-        { "type": "integer", "minimum": 0 }
-      ]
+      "description": "A human duration as a STRING: `30s` / `5m` / `2h` / `7d` / `2w`, or bare seconds (`\"45\"`). A unitless YAML number is not accepted — quote it.",
+      "type": "string",
+      "pattern": "^[0-9]+[smhdw]?$"
     },
     "providerRef": {
       "description": "A provider key (e.g. claude / codex / copilot, or a registered alias).",
