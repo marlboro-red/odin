@@ -24,6 +24,12 @@ workspace:
 # The four dimension reviewers are `scratch` (isolated worktrees), so they run concurrently.
 max_parallel: 4
 
+# Several agent CLIs billing in parallel can hit a transient rate/usage limit — without a retry one
+# flaky reviewer fails the whole run (and you've already paid for the others). One backed-off retry
+# recovers a transient blip; applies to every step that doesn't set its own `retry`.
+defaults:
+  retry: { max: 1, backoff: exponential }
+
 params:
   out:
     type: string
