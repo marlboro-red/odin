@@ -1,0 +1,229 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/marlboro-red/odin/blob/main/docs/workflow.schema.json",
+  "title": "Odin workflow",
+  "description": "Schema for an Odin workflow YAML file. An editor aid (autocomplete + typo-catching via yaml-language-server); `odin validate` is the authoritative validator and additionally enforces semantic rules (the ODIN### diagnostics) and the exactly-one-of step kind. Add `# yaml-language-server: $schema=...` atop a file, or map it in your editor's YAML schema settings.",
+  "type": "object",
+  "required": ["name", "steps"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "MAJOR.MINOR file-format version. Defaults to the current major.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "name": {
+      "description": "Stable identity and display name of this workflow.",
+      "type": "string",
+      "minLength": 1
+    },
+    "version": { "description": "Author's semantic version of the content (opaque to the engine).", "type": "string" },
+    "description": { "type": "string" },
+    "tags": {
+      "description": "Free-form labels (trimmed + lowercased on parse).",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "durable": {
+      "description": "Whether runs are checkpointed to the store (crash-resumable). Default true.",
+      "type": "boolean"
+    },
+    "workspace": { "$ref": "#/$defs/workspace" },
+    "triggers": { "type": "array", "items": { "$ref": "#/$defs/trigger" } },
+    "params": {
+      "description": "Input parameter schema, keyed by name.",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/paramSpec" }
+    },
+    "steps": {
+      "description": "The workflow steps (a DAG via each step's depends_on).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/step" }
+    },
+    "defaults": {
+      "description": "Default retry/timeout applied to steps that omit their own.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "timeout": { "$ref": "#/$defs/duration" },
+        "retry": { "$ref": "#/$defs/retry" }
+      }
+    },
+    "max_parallel": {
+      "description": "Max steps executing at once within a run (>=1). Omitted/1 = sequential.",
+      "type": "integer",
+      "minimum": 1
+    }
+  },
+  "$defs": {
+    "duration": {
+      "description": "A human duration: `30s` / `5m` / `2h`, or bare seconds (`45` or \"45\").",
+      "oneOf": [
+        { "type": "string", "pattern": "^[0-9]+[smh]?$" },
+        { "type": "integer", "minimum": 0 }
+      ]
+    },
+    "providerRef": {
+      "description": "A provider key (e.g. claude / codex / copilot, or a registered alias).",
+      "type": "string",
+      "minLength": 1
+    },
+    "workspace": {
+      "description": "How a run gets its working directory. Tagged on `type`.",
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "worktree" },
+            "base": { "description": "Base branch/ref (defaults to repo HEAD).", "type": "string" }
+          }
+        },
+        {
+          "required": ["pool"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "slot_pool" },
+            "pool": { "description": "Number of clones in the pool (>=1).", "type": "integer", "minimum": 1 },
+            "reset": { "description": "How a slot is reset before reuse.", "enum": ["git_clean", "reclone"] },
+            "base": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "trigger": {
+      "description": "What starts a run. Tagged on `type`.",
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": { "type": { "const": "manual" } }
+        },
+        {
+          "required": ["events"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "github_webhook" },
+            "events": { "type": "array", "items": { "type": "string" }, "description": "e.g. [\"issues.labeled\"]; a bare type matches any action." },
+            "repo": { "type": "string", "description": "owner/repo filter." },
+            "params": { "type": "object", "additionalProperties": { "type": "string" }, "description": "param -> dot-path into the payload." }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "webhook" },
+            "event": { "type": "string", "description": "Matched against the X-Odin-Event header; omit for any." },
+            "params": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        {
+          "required": ["schedule"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "cron" },
+            "schedule": { "type": "string", "description": "A 5-field cron expression." }
+          }
+        }
+      ]
+    },
+    "paramSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["string", "number", "bool"], "description": "Value type (default string)." },
+        "required": { "type": "boolean" },
+        "default": {},
+        "description": { "type": "string" }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max": { "description": "Max ADDITIONAL attempts after the first (0 = none).", "type": "integer", "minimum": 0 },
+        "backoff": { "enum": ["fixed", "exponential"] },
+        "on_fallback_provider": { "$ref": "#/$defs/providerRef" },
+        "feedback": { "enum": ["off", "concise", "verbose"], "description": "Expose the prior failure to templates as retry.feedback (concise = first line, verbose = full)." }
+      }
+    },
+    "judge": {
+      "type": "object",
+      "required": ["provider", "criteria"],
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "$ref": "#/$defs/providerRef" },
+        "criteria": { "type": "string" },
+        "threshold": { "type": "number", "minimum": 0, "maximum": 1, "description": "Pass threshold 0..=1 (default 0.5)." }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requires": { "type": "array", "items": { "type": "string" } },
+        "produces": { "type": "array", "items": { "type": "string" }, "description": "DIFF is auto-captured." }
+      }
+    },
+    "caseBranch": {
+      "type": "object",
+      "required": ["label"],
+      "additionalProperties": false,
+      "properties": {
+        "label": { "type": "string" },
+        "when": { "type": "string", "description": "Minijinja boolean guard; absent = catch-all." }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "branches": { "type": "array", "items": { "$ref": "#/$defs/caseBranch" } },
+        "else": { "type": "string" }
+      }
+    },
+    "loop": {
+      "type": "object",
+      "required": ["until", "max"],
+      "additionalProperties": false,
+      "properties": {
+        "until": { "type": "string", "description": "Boolean guard checked after each iteration." },
+        "max": { "description": "Hard iteration cap (required; 1..=255).", "type": "integer", "minimum": 1, "maximum": 255 },
+        "steps": { "type": "array", "items": { "$ref": "#/$defs/step" } }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "message": { "type": "string" } }
+    },
+    "step": {
+      "description": "One node in the workflow DAG. Exactly one of provider/action/run/approval/case/loop is the step's kind (enforced by `odin validate`, not by this schema).",
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "provider": { "$ref": "#/$defs/providerRef" },
+        "prompt": { "type": "string" },
+        "prompt_file": { "type": "string" },
+        "action": { "type": "string", "description": "A registered action name, e.g. github.open_pr." },
+        "with": { "type": "object", "description": "Inputs to the action." },
+        "run": { "type": "string", "description": "A shell command." },
+        "approval": { "$ref": "#/$defs/approval" },
+        "case": { "$ref": "#/$defs/case" },
+        "loop": { "$ref": "#/$defs/loop" },
+        "artifacts": { "$ref": "#/$defs/artifacts" },
+        "gates": { "type": "object", "additionalProperties": { "type": "string" }, "description": "name -> shell command; all must exit 0." },
+        "judge": { "$ref": "#/$defs/judge" },
+        "retry": { "$ref": "#/$defs/retry" },
+        "timeout": { "$ref": "#/$defs/duration" },
+        "when": { "type": "string", "description": "Minijinja boolean; the step is skipped when false." },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "scratch": { "type": "boolean", "description": "Run in an isolated throwaway worktree (fan-out)." }
+      }
+    }
+  }
+}

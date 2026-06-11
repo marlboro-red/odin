@@ -141,7 +141,7 @@ See the [integration guide](docs/integration-guide.md) for the full embedding st
 - [`odin` CLI](docs/cli.md) and [`odind` daemon](docs/daemon.md) references.
 - [Webhook walkthrough](docs/webhook-walkthrough.md) — wire a GitHub webhook end-to-end.
 - [Scaffolding & templating](docs/recipe-templating.md) · [Integration guide](docs/integration-guide.md) · [Observability](docs/observability.md) · [Architecture](docs/architecture.md).
-- [Glossary](docs/glossary.md) · [Environment variables](docs/environment.md) · [HTTP API (OpenAPI)](docs/openapi.yaml).
+- [Glossary](docs/glossary.md) · [Environment variables](docs/environment.md) · [HTTP API (OpenAPI)](docs/openapi.yaml) · [Workflow JSON Schema](docs/workflow.schema.json).
 - [`CHANGELOG.md`](CHANGELOG.md) and the [versioning policy](#versioning) below.
 - `cargo doc --open -p odin-core --all-features` — the API reference.
 

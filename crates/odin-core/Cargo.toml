@@ -61,6 +61,9 @@ rustix = { version = "1", default-features = false, features = ["process"] }
 [dev-dependencies]
 serde_yaml_ng = "0.10.0"
 tempfile = "3.27.0"
+# Validates the shipped examples against docs/workflow.schema.json (tests/schema.rs). Dev-only —
+# never shipped. `default-features = false` drops the remote-$ref network resolver we don't need.
+jsonschema = { version = "0.46", default-features = false }
 
 [features]
 default = ["full"]
