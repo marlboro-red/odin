@@ -16,7 +16,11 @@ fn open(repo: Option<PathBuf>, db: Option<PathBuf>) -> anyhow::Result<Option<Sql
             .join("state.db")
     });
     if !path.exists() {
-        eprintln!("no run state database at {}", path.display());
+        eprintln!(
+            "no run state database at {} — a run is recorded here once you run a `durable` \
+             workflow without `--no-store`.",
+            path.display()
+        );
         return Ok(None);
     }
     let store = SqliteStore::open(&path).with_context(|| format!("opening {}", path.display()))?;
@@ -70,7 +74,9 @@ pub(crate) fn list(
                 .collect();
             println!("{}", serde_json::to_string_pretty(&summaries)?);
         } else if runs.is_empty() {
-            println!("no runs");
+            println!(
+                "no runs recorded yet (a `durable` run not started with `--no-store` appears here)"
+            );
         } else {
             for r in &runs {
                 println!(

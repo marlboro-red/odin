@@ -132,13 +132,18 @@ Linux `~/.local/share/odin/recipes`, Windows `%LOCALAPPDATA%\odin\data\recipes`)
 
 ## 3. Inspect past runs
 
+`odin list` / `show` / `logs` read the run-state store, so they show runs that were **persisted** —
+i.e. a `durable` workflow run *without* `--no-store`. Drop the `--no-store` from the quickstart above
+so it's recorded, then inspect it:
+
 ```sh
+odin run examples/quickstart.yaml --repo .   # no --no-store → persisted to ./.odin/state.db
 odin list                          # recent runs, newest first
 odin show <RUN_ID>                 # one run's status, steps, and captured diff
 odin logs <RUN_ID>                 # a run's event log
 ```
 
-All three read the same store `odin run` (and the daemon) write to, and accept `--json`.
+All three accept `--json` and read the same store `odin run` (and the daemon) write to.
 
 ## 4. Serve workflows on events
 

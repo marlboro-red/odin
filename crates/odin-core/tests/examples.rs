@@ -350,7 +350,13 @@ fn quickstart_validates_and_is_provider_free() {
         validate_source(QUICKSTART, &wf, &KnownNames::builtin()).is_empty(),
         "quickstart should validate clean"
     );
-    assert!(!wf.durable, "a stateless one-shot (run with --no-store)");
+    // Durable, so dropping `--no-store` records it and `odin list`/`show`/`logs` can inspect it —
+    // the documented first-run flow. (The headline demo still passes `--no-store` for an ephemeral
+    // run.) The real "a stranger can run this" guarantee is the provider-free check below.
+    assert!(
+        wf.durable,
+        "quickstart is durable so the inspect flow works"
+    );
     assert!(
         !wf.steps
             .iter()
