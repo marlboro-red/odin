@@ -377,17 +377,30 @@ fn shquote_suppresses_the_shell_injection_lints() {
 }
 
 #[test]
-fn shquote_in_a_concatenation_does_not_suppress_the_siblings() {
-    // `|` binds tighter than `~`, so in `{{ a ~ b | shquote }}` only `b` is quoted and `a` is RAW.
-    // The lint must NOT be fooled into clearing by the trailing `shquote` (a real injection).
-    let concat = report(
-        "name: x\nsteps:\n  - {id: a, run: \"git checkout {{ trigger.a ~ trigger.b | shquote }}\"}\n",
-    );
+fn shquote_suppression_is_not_fooled_by_a_trailing_shquote() {
+    // `|` binds tighter than `~`/ternary, so a trailing `shquote` may wrap only PART of the
+    // expression. The lint must fire whenever an untrusted value reaches the shell raw. Each of
+    // these has a `shquote` at the end but still leaves a value unquoted — all must warn.
+    for expr in [
+        "trigger.a ~ trigger.b | shquote",           // concat: a is raw
+        "trigger.x ~ trigger.x | shquote", // duplicate name collapses to one — first is raw
+        "trigger.x ~ 'lit' | shquote",     // var concatenated with a literal — var is raw
+        "trigger.x if trigger.x else 'y' | shquote", // ternary: selected branch is raw
+        "trigger.a ~ '}}' ~ trigger.b",    // `}}` inside a literal must not truncate parsing
+    ] {
+        let src = format!("name: x\nsteps:\n  - {{id: a, run: \"echo {{{{ {expr} }}}}\"}}\n");
+        assert!(
+            report(&src).contains(DiagCode::TriggerIntoShell),
+            "must still fire for `{expr}`:\n{}",
+            report(&src)
+        );
+    }
+    // ...while the genuinely-safe lone shquoted form stays clean (incl. whitespace-control braces).
+    let safe = report("name: x\nsteps:\n  - {id: a, run: \"echo {{ trigger.x | shquote }}\"}\n");
     assert!(
-        concat.contains(DiagCode::TriggerIntoShell),
-        "a concat leaving a sibling raw must still fire:\n{concat}"
+        !safe.contains(DiagCode::TriggerIntoShell),
+        "a lone shquoted var should clear:\n{safe}"
     );
-    // Whitespace-control braces around a properly-shquoted value are still recognized as safe.
     let ws = report("name: x\nsteps:\n  - {id: a, run: \"echo {{- trigger.x | shquote -}}\"}\n");
     assert!(
         !ws.contains(DiagCode::TriggerIntoShell),

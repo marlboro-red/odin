@@ -352,42 +352,67 @@ fn collect_templates(ptr: &str, s: &crate::ir::Step) -> Vec<Templated> {
     out
 }
 
-/// The variable paths a (shell) template interpolates WITHOUT individually shquoting them — the
-/// injection-risky ones. A `{{ … }}` block "protects" its variable only when it is a **single**
-/// variable whose final filter is `shquote`: `{{ x | shquote }}` is safe, but
-/// `{{ a ~ b | shquote }}` is NOT — minijinja's filter `|` binds tighter than `~` (concat) and the
-/// `if`/`else` ternary, so `shquote` there wraps only the last operand and leaves the others raw.
-/// So a value piped through `shquote` clears the lint (ODIN031/ODIN046), but a concatenation that
-/// leaves a sibling unquoted still fires. Conservative: anything not clearly a lone shquoted
-/// variable is treated as unprotected.
+/// The variable paths a (shell) template interpolates WITHOUT shquoting them — the injection-risky
+/// ones (used to gate ODIN031/ODIN046). A value piped through `| shquote` is shell-safe and must
+/// not be flagged, or the lint can't be satisfied by applying its own suggested fix.
+///
+/// We do NOT try to reason about minijinja precedence lexically (that's fragile: `|` binds tighter
+/// than `~`/ternary, so `{{ a ~ b | shquote }}` shquotes only `b`). Instead we BLANK OUT only the
+/// interpolations we can prove safe — a single bare variable piped through exactly `shquote`,
+/// `{{ var | shquote }}`, which by construction contains no quotes or `}}` so its boundary is
+/// unambiguous — and hand everything else **verbatim** to minijinja's real lexer ([`analyze`]),
+/// which counts the risky vars correctly even across string literals and concatenations. Anything
+/// fancier than a lone shquoted variable (multi-filter, concat, ternary, subscript) is conservatively
+/// treated as unprotected (it may over-warn, never under-warn).
 fn unprotected_shell_vars(source: &str) -> HashSet<String> {
-    let mut unprotected = HashSet::new();
+    let mut masked = String::with_capacity(source.len());
     let mut rest = source;
     while let Some(open) = rest.find("{{") {
+        masked.push_str(&rest[..open]);
         let after_open = &rest[open + 2..];
         let Some(close) = after_open.find("}}") else {
-            break; // unterminated `{{` — the syntax error is reported as ODIN018 elsewhere.
+            masked.push_str(&rest[open..]); // unterminated — ODIN018 reports the syntax error.
+            break;
         };
-        // Strip minijinja whitespace-control dashes (`{{- … -}}`) before reading the expression.
-        let inner = after_open[..close].trim().trim_matches('-').trim();
-        // The variables in THIS single interpolation. (A malformed block fails the full-template
-        // analyze first → ODIN018, so we never reach the injection check for it.)
-        let block_vars = analyze(&format!("{{{{ {inner} }}}}")).unwrap_or_default();
-        let protected = block_vars.len() == 1 && last_filter_is_shquote(inner);
-        if !protected {
-            unprotected.extend(block_vars);
+        if is_lone_shquoted_var(&after_open[..close]) {
+            masked.push(' '); // proven safe — drop it so its variable isn't counted.
+        } else {
+            // Keep verbatim. For a block with a string literal containing `}}`, `find` lands on the
+            // literal's `}}` and we copy a truncated slice — but since we change nothing, the rest of
+            // the block follows and `masked` reconstructs the original, which minijinja parses right.
+            masked.push_str(&rest[open..open + 2 + close + 2]);
         }
         rest = &after_open[close + 2..];
     }
-    unprotected
+    masked.push_str(rest);
+    analyze(&masked).unwrap_or_default()
 }
 
-/// Whether the LAST filter of a minijinja interpolation is `shquote` (`x | shquote`,
-/// `x | upper | shquote`, or `x | shquote(…)`). Conservative: anything it can't clearly read as a
-/// trailing `shquote` is treated as NOT shquoted, so the value is still flagged.
-fn last_filter_is_shquote(inner: &str) -> bool {
-    let last = inner.rsplit('|').next().unwrap_or("").trim();
-    last.split('(').next().unwrap_or("").trim() == "shquote"
+/// Whether an interpolation's inner is EXACTLY a bare variable path piped through `shquote`
+/// (`trigger.x | shquote`, optionally `{{- … -}}` whitespace-control or `shquote(args)`). Requires
+/// the shquoted operand to BE the variable — no concatenation, ternary, extra filters, quotes, or
+/// subscripts — so `shquote` provably wraps the whole untrusted value. Conservative: anything else
+/// is `false` (treated as unprotected).
+fn is_lone_shquoted_var(inner: &str) -> bool {
+    let inner = inner.trim().trim_matches('-').trim();
+    let Some((path, filter)) = inner.split_once('|') else {
+        return false;
+    };
+    let filter = filter.trim();
+    // Exactly one filter, and it is `shquote` (with or without `(args)`).
+    if filter.contains('|') || filter.split('(').next().unwrap_or("").trim() != "shquote" {
+        return false;
+    }
+    // The operand must be a bare dot-path variable: a letter/`_` start, then `[A-Za-z0-9_.]`.
+    let path = path.trim();
+    !path.is_empty()
+        && path
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
 }
 
 /// Compiles `source` and returns the set of (possibly dotted) variable paths it uses.
