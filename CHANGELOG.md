@@ -6,6 +6,32 @@ All notable changes to Odin are recorded here. The format follows
 [versioning policy](README.md#versioning) (the minor is the breaking slot). The library crates and
 the CLIs share one version.
 
+## [0.1.2] – 2026-06-11
+
+Security fixes (found by running Odin's own `deep-review` workflow against this repo and verifying
+the findings) plus a first-run smoothing. No breaking changes.
+
+### Security
+
+- **codex prompt arg-injection** — `codex exec` took the prompt as a bare trailing positional, so a
+  rendered prompt beginning with `-` (an injected step output, or a webhook param at the start of a
+  prompt) was parsed as codex flags — an injected `--dangerously-bypass-approvals-and-sandbox` could
+  override the sandbox. The prompt is now passed after a `--` option terminator (and the slot-pool
+  `git` invocations gained the same guard).
+- **webhook-mapped params into a shell** — the shell-injection lint flagged untrusted `trigger.*`
+  (ODIN031) but not a `params.*` value mapped from a webhook payload, which the daemon fills from the
+  attacker-controlled event body. New **ODIN046** catches it; `| shquote` now *clears* the
+  shell-injection lints (previously they fired even when you applied the fix).
+- **the daemon now validates workflows at load** — it previously parsed but never validated served
+  workflows, so the injection lints never fired on the live webhook path. A workflow with validation
+  errors is now refused; warnings (including the injection lints) are logged at startup.
+
+### Changed
+
+- First-run: the quickstart example is now `durable`, so the documented `run → list → show → logs`
+  flow works (it previously dead-ended on an empty store); the empty-store CLI messages now explain
+  how a run gets recorded.
+
 ## [0.1.1] – 2026-06-11
 
 A small additive follow-up to 0.1.0 (no breaking changes).
