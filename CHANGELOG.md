@@ -6,6 +6,21 @@ All notable changes to Odin are recorded here. The format follows
 [versioning policy](README.md#versioning) (the minor is the breaking slot). The library crates and
 the CLIs share one version.
 
+## [0.1.1] – 2026-06-11
+
+A small additive follow-up to 0.1.0 (no breaking changes).
+
+### Added
+
+- The web dashboard now renders each run's wall-clock duration and per-step durations (the
+  `duration_ms` the engine already projects).
+- `odin_steps_in_flight` gauge on `/metrics` — steps in an active execution segment right now,
+  across all runs (run-level activity remains the store-backed `odin_runs_in_flight` /
+  `odin_runs_pending` gauges).
+- `docs/workflow.schema.json` — a JSON Schema for workflow files, for editor autocomplete and
+  inline typo-catching via a YAML language server. A CI test keeps it in sync with every shipped
+  example. (`odin validate` remains authoritative.)
+
 ## [0.1.0] – 2026-06-11
 
 A developer-experience milestone: the engine was already strong at "run, then read the result", but
