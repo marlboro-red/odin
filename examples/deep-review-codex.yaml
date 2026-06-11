@@ -17,6 +17,12 @@ workspace:
 
 max_parallel: 4
 
+# Several agent CLIs billing in parallel can hit a transient rate/usage limit; one backed-off retry
+# recovers a flaky reviewer instead of failing the whole (already-paid-for) run. Applies to every
+# step that doesn't set its own `retry`.
+defaults:
+  retry: { max: 1, backoff: exponential }
+
 params:
   out:
     type: string

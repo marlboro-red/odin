@@ -242,7 +242,23 @@ fn parse_result(stdout: &str) -> ParsedResult {
                 .get("subtype")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("error");
-            format!("claude reported an error (is_error, subtype={subtype})")
+            // Include the CLI's own `result` text (truncated) so an `is_error` is DEBUGGABLE — a bare
+            // `subtype=success` tells an operator nothing, but `result` carries the real cause (e.g.
+            // a usage/rate-limit notice), which Odin otherwise discarded.
+            let detail = v
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if detail.is_empty() {
+                format!("claude reported an error (is_error, subtype={subtype})")
+            } else {
+                let mut d: String = detail.chars().take(300).collect();
+                if detail.chars().count() > 300 {
+                    d.push('…');
+                }
+                format!("claude reported an error (is_error, subtype={subtype}): {d}")
+            }
         });
     ParsedResult {
         text,
@@ -324,6 +340,11 @@ mod tests {
         assert!(
             reason.contains("error_max_turns"),
             "reason names the subtype: {reason}"
+        );
+        // The CLI's own `result` message is surfaced too, so the failure is debuggable.
+        assert!(
+            reason.contains("hit the limit"),
+            "reason includes the CLI's detail: {reason}"
         );
         // usage is still captured (the call cost tokens even though it errored).
         assert_eq!(p.usage.unwrap().input_tokens, 10);
