@@ -377,6 +377,25 @@ fn shquote_suppresses_the_shell_injection_lints() {
 }
 
 #[test]
+fn shquote_in_a_concatenation_does_not_suppress_the_siblings() {
+    // `|` binds tighter than `~`, so in `{{ a ~ b | shquote }}` only `b` is quoted and `a` is RAW.
+    // The lint must NOT be fooled into clearing by the trailing `shquote` (a real injection).
+    let concat = report(
+        "name: x\nsteps:\n  - {id: a, run: \"git checkout {{ trigger.a ~ trigger.b | shquote }}\"}\n",
+    );
+    assert!(
+        concat.contains(DiagCode::TriggerIntoShell),
+        "a concat leaving a sibling raw must still fire:\n{concat}"
+    );
+    // Whitespace-control braces around a properly-shquoted value are still recognized as safe.
+    let ws = report("name: x\nsteps:\n  - {id: a, run: \"echo {{- trigger.x | shquote -}}\"}\n");
+    assert!(
+        !ws.contains(DiagCode::TriggerIntoShell),
+        "`{{- x | shquote -}}` should clear:\n{ws}"
+    );
+}
+
+#[test]
 fn odin032_approval_step_requires_durable() {
     // A pausable approval gate is unresumable without persistence → must be durable.
     // (`durable` defaults to true, so the mistake is explicitly setting it false.)

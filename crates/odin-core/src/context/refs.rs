@@ -135,7 +135,7 @@ fn process_templates(
                 // interpolations stripped so the injection lints (ODIN031/ODIN046) fire ONLY for
                 // variables used UNPROTECTED in a shell sink.
                 let unprotected = if tpl.shell {
-                    analyze(&strip_shquoted(&source)).unwrap_or_default()
+                    unprotected_shell_vars(&source)
                 } else {
                     HashSet::new()
                 };
@@ -352,32 +352,34 @@ fn collect_templates(ptr: &str, s: &crate::ir::Step) -> Vec<Templated> {
     out
 }
 
-/// Removes every `{{ … | shquote }}` interpolation from a template, so re-analyzing the remainder
-/// yields only the variables used WITHOUT `shquote` — the injection-risky ones. A value the author
-/// piped through `shquote` is already shell-safe and must not be flagged (ODIN031/ODIN046), or the
-/// lint couldn't be satisfied by applying its own suggested fix.
-fn strip_shquoted(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
+/// The variable paths a (shell) template interpolates WITHOUT individually shquoting them — the
+/// injection-risky ones. A `{{ … }}` block "protects" its variable only when it is a **single**
+/// variable whose final filter is `shquote`: `{{ x | shquote }}` is safe, but
+/// `{{ a ~ b | shquote }}` is NOT — minijinja's filter `|` binds tighter than `~` (concat) and the
+/// `if`/`else` ternary, so `shquote` there wraps only the last operand and leaves the others raw.
+/// So a value piped through `shquote` clears the lint (ODIN031/ODIN046), but a concatenation that
+/// leaves a sibling unquoted still fires. Conservative: anything not clearly a lone shquoted
+/// variable is treated as unprotected.
+fn unprotected_shell_vars(source: &str) -> HashSet<String> {
+    let mut unprotected = HashSet::new();
     let mut rest = source;
     while let Some(open) = rest.find("{{") {
-        out.push_str(&rest[..open]);
         let after_open = &rest[open + 2..];
         let Some(close) = after_open.find("}}") else {
-            // Unterminated `{{` — keep the remainder verbatim (the syntax error is reported elsewhere).
-            out.push_str(&rest[open..]);
-            return out;
+            break; // unterminated `{{` — the syntax error is reported as ODIN018 elsewhere.
         };
-        if last_filter_is_shquote(&after_open[..close]) {
-            // shquote-protected — drop it (a space avoids joining the adjacent shell tokens).
-            out.push(' ');
-        } else {
-            // Unprotected — keep the whole `{{ … }}` so its variables are still analyzed + flagged.
-            out.push_str(&rest[open..open + 2 + close + 2]);
+        // Strip minijinja whitespace-control dashes (`{{- … -}}`) before reading the expression.
+        let inner = after_open[..close].trim().trim_matches('-').trim();
+        // The variables in THIS single interpolation. (A malformed block fails the full-template
+        // analyze first → ODIN018, so we never reach the injection check for it.)
+        let block_vars = analyze(&format!("{{{{ {inner} }}}}")).unwrap_or_default();
+        let protected = block_vars.len() == 1 && last_filter_is_shquote(inner);
+        if !protected {
+            unprotected.extend(block_vars);
         }
         rest = &after_open[close + 2..];
     }
-    out.push_str(rest);
-    out
+    unprotected
 }
 
 /// Whether the LAST filter of a minijinja interpolation is `shquote` (`x | shquote`,
