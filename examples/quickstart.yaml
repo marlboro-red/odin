@@ -2,16 +2,17 @@
 # no authentication. Watch Odin provision a per-run worktree, walk the step DAG, capture the diff,
 # and print a RunSummary. The fastest way to see the engine actually work after a clone:
 #
-#   odin run quickstart --repo . --no-store
+#   odin run quickstart --repo . --no-store        # the run isn't recorded (won't appear in `odin list`)
 #   # or, without installing: cargo run -p odin-cli -- run examples/quickstart.yaml --repo . --no-store
 #
-# To run a PROVIDER-using workflow offline too (agent steps echo their prompt, no real CLI/auth):
-#   odin run deep-review --repo . --no-store --mock
+# Drop `--no-store` and the run is recorded (it's `durable`) so `odin list` / `show` / `logs` can
+# inspect it. To run a PROVIDER-using workflow offline too (agent steps echo their prompt, no real
+# CLI/auth):  odin run deep-review --repo . --no-store --mock
 schema_version: "1.0"
 name: quickstart
 description: "A zero-dependency hello-world — plain run: steps, no agent CLI or auth required."
 tags: [demo]
-durable: false
+durable: true
 
 workspace:
   type: worktree

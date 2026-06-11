@@ -46,7 +46,11 @@ pub(crate) fn run(args: StatusArgs) -> anyhow::Result<ExitCode> {
         if args.json {
             println!("[]");
         } else {
-            eprintln!("no run state database at {}", path.display());
+            eprintln!(
+                "no run state database at {} — a run is recorded here once you run a `durable` \
+                 workflow without `--no-store`.",
+                path.display()
+            );
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -151,7 +155,9 @@ const STATUS_ORDER: [&str; 6] = [
 
 fn render(views: &[RunView]) {
     if views.is_empty() {
-        println!("no runs yet");
+        println!(
+            "no runs recorded yet (a `durable` run not started with `--no-store` appears here)"
+        );
         return;
     }
     // Summary header: counts of the displayed runs, by status.
