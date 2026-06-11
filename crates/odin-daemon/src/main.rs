@@ -27,7 +27,9 @@ use anyhow::Context as _;
 use clap::Parser;
 use odin_core::ir::{HumanDuration, StepKind, TriggerDecl};
 use odin_core::telemetry::{self, Options};
-use odin_core::{EngineBuilder, PrunePolicy, SqliteStore, Store, Workflow};
+use odin_core::{
+    EngineBuilder, KnownNames, PrunePolicy, SqliteStore, Store, Workflow, validate_source,
+};
 use odin_daemon::{Daemon, Metrics, WebhookServer};
 
 /// Run Odin workflows from event triggers (cron schedules + GitHub webhooks).
@@ -385,6 +387,26 @@ fn load_workflows(dir: &Path) -> anyhow::Result<Vec<Workflow>> {
         };
         match Workflow::from_yaml_str(&src) {
             Ok(workflow) => {
+                // Validate at load — the daemon is the network-exposed component, so the diagnostics
+                // (notably the shell-injection lints ODIN031/ODIN046) must surface HERE, on the live
+                // webhook path, not only when an author runs `odin validate`. Refuse to serve a
+                // workflow with validation ERRORS; surface warnings loudly but still serve them.
+                let report = validate_source(&src, &workflow, &KnownNames::builtin());
+                if report.has_errors() {
+                    tracing::error!(
+                        path = %path.display(),
+                        workflow = %workflow.name.as_str(),
+                        "refusing to serve a workflow with validation errors:\n{report}"
+                    );
+                    continue;
+                }
+                if !report.is_empty() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        workflow = %workflow.name.as_str(),
+                        "workflow has validation warnings:\n{report}"
+                    );
+                }
                 tracing::debug!(workflow = %workflow.name.as_str(), path = %path.display(), "loaded workflow");
                 workflows.push(workflow);
             }
@@ -476,7 +498,7 @@ mod tests {
         assert!(prune_policy(Some("24h"), Some("not-a-duration"), None).is_err());
     }
 
-    use super::{catalog, load_all};
+    use super::{catalog, load_all, load_workflows};
     use std::path::Path;
 
     fn wf(dir: &Path, file: &str, name: &str) {
@@ -513,6 +535,31 @@ mod tests {
                 .filter(|w| w.name.as_str() == "shared")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn load_refuses_validation_errors_but_still_serves_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        // A validation ERROR (unknown provider, ODIN005) — must NOT be served.
+        std::fs::write(
+            dir.path().join("err.yaml"),
+            "name: err\nsteps:\n  - {id: a, provider: nope, prompt: hi}\n",
+        )
+        .unwrap();
+        // A validation WARNING (a webhook-mapped param into a shell, ODIN046) — still served.
+        std::fs::write(
+            dir.path().join("warn.yaml"),
+            "name: warn\ntriggers:\n  - {type: webhook, event: e, params: {r: x.r}}\n\
+             params: {r: {}}\nsteps:\n  - {id: a, run: \"echo {{ params.r }}\"}\n",
+        )
+        .unwrap();
+        let loaded = load_workflows(dir.path()).unwrap();
+        let names: Vec<&str> = loaded.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["warn"],
+            "the errored workflow must be refused; the warning one served"
         );
     }
 

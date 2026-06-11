@@ -45,7 +45,11 @@ idempotently. Set `ODIN_SQLITE_SYNCHRONOUS=full` for zero-loss at higher write l
 ## What startup does
 
 1. Load every `*.yaml`/`*.yml` in `--workflows` (sorted; unreadable/unparseable files are
-   skipped with a warning). An empty result is fatal.
+   skipped with a warning). Each loaded workflow is then **validated** (the same `ODIN###` rules as
+   `odin validate`): a workflow with any **error** is **refused** (logged, not served), and
+   **warnings** — including the shell-injection lints [ODIN031](workflow-reference.md#odin031) /
+   [ODIN046](workflow-reference.md#odin046) — are logged loudly so they surface on the network-exposed
+   path, not only at author time. An empty result is fatal.
 2. Open the SQLite store and build the engine over `--repo`.
 3. Build the HTTP server: `/webhook` per `github_webhook` trigger and `/approve` if any workflow
    has an approval gate (enforcing the [fail-closed secret rule](#security) for those), plus the
