@@ -18,8 +18,7 @@ fn open(repo: Option<PathBuf>, db: Option<PathBuf>) -> anyhow::Result<Option<Sql
     if !path.exists() {
         eprintln!(
             "no run state database at {} — a run is recorded here once you run a `durable` \
-             workflow without `--no-store` (the provider-free quickstart is a stateless one-shot \
-             and won't appear).",
+             workflow without `--no-store`.",
             path.display()
         );
         return Ok(None);
