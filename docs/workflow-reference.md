@@ -4,6 +4,13 @@ A workflow is a YAML file describing a directed acyclic graph of steps that Odin
 This page documents **every field** of the schema and **every validator diagnostic**
 (`ODIN001`–`ODIN045`).
 
+> **Editor support.** [`docs/workflow.schema.json`](workflow.schema.json) is a JSON Schema for
+> workflow files — point your editor's YAML language server at it for autocomplete and inline
+> typo-catching, e.g. add `# yaml-language-server: $schema=https://raw.githubusercontent.com/marlboro-red/odin/main/docs/workflow.schema.json`
+> to the top of a file. It's an *aid*; `odin validate` is authoritative (it also enforces the
+> semantic `ODIN###` rules and the exactly-one-of step kind, which a JSON Schema can't cleanly
+> express). A CI test keeps the schema in sync with every shipped example.
+
 Two phases govern a workflow file, and it helps to keep them distinct:
 
 - **Parsing** (`Workflow::from_yaml_str`) is fail-fast and only catches *structural*
